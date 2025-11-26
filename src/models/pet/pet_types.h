@@ -2,9 +2,11 @@
 
 #include "mlipcpp/neighbor_list.h"
 #include "mlipcpp/system.h"
+#include <array>
 #include <cstdint>
 #include <ggml.h>
 #include <map>
+#include <string>
 #include <vector>
 
 /**
@@ -59,6 +61,84 @@ struct PETHypers {
   float cutoff = 4.5f;          ///< Cutoff radius in Angstroms
   float cutoff_width = 0.5f;    ///< Cutoff smoothing width in Angstroms
 };
+
+// ============================================================================
+// Property Head System (unified, extensible)
+// ============================================================================
+
+/**
+ * @brief Unified property head weights
+ *
+ * A single structure that handles all property types (energy, forces, stress,
+ * etc.). Each property head consists of:
+ * - Node head: 2-layer MLP applied to per-atom features
+ * - Edge head: 2-layer MLP applied to per-edge features
+ * Both output to an output_dim determined by the last layer weight shape.
+ *
+ * Output dimensions by property:
+ * - Energy: 1 (scalar per atom)
+ * - Forces: 3 (vector per atom)
+ * - Stress: 9 (3x3 tensor per atom, then aggregated)
+ */
+struct PropertyHead {
+  // Node head MLP: d_pet -> d_head -> d_head -> output_dim
+  ggml_tensor *node_head_0_weight = nullptr; ///< [d_head, d_pet]
+  ggml_tensor *node_head_0_bias = nullptr;   ///< [d_head]
+  ggml_tensor *node_head_2_weight = nullptr; ///< [d_head, d_head]
+  ggml_tensor *node_head_2_bias = nullptr;   ///< [d_head]
+  ggml_tensor *node_last_weight = nullptr;   ///< [output_dim, d_head]
+  ggml_tensor *node_last_bias = nullptr;     ///< [output_dim]
+
+  // Edge head MLP: d_pet -> d_head -> d_head -> output_dim
+  ggml_tensor *edge_head_0_weight = nullptr; ///< [d_head, d_pet]
+  ggml_tensor *edge_head_0_bias = nullptr;   ///< [d_head]
+  ggml_tensor *edge_head_2_weight = nullptr; ///< [d_head, d_head]
+  ggml_tensor *edge_head_2_bias = nullptr;   ///< [d_head]
+  ggml_tensor *edge_last_weight = nullptr;   ///< [output_dim, d_head]
+  ggml_tensor *edge_last_bias = nullptr;     ///< [output_dim]
+
+  /// Check if this head has been loaded
+  bool is_loaded() const { return node_head_0_weight != nullptr; }
+
+  /// Get output dimension from last layer weight shape
+  int output_dim() const {
+    return node_last_weight ? static_cast<int>(node_last_weight->ne[1]) : 0;
+  }
+};
+
+/**
+ * @brief Configuration for loading a property head from GGUF
+ *
+ * Defines the tensor naming patterns for a property type.
+ * The "{}" placeholder is replaced with the layer index.
+ */
+struct PropertyConfig {
+  std::string name;          ///< Property identifier (e.g., "energy")
+  std::string node_prefix;   ///< Prefix for node head tensors
+  std::string edge_prefix;   ///< Prefix for edge head tensors
+  std::string node_last_fmt; ///< Format for node last layer (with {} for layer)
+  std::string edge_last_fmt; ///< Format for edge last layer (with {} for layer)
+};
+
+/// Standard property configurations
+namespace property_configs {
+inline const PropertyConfig ENERGY = {
+    "energy", "model.node_heads.energy", "model.edge_heads.energy",
+    "model.node_last_layers.energy.{}.energy___0",
+    "model.edge_last_layers.energy.{}.energy___0"};
+
+inline const PropertyConfig NC_FORCES = {
+    "nc_forces", "model.node_heads.nc_forces", "model.edge_heads.nc_forces",
+    "model.node_last_layers.nc_forces.{}.nc_f",
+    "model.edge_last_layers.nc_forces.{}.nc_f"};
+
+inline const PropertyConfig NC_STRESS = {
+    "nc_stress", "model.node_heads.nc_stress", "model.edge_heads.nc_stress",
+    "model.node_last_layers.nc_stress.{}.nc_s",
+    "model.edge_last_layers.nc_stress.{}.nc_s"};
+} // namespace property_configs
+
+// ============================================================================
 
 /**
  * @brief Hierarchical weight structure for PET model
@@ -141,28 +221,37 @@ struct Weights {
   } gnn[2];  ///< 2 GNN layers
 
   /**
-   * @brief Output head weights for energy prediction
+   * @brief Property heads organized by property name and layer
    *
-   * Separate heads for node and edge contributions.
-   * Each head is a 2-layer MLP followed by a scalar output layer.
+   * Maps property name -> array of heads (one per GNN layer).
+   * Common properties:
+   * - "energy": scalar energy prediction (output_dim=1)
+   * - "nc_forces": non-conservative forces (output_dim=3)
+   * - "nc_stress": non-conservative stress (output_dim=9)
+   *
+   * Example access:
+   *   weights.property_heads["energy"][0]  // Layer 0 energy head
+   *   weights.property_heads["nc_forces"][1] // Layer 1 force head
    */
-  struct HeadWeights {
-    // Node head: features -> hidden -> energy
-    ggml_tensor *node_head_0_weight = nullptr; ///< [d_pet, d_pet]
-    ggml_tensor *node_head_0_bias = nullptr;   ///< [d_pet]
-    ggml_tensor *node_head_2_weight = nullptr; ///< [d_pet, d_pet]
-    ggml_tensor *node_head_2_bias = nullptr;   ///< [d_pet]
-    ggml_tensor *node_last_weight = nullptr;   ///< [1, d_pet]
-    ggml_tensor *node_last_bias = nullptr;     ///< [1]
+  std::map<std::string, std::array<PropertyHead, 2>> property_heads;
 
-    // Edge head: features -> hidden -> energy
-    ggml_tensor *edge_head_0_weight = nullptr; ///< [d_pet, d_pet]
-    ggml_tensor *edge_head_0_bias = nullptr;   ///< [d_pet]
-    ggml_tensor *edge_head_2_weight = nullptr; ///< [d_pet, d_pet]
-    ggml_tensor *edge_head_2_bias = nullptr;   ///< [d_pet]
-    ggml_tensor *edge_last_weight = nullptr;   ///< [1, d_pet]
-    ggml_tensor *edge_last_bias = nullptr;     ///< [1]
-  } heads[2];                                  ///< One head per GNN layer
+  /// Convenience accessor for energy heads (legacy compatibility)
+  PropertyHead &heads(int layer) { return property_heads["energy"][layer]; }
+  const PropertyHead &heads(int layer) const {
+    static const PropertyHead empty;
+    auto it = property_heads.find("energy");
+    return it != property_heads.end() ? it->second[layer] : empty;
+  }
+
+  /// Check if a property is available
+  bool has_property(const std::string &name) const {
+    auto it = property_heads.find(name);
+    return it != property_heads.end() && it->second[0].is_loaded();
+  }
+
+  /// Convenience flags for common properties
+  bool has_force_heads() const { return has_property("nc_forces"); }
+  bool has_stress_heads() const { return has_property("nc_stress"); }
 };
 
 /**

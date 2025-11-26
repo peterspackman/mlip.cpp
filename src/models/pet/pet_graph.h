@@ -205,4 +205,25 @@ ggml_tensor *build_aggregation_and_output(
     const std::vector<ggml_tensor *> &node_features_list,
     const std::vector<ggml_tensor *> &edge_features_list);
 
+/**
+ * Generic property output builder
+ *
+ * Applies a property head (node + edge MLPs) to features from a single GNN
+ * layer. This is the building block for all property predictions (energy,
+ * forces, stress).
+ *
+ * @param gctx Graph context
+ * @param property_name Name of the property ("energy", "nc_forces", "nc_stress")
+ * @param node_features Node features [d_pet, total_atoms]
+ * @param edge_features Edge features [d_pet, max_neighbors, total_atoms]
+ * @param layer_idx GNN layer index (0 or 1)
+ * @param weight_edges_by_cutoff If true, weight edge contributions by cutoff
+ * @return Property values [output_dim, total_atoms], or nullptr if not available
+ */
+ggml_tensor *build_property_output(pet_graph_context &gctx,
+                                   const std::string &property_name,
+                                   ggml_tensor *node_features,
+                                   ggml_tensor *edge_features, int layer_idx,
+                                   bool weight_edges_by_cutoff = true);
+
 } // namespace mlipcpp::pet

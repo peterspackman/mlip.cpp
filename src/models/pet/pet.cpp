@@ -27,6 +27,59 @@ constexpr size_t MAX_GRAPH_NODES_FORWARD =
 constexpr size_t MAX_GRAPH_NODES_BACKWARD =
     16384; // Max nodes when computing gradients
 
+// ============================================================================
+// Property Head Loading Helper
+// ============================================================================
+
+namespace {
+
+/// Replace "{}" in format string with layer index
+std::string format_layer(const std::string &fmt, int layer_idx) {
+  std::string result = fmt;
+  size_t pos = result.find("{}");
+  if (pos != std::string::npos) {
+    result.replace(pos, 2, std::to_string(layer_idx));
+  }
+  return result;
+}
+
+/// Load a property head from GGUF using the given config
+template <typename GetTensorFn>
+PropertyHead load_property_head(int layer_idx, const PropertyConfig &config,
+                                GetTensorFn get_tensor) {
+  PropertyHead head;
+  std::string l = std::to_string(layer_idx);
+
+  // Node head MLP layers
+  head.node_head_0_weight =
+      get_tensor(config.node_prefix + "." + l + ".0.weight");
+  head.node_head_0_bias = get_tensor(config.node_prefix + "." + l + ".0.bias");
+  head.node_head_2_weight =
+      get_tensor(config.node_prefix + "." + l + ".2.weight");
+  head.node_head_2_bias = get_tensor(config.node_prefix + "." + l + ".2.bias");
+
+  // Edge head MLP layers
+  head.edge_head_0_weight =
+      get_tensor(config.edge_prefix + "." + l + ".0.weight");
+  head.edge_head_0_bias = get_tensor(config.edge_prefix + "." + l + ".0.bias");
+  head.edge_head_2_weight =
+      get_tensor(config.edge_prefix + "." + l + ".2.weight");
+  head.edge_head_2_bias = get_tensor(config.edge_prefix + "." + l + ".2.bias");
+
+  // Last layers (different naming pattern)
+  std::string node_last = format_layer(config.node_last_fmt, layer_idx);
+  std::string edge_last = format_layer(config.edge_last_fmt, layer_idx);
+
+  head.node_last_weight = get_tensor(node_last + ".weight");
+  head.node_last_bias = get_tensor(node_last + ".bias");
+  head.edge_last_weight = get_tensor(edge_last + ".weight");
+  head.edge_last_bias = get_tensor(edge_last + ".bias");
+
+  return head;
+}
+
+} // anonymous namespace
+
 PETModel::PETModel(const PETHypers &hypers)
     : hypers_(hypers),
       neighbor_builder_(NeighborListOptions{hypers.cutoff, true, false}) {
@@ -71,7 +124,8 @@ ModelResult PETModel::predict(const AtomicSystem &system, bool compute_forces) {
 
 std::vector<ModelResult>
 PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
-                        bool compute_forces) {
+                        bool compute_forces,
+                        bool compute_nc) {
   ScopedTimer total_timer(TimerCategory::Total);
 
   if (systems.empty()) {
@@ -220,13 +274,20 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
   batch.attn_mask_layer0 = create_input_tensor(batch_src.attn_mask_layer0);
   batch.attn_mask_layer1 = create_input_tensor(batch_src.attn_mask_layer1);
 
+  // Determine what nc outputs to compute
+  // nc_forces and nc_stress are computed from forward pass (no gradient needed)
+  // These are an ALTERNATIVE to gradient-based forces, not additive
+  // Computed only when explicitly requested via compute_nc
+  bool compute_nc_forces = compute_nc && weights_.has_force_heads();
+  bool compute_nc_stress = compute_nc && weights_.has_stress_heads();
+
   // Build forward graph (returns atomic energies)
   ggml_tensor *atomic_energies;
   ggml_tensor *total_energy = nullptr;
   ggml_cgraph *gf;
   {
     ScopedTimer graph_timer(TimerCategory::GraphBuild);
-    atomic_energies = build_forward_graph(batch);
+    atomic_energies = build_forward_graph(batch, compute_nc_forces, compute_nc_stress);
 
     // For gradient computation, we need a scalar loss
     if (compute_forces) {
@@ -236,6 +297,14 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
 
     gf = ggml_new_graph_custom(ctx_compute_, 32768, compute_forces);
     ggml_build_forward_expand(gf, atomic_energies);
+
+    // Include nc outputs in graph if requested
+    if (compute_nc_forces && nc_forces_output_) {
+      ggml_build_forward_expand(gf, nc_forces_output_);
+    }
+    if (compute_nc_stress && nc_stress_output_) {
+      ggml_build_forward_expand(gf, nc_stress_output_);
+    }
 
     if (compute_forces) {
       ggml_build_forward_expand(gf, total_energy);
@@ -274,25 +343,6 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
   }
   if (!sched_) {
     throw std::runtime_error("Failed to create backend scheduler");
-  }
-
-  // Debug: print out_prod tensor shapes when MLIP_DEBUG_OUT_PROD is set
-  if (std::getenv("MLIP_DEBUG_OUT_PROD")) {
-    int n_nodes = ggml_graph_n_nodes(gf);
-    for (int i = 0; i < n_nodes; i++) {
-      ggml_tensor *node = ggml_graph_node(gf, i);
-      if (node->op == GGML_OP_OUT_PROD) {
-        fprintf(stderr, "OUT_PROD node %d: dst[%ld,%ld,%ld,%ld] = src0[%ld,%ld,%ld,%ld] x src1[%ld,%ld,%ld,%ld]\n",
-                i,
-                node->ne[0], node->ne[1], node->ne[2], node->ne[3],
-                node->src[0]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2], node->src[0]->ne[3],
-                node->src[1]->ne[0], node->src[1]->ne[1], node->src[1]->ne[2], node->src[1]->ne[3]);
-        fprintf(stderr, "  src0 strides: nb[%ld,%ld,%ld,%ld]\n",
-                node->src[0]->nb[0], node->src[0]->nb[1], node->src[0]->nb[2], node->src[0]->nb[3]);
-        fprintf(stderr, "  src1 strides: nb[%ld,%ld,%ld,%ld]\n",
-                node->src[1]->nb[0], node->src[1]->nb[1], node->src[1]->nb[2], node->src[1]->nb[3]);
-      }
-    }
   }
 
   // Allocate graph tensors in backend buffers
@@ -519,16 +569,136 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
     extract_stress(batch, batch_src, gf, systems, results);
   }
 
+  // Extract non-conservative forces if computed
+  if (nc_forces_output_ && nc_forces_output_->buffer) {
+    // nc_forces_output_ shape: [output_dim, total_atoms] = [3, total_atoms]
+    std::vector<float> nc_forces_data(ggml_nelements(nc_forces_output_));
+    ggml_backend_tensor_get(nc_forces_output_, nc_forces_data.data(), 0,
+                            ggml_nbytes(nc_forces_output_));
+
+    // Build atom-to-system mapping
+    int32_t *system_indices_ptr =
+        static_cast<int32_t *>(batch_src.system_indices->data);
+    std::vector<int> atom_to_local(batch.total_atoms);
+    std::vector<int> local_idx_counter(systems.size(), 0);
+    for (int atom_idx = 0; atom_idx < batch.total_atoms; ++atom_idx) {
+      int sys_idx = system_indices_ptr[atom_idx];
+      atom_to_local[atom_idx] = local_idx_counter[sys_idx]++;
+    }
+
+    // Initialize forces if not already done
+    for (size_t i = 0; i < systems.size(); ++i) {
+      if (results[i].forces.empty()) {
+        results[i].forces.resize(systems[i].num_atoms() * 3, 0.0f);
+      }
+      results[i].has_forces = true;
+    }
+
+    // Add nc_forces to results (accumulated with gradient-based forces if
+    // present)
+    for (int atom_idx = 0; atom_idx < batch.total_atoms; ++atom_idx) {
+      int sys_idx = system_indices_ptr[atom_idx];
+      int local_atom = atom_to_local[atom_idx];
+
+      // nc_forces_output_ is [3, total_atoms] in GGML format
+      // GGML memory layout: element(i,j) at offset i + j*ne[0]
+      // So data is: [fx_0, fy_0, fz_0, fx_1, fy_1, fz_1, ...]
+      float fx = nc_forces_data[atom_idx * 3 + 0];
+      float fy = nc_forces_data[atom_idx * 3 + 1];
+      float fz = nc_forces_data[atom_idx * 3 + 2];
+
+      results[sys_idx].forces[local_atom * 3 + 0] += fx;
+      results[sys_idx].forces[local_atom * 3 + 1] += fy;
+      results[sys_idx].forces[local_atom * 3 + 2] += fz;
+    }
+  }
+
+  // Extract non-conservative stress if available
+  if (nc_stress_output_ && nc_stress_output_->buffer) {
+    // nc_stress_output_ shape: [9, total_atoms]
+    std::vector<float> nc_stress_data(ggml_nelements(nc_stress_output_));
+    ggml_backend_tensor_get(nc_stress_output_, nc_stress_data.data(), 0,
+                            ggml_nbytes(nc_stress_output_));
+
+    int32_t *system_indices_ptr =
+        static_cast<int32_t *>(batch_src.system_indices->data);
+
+    // Initialize stress if not already done (Voigt notation: xx, yy, zz, yz,
+    // xz, xy)
+    for (size_t i = 0; i < systems.size(); ++i) {
+      if (results[i].stress.empty()) {
+        results[i].stress.resize(6, 0.0f);
+      }
+    }
+
+    // Accumulate per-atom stress contributions to system stress
+    // The nc_stress head outputs 9 values per atom (full 3x3 tensor)
+    // Convert to Voigt notation and accumulate
+    for (int atom_idx = 0; atom_idx < batch.total_atoms; ++atom_idx) {
+      int sys_idx = system_indices_ptr[atom_idx];
+
+      // nc_stress_output_ is [9, total_atoms] in GGML format
+      // GGML memory layout: element(i,j) at offset i + j*ne[0]
+      // So data is: [s00_0, s01_0, s02_0, ..., s22_0, s00_1, s01_1, ...]
+      // Indices within each atom: 0=xx, 1=xy, 2=xz, 3=yx, 4=yy, 5=yz, 6=zx, 7=zy, 8=zz
+      int base = atom_idx * 9;
+      float sxx = nc_stress_data[base + 0];
+      float sxy = nc_stress_data[base + 1];
+      float sxz = nc_stress_data[base + 2];
+      float syx = nc_stress_data[base + 3];
+      float syy = nc_stress_data[base + 4];
+      float syz = nc_stress_data[base + 5];
+      float szx = nc_stress_data[base + 6];
+      float szy = nc_stress_data[base + 7];
+      float szz = nc_stress_data[base + 8];
+
+      // Voigt: [xx, yy, zz, yz, xz, xy]
+      // Symmetrize off-diagonal components
+      results[sys_idx].stress[0] += sxx;
+      results[sys_idx].stress[1] += syy;
+      results[sys_idx].stress[2] += szz;
+      results[sys_idx].stress[3] += 0.5f * (syz + szy);
+      results[sys_idx].stress[4] += 0.5f * (sxz + szx);
+      results[sys_idx].stress[5] += 0.5f * (sxy + syx);
+    }
+
+    // Divide by cell volume for periodic systems
+    for (size_t sys_idx = 0; sys_idx < systems.size(); ++sys_idx) {
+      const Cell *cell = systems[sys_idx].cell();
+      if (cell &&
+          (cell->periodic[0] || cell->periodic[1] || cell->periodic[2])) {
+        const auto &m = cell->matrix;
+        float vol = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        vol = std::abs(vol);
+
+        if (vol > 1e-10f) {
+          for (int i = 0; i < 6; ++i) {
+            results[sys_idx].stress[i] /= vol;
+          }
+          results[sys_idx].has_stress = true;
+        }
+      }
+    }
+  }
+
   // Cleanup batch context
   ggml_free(batch_ctx);
 
   return results;
 }
 
-ggml_tensor *PETModel::build_forward_graph(const BatchedInput &batch) {
+ggml_tensor *PETModel::build_forward_graph(const BatchedInput &batch,
+                                           bool compute_nc_forces,
+                                           bool compute_nc_stress) {
   // Create graph context for helper functions
   pet_graph_context gctx = {ctx_compute_, hypers_, batch, weights_,
                             compute_precision_};
+
+  // Reset non-conservative outputs
+  nc_forces_output_ = nullptr;
+  nc_stress_output_ = nullptr;
 
   // Phase 2: Initial embeddings
   ggml_tensor *input_messages = initial_embeddings(batch);
@@ -556,11 +726,55 @@ ggml_tensor *PETModel::build_forward_graph(const BatchedInput &batch) {
   node_features_list.push_back(node_features_1);
   edge_features_list.push_back(edge_features_1);
 
-  // Store for post-compute logging
-
   // Phase 4: Aggregation using extracted helper
-  return build_aggregation_and_output(gctx, node_features_list,
-                                      edge_features_list);
+  ggml_tensor *atomic_energies = build_aggregation_and_output(
+      gctx, node_features_list, edge_features_list);
+
+  // Build non-conservative force outputs if requested and available
+  if (compute_nc_forces && weights_.has_force_heads()) {
+    for (size_t layer_idx = 0; layer_idx < node_features_list.size();
+         ++layer_idx) {
+      ggml_tensor *nc_forces_layer = build_property_output(
+          gctx, "nc_forces", node_features_list[layer_idx],
+          edge_features_list[layer_idx], static_cast<int>(layer_idx), true);
+
+      if (nc_forces_layer) {
+        if (nc_forces_output_ == nullptr) {
+          nc_forces_output_ = nc_forces_layer;
+        } else {
+          nc_forces_output_ =
+              ggml_add(ctx_compute_, nc_forces_output_, nc_forces_layer);
+        }
+      }
+    }
+    if (nc_forces_output_) {
+      ggml_set_output(nc_forces_output_);
+    }
+  }
+
+  // Build non-conservative stress outputs if requested and available
+  if (compute_nc_stress && weights_.has_stress_heads()) {
+    for (size_t layer_idx = 0; layer_idx < node_features_list.size();
+         ++layer_idx) {
+      ggml_tensor *nc_stress_layer = build_property_output(
+          gctx, "nc_stress", node_features_list[layer_idx],
+          edge_features_list[layer_idx], static_cast<int>(layer_idx), true);
+
+      if (nc_stress_layer) {
+        if (nc_stress_output_ == nullptr) {
+          nc_stress_output_ = nc_stress_layer;
+        } else {
+          nc_stress_output_ =
+              ggml_add(ctx_compute_, nc_stress_output_, nc_stress_layer);
+        }
+      }
+    }
+    if (nc_stress_output_) {
+      ggml_set_output(nc_stress_output_);
+    }
+  }
+
+  return atomic_energies;
 }
 
 ggml_tensor *PETModel::initial_embeddings(const BatchedInput &batch) {
@@ -967,9 +1181,8 @@ bool PETModel::load_from_gguf(const std::string &path) {
     // Get weight tensors by name (they now have data in backend buffer)
     auto get_weight_tensor = [&](const std::string &name) -> ggml_tensor * {
       ggml_tensor *t = ggml_get_tensor(ctx_weights_, name.c_str());
-      if (!t) {
-        log::warn("Tensor '{}' not found in loaded weights", name);
-      }
+      // Don't log missing tensors - optional properties (nc_forces, nc_stress)
+      // may not exist in older models
       return t;
     };
 
@@ -1029,40 +1242,27 @@ bool PETModel::load_from_gguf(const std::string &path) {
       }
     }
 
-    // Load output head weights for each GNN layer
+    // Load property heads for each GNN layer using the generic loader
     for (int layer_idx = 0; layer_idx < hypers_.num_gnn_layers; ++layer_idx) {
-      std::string layer_str = std::to_string(layer_idx);
-      auto &head = weights_.heads[layer_idx];
+      // Energy heads (always required)
+      weights_.property_heads["energy"][layer_idx] = load_property_head(
+          layer_idx, property_configs::ENERGY, get_weight_tensor);
 
-      // Node head
-      head.node_head_0_weight = get_weight_tensor("model.node_heads.energy." +
-                                                  layer_str + ".0.weight");
-      head.node_head_0_bias =
-          get_weight_tensor("model.node_heads.energy." + layer_str + ".0.bias");
-      head.node_head_2_weight = get_weight_tensor("model.node_heads.energy." +
-                                                  layer_str + ".2.weight");
-      head.node_head_2_bias =
-          get_weight_tensor("model.node_heads.energy." + layer_str + ".2.bias");
+      // Non-conservative force heads (PET-MAD v1.1.0+)
+      weights_.property_heads["nc_forces"][layer_idx] = load_property_head(
+          layer_idx, property_configs::NC_FORCES, get_weight_tensor);
 
-      // Edge head
-      head.edge_head_0_weight = get_weight_tensor("model.edge_heads.energy." +
-                                                  layer_str + ".0.weight");
-      head.edge_head_0_bias =
-          get_weight_tensor("model.edge_heads.energy." + layer_str + ".0.bias");
-      head.edge_head_2_weight = get_weight_tensor("model.edge_heads.energy." +
-                                                  layer_str + ".2.weight");
-      head.edge_head_2_bias =
-          get_weight_tensor("model.edge_heads.energy." + layer_str + ".2.bias");
+      // Non-conservative stress heads (PET-MAD v1.1.0+)
+      weights_.property_heads["nc_stress"][layer_idx] = load_property_head(
+          layer_idx, property_configs::NC_STRESS, get_weight_tensor);
+    }
 
-      // Last layers
-      head.node_last_weight = get_weight_tensor(
-          "model.node_last_layers.energy." + layer_str + ".energy___0.weight");
-      head.node_last_bias = get_weight_tensor("model.node_last_layers.energy." +
-                                              layer_str + ".energy___0.bias");
-      head.edge_last_weight = get_weight_tensor(
-          "model.edge_last_layers.energy." + layer_str + ".energy___0.weight");
-      head.edge_last_bias = get_weight_tensor("model.edge_last_layers.energy." +
-                                              layer_str + ".energy___0.bias");
+    // Log available properties
+    if (weights_.has_force_heads()) {
+      log::info("Non-conservative force heads: available");
+    }
+    if (weights_.has_stress_heads()) {
+      log::info("Non-conservative stress heads: available");
     }
 
     // Load composition energies from GGUF (stored as tensors in backend buffer)
@@ -1088,13 +1288,6 @@ bool PETModel::load_from_gguf(const std::string &path) {
         species_to_index_[atomic_numbers[i]] = i;
       }
 
-      // Debug output
-      if (getenv("MLIP_DEBUG_COMP")) {
-        log::debug("Loaded {} composition energies:", n_species);
-        for (int i = 0; i < n_species; ++i) {
-          log::debug("  Z={}: {:.6f} eV", atomic_numbers[i], energies[i]);
-        }
-      }
     }
 
     // Free the temporary context (we're done with it)

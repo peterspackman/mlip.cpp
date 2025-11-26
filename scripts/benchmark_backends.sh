@@ -18,7 +18,18 @@ if [ ! -f "$BENCHMARK" ]; then
 fi
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <model.gguf> [--no-forces] [--warmup N] [--iterations N]"
+    echo "Usage: $0 <model.gguf> [options]"
+    echo ""
+    echo "Options (passed to backend_benchmark):"
+    echo "  --no-forces     Energy only (fastest)"
+    echo "  --nc-forces     Non-conservative forces via forward pass (fast)"
+    echo "  (default)       Gradient forces via backprop (slow)"
+    echo "  --warmup N      Warmup iterations (default: 2)"
+    echo "  --iterations N  Timed iterations (default: 3)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 pet-mad.gguf --no-forces          # Fast energy-only benchmark"
+    echo "  $0 pet-mad-1.1.0.gguf --nc-forces    # NC-forces benchmark (v1.1.0+)"
     exit 1
 fi
 
@@ -27,11 +38,20 @@ shift
 EXTRA_ARGS="$@"
 
 # Backends to try (in order of preference)
-BACKENDS=(cpu metal cuda hip vulkan sycl)
+BACKENDS=(metal cuda hip cpu vulkan sycl)
+
+# Determine mode for display
+MODE="Energy + Forces (gradient)"
+if [[ "$EXTRA_ARGS" == *"--no-forces"* ]]; then
+    MODE="Energy only"
+elif [[ "$EXTRA_ARGS" == *"--nc-forces"* ]]; then
+    MODE="Energy + NC-Forces (forward)"
+fi
 
 echo "=========================================="
 echo "Backend Benchmark Comparison"
 echo "Model: $MODEL"
+echo "Mode: $MODE"
 echo "=========================================="
 echo ""
 
@@ -42,12 +62,12 @@ echo "backend,atoms,time_ms,energy" > "$TMPFILE"
 AVAILABLE_BACKENDS=()
 
 for backend in "${BACKENDS[@]}"; do
-    echo "Testing $backend backend..."
+    echo -n "Testing $backend backend... "
     if $BENCHMARK "$MODEL" --backend "$backend" --csv $EXTRA_ARGS 2>/dev/null | tail -n +2 >> "$TMPFILE"; then
         AVAILABLE_BACKENDS+=("$backend")
-        echo "  OK"
+        echo "OK"
     else
-        echo "  Not available"
+        echo "Not available"
     fi
 done
 
@@ -87,23 +107,26 @@ done
 
 echo ""
 
-# Speedup table if CPU is available
-if [[ " ${AVAILABLE_BACKENDS[*]} " =~ " cpu " ]]; then
+# Speedup table if we have multiple backends
+if [ ${#AVAILABLE_BACKENDS[@]} -gt 1 ]; then
+    # Use first backend as baseline
+    BASELINE="${AVAILABLE_BACKENDS[0]}"
+
     echo "=========================================="
-    echo "Speedup vs CPU (higher is better)"
+    echo "Speedup vs $BASELINE (higher is better)"
     echo "=========================================="
     echo ""
 
     printf "%8s" "Atoms"
     for backend in "${AVAILABLE_BACKENDS[@]}"; do
-        if [ "$backend" != "cpu" ]; then
+        if [ "$backend" != "$BASELINE" ]; then
             printf "%12s" "$backend"
         fi
     done
     echo ""
     printf "%8s" "--------"
     for backend in "${AVAILABLE_BACKENDS[@]}"; do
-        if [ "$backend" != "cpu" ]; then
+        if [ "$backend" != "$BASELINE" ]; then
             printf "%12s" "--------"
         fi
     done
@@ -111,12 +134,12 @@ if [[ " ${AVAILABLE_BACKENDS[*]} " =~ " cpu " ]]; then
 
     for n_atoms in $ATOMS; do
         printf "%8s" "$n_atoms"
-        cpu_time=$(grep "^cpu,$n_atoms," "$TMPFILE" | cut -d',' -f3)
+        baseline_time=$(grep "^$BASELINE,$n_atoms," "$TMPFILE" | cut -d',' -f3)
         for backend in "${AVAILABLE_BACKENDS[@]}"; do
-            if [ "$backend" != "cpu" ]; then
+            if [ "$backend" != "$BASELINE" ]; then
                 backend_time=$(grep "^$backend,$n_atoms," "$TMPFILE" | cut -d',' -f3)
-                if [ -n "$backend_time" ] && [ -n "$cpu_time" ]; then
-                    speedup=$(echo "scale=2; $cpu_time / $backend_time" | bc)
+                if [ -n "$backend_time" ] && [ -n "$baseline_time" ]; then
+                    speedup=$(echo "scale=2; $baseline_time / $backend_time" | bc)
                     printf "%11sx" "$speedup"
                 else
                     printf "%12s" "-"

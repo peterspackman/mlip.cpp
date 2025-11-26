@@ -721,6 +721,124 @@ ggml_tensor *build_tokens(pet_graph_context &gctx, int layer_idx,
 // Aggregation and Output
 // ============================================================================
 
+// ============================================================================
+// Property Head Application Helper
+// ============================================================================
+
+namespace {
+
+/// Apply a 2-layer MLP head to features
+/// Input: features [d_pet, N] (2D)
+/// Output: [output_dim, N]
+ggml_tensor *apply_mlp_head(pet_graph_context &gctx, const PropertyHead &head,
+                            ggml_tensor *features, bool is_node_head) {
+
+  auto *w0 = is_node_head ? head.node_head_0_weight : head.edge_head_0_weight;
+  auto *b0 = is_node_head ? head.node_head_0_bias : head.edge_head_0_bias;
+  auto *w2 = is_node_head ? head.node_head_2_weight : head.edge_head_2_weight;
+  auto *b2 = is_node_head ? head.node_head_2_bias : head.edge_head_2_bias;
+  auto *wL = is_node_head ? head.node_last_weight : head.edge_last_weight;
+  auto *bL = is_node_head ? head.node_last_bias : head.edge_last_bias;
+
+  // Layer 0: d_pet -> d_head
+  ggml_tensor *h =
+      ggml_mul_mat(gctx.ctx, maybe_cast(gctx.ctx, w0, gctx.precision), features);
+  h = ggml_add(gctx.ctx, h, b0);
+  h = ggml_silu(gctx.ctx, h);
+
+  // Layer 2: d_head -> d_head
+  h = ggml_mul_mat(gctx.ctx, maybe_cast(gctx.ctx, w2, gctx.precision), h);
+  h = ggml_add(gctx.ctx, h, b2);
+  h = ggml_silu(gctx.ctx, h);
+
+  // Last layer: d_head -> output_dim
+  h = ggml_mul_mat(gctx.ctx, maybe_cast(gctx.ctx, wL, gctx.precision), h);
+  h = ggml_add(gctx.ctx, h, bL);
+
+  return h;
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// Generic Property Output Builder
+// ============================================================================
+
+ggml_tensor *build_property_output(pet_graph_context &gctx,
+                                   const std::string &property_name,
+                                   ggml_tensor *node_features,
+                                   ggml_tensor *edge_features, int layer_idx,
+                                   bool weight_edges_by_cutoff) {
+  // Get the property head for this layer
+  auto it = gctx.weights.property_heads.find(property_name);
+  if (it == gctx.weights.property_heads.end()) {
+    return nullptr;
+  }
+
+  const PropertyHead &head = it->second[layer_idx];
+  if (!head.is_loaded()) {
+    return nullptr;
+  }
+
+  // Apply node head
+  ggml_tensor *node_out = apply_mlp_head(gctx, head, node_features, true);
+  // Result: [output_dim, total_atoms]
+
+  // Apply edge head (on 2D flattened version)
+  ggml_tensor *edge_feat_cont = ggml_cont(gctx.ctx, edge_features);
+  ggml_tensor *edge_feat_2d =
+      ggml_reshape_2d(gctx.ctx, edge_feat_cont, gctx.hypers.d_pet,
+                      gctx.batch.max_neighbors * gctx.batch.total_atoms);
+
+  ggml_tensor *edge_head_out = apply_mlp_head(gctx, head, edge_feat_2d, false);
+  // Result: [output_dim, max_neighbors * total_atoms]
+
+  int output_dim = head.output_dim();
+
+  // Reshape edge output to 3D
+  edge_head_out = ggml_cont(gctx.ctx, edge_head_out);
+  edge_head_out = ggml_reshape_3d(gctx.ctx, edge_head_out, output_dim,
+                                  gctx.batch.max_neighbors,
+                                  gctx.batch.total_atoms);
+  // Result: [output_dim, max_neighbors, total_atoms]
+
+  if (weight_edges_by_cutoff) {
+    // Weight by cutoff factors: need to broadcast [max_neighbors, total_atoms]
+    // to [output_dim, max_neighbors, total_atoms]
+    ggml_tensor *cutoff_broadcast =
+        ggml_reshape_3d(gctx.ctx, gctx.batch.cutoff_factors_nef, 1,
+                        gctx.batch.max_neighbors, gctx.batch.total_atoms);
+    edge_head_out = ggml_mul(gctx.ctx, edge_head_out, cutoff_broadcast);
+
+    // Also apply padding mask
+    ggml_tensor *mask_broadcast =
+        ggml_reshape_3d(gctx.ctx, gctx.batch.padding_mask_nef, 1,
+                        gctx.batch.max_neighbors, gctx.batch.total_atoms);
+    edge_head_out = ggml_mul(gctx.ctx, edge_head_out, mask_broadcast);
+  }
+
+  // Sum over neighbors: [output_dim, max_neighbors, total_atoms] -> [output_dim,
+  // total_atoms]
+  // We need to sum dimension 1 (max_neighbors). GGML sum_rows sums dim 0, so we
+  // permute first.
+  ggml_tensor *edge_permuted =
+      ggml_permute(gctx.ctx, edge_head_out, 1, 0, 2, 3);
+  // Now: [max_neighbors, output_dim, total_atoms]
+  edge_permuted = ggml_cont(gctx.ctx, edge_permuted);
+  ggml_tensor *edge_summed = ggml_sum_rows(gctx.ctx, edge_permuted);
+  // Result: [1, output_dim, total_atoms]
+  edge_summed =
+      ggml_reshape_2d(gctx.ctx, edge_summed, output_dim, gctx.batch.total_atoms);
+  // Result: [output_dim, total_atoms]
+
+  // Combine node and edge contributions
+  return ggml_add(gctx.ctx, node_out, edge_summed);
+}
+
+// ============================================================================
+// Aggregation and Output (Energy-specific)
+// ============================================================================
+
 ggml_tensor *build_aggregation_and_output(
     pet_graph_context &gctx,
     const std::vector<ggml_tensor *> &node_features_list,
@@ -731,7 +849,7 @@ ggml_tensor *build_aggregation_and_output(
 
   for (size_t layer_idx = 0; layer_idx < node_features_list.size();
        ++layer_idx) {
-    const auto &head = gctx.weights.heads[layer_idx];
+    const auto &head = gctx.weights.heads(static_cast<int>(layer_idx));
     ggml_tensor *node_feat = node_features_list[layer_idx];
     ggml_tensor *edge_feat = edge_features_list[layer_idx];
 
