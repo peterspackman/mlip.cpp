@@ -1,0 +1,32 @@
+build/
+build*/
+debug/
+*.swp
+*.swo
+*~
+.DS_Store
+*.gguf
+*.pt
+*.pth
+compile_commands.json
+
+.cache
+# Reference repositories (for development only, not part of the project)
+reference/
+
+# Temporary files and directories
+/tmp/
+*_test_*/
+*_debug*/
+*.backup*
+__pycache__/
+pytorch_dump/
+stdout
+
+# Documentation (except README)
+*.md
+!README.md
+
+# Development directories
+testing/
+local/

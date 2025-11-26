@@ -1,0 +1,47 @@
+[build-system]
+requires = ["scikit-build-core >=0.4.3", "nanobind >=2.0.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mlipcpp"
+version = "0.1.0"
+description = "Fast C++ implementation of Machine Learning Interatomic Potentials"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Peter Spackman", email = "peterspackman@fastmail.com" },
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = ["numpy >=1.24.0"]
+
+[project.optional-dependencies]
+ase = ["ase >=3.22.0"]
+test = ["pytest", "ase >=3.22.0"]
+
+[project.urls]
+Homepage = "https://github.com/peterspackman/mlipcpp"
+
+[tool.scikit-build]
+minimum-version = "0.4"
+build-dir = "build-{wheel_tag}"
+wheel.py-api = "cp312"
+cmake.targets = ["_mlipcpp"]
+
+[tool.scikit-build.cmake.define]
+MLIPCPP_BUILD_PYTHON = "ON"
+MLIPCPP_BUILD_EXAMPLES = "OFF"
+MLIPCPP_BUILD_TESTS = "OFF"
+
+[tool.cibuildwheel]
+build-verbosity = 1
+skip = ["cp38-*", "cp39-*", "pp*", "*musllinux*"]
+archs = ["auto64"]
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "11.0"

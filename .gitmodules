@@ -1,0 +1,9 @@
+[submodule "external/ggml"]
+	path = external/ggml
+	url = https://github.com/ggml-org/ggml.git
+[submodule "external/Catch2"]
+	path = external/Catch2
+	url = https://github.com/catchorg/Catch2.git
+[submodule "external/fmt"]
+	path = external/fmt
+	url = https://github.com/fmtlib/fmt.git

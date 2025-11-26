@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+# mlipcpp - Machine Learning Interatomic Potentials in C++
+#
+# Provides the following imported targets:
+#   mlipcpp::mlipcpp   - Main C/C++ library
+#   mlipcpp::fortran   - Fortran bindings (if built with MLIPCPP_BUILD_FORTRAN)
+#
+# Usage:
+#   find_package(mlipcpp REQUIRED)
+#   target_link_libraries(myapp PRIVATE mlipcpp::mlipcpp)
+
+# Include the targets file
+include("${CMAKE_CURRENT_LIST_DIR}/mlipcppTargets.cmake")
+
+check_required_components(mlipcpp)
