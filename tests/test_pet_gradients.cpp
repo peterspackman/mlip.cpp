@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <cmath>
+#include <fmt/core.h>
 #include <vector>
 
 using namespace mlipcpp;
@@ -52,8 +53,7 @@ TEST_CASE("PET forces match Python reference (water molecule)",
   REQUIRE(result.forces.size() == 9); // 3 atoms * 3 coords
 
   // Compare against Python reference
-  fprintf(stderr,
-          "Water molecule forces comparison vs Python PETMADCalculator:\n");
+  fmt::print("Water molecule forces comparison vs Python PETMADCalculator:\n");
   float max_error = 0.0f;
 
   for (int atom = 0; atom < 3; ++atom) {
@@ -63,15 +63,14 @@ TEST_CASE("PET forces match Python reference (water molecule)",
       float py_force = WATER_REF_FORCES[idx];
       float error = std::abs(cpp_force - py_force);
 
-      fprintf(stderr,
-              "  Atom %d coord %d: C++=%10.6f Python=%10.6f error=%.6f\n", atom,
-              coord, cpp_force, py_force, error);
+      fmt::print("  Atom {} coord {}: C++=%10.6f Python=%10.6f error=%.6f\n",
+                 atom, coord, cpp_force, py_force, error);
 
       max_error = std::max(max_error, error);
     }
   }
 
-  fprintf(stderr, "Max absolute error: %.6f eV/A\n", max_error);
+  fmt::print("Max absolute error: %.6f eV/A\n", max_error);
   INFO("Max absolute error: " << max_error << " eV/A");
 
   // Require very tight tolerance - should match to ~6 decimal places
@@ -109,7 +108,7 @@ TEST_CASE("PET forces match Python reference (Si crystal)", "[pet][gradient]") {
   REQUIRE(result.forces.size() == 6); // 2 atoms * 3 coords
 
   // Compare against Python reference
-  fprintf(stderr, "Si crystal forces comparison vs Python PETMADCalculator:\n");
+  fmt::print("Si crystal forces comparison vs Python PETMADCalculator:\n");
   float max_error = 0.0f;
 
   for (int atom = 0; atom < 2; ++atom) {
@@ -119,15 +118,14 @@ TEST_CASE("PET forces match Python reference (Si crystal)", "[pet][gradient]") {
       float py_force = SI_REF_FORCES[idx];
       float error = std::abs(cpp_force - py_force);
 
-      fprintf(stderr,
-              "  Atom %d coord %d: C++=%10.6f Python=%10.6f error=%.6f\n", atom,
-              coord, cpp_force, py_force, error);
+      fmt::print("  Atom {} coord {}: C++=%10.6f Python=%10.6f error=%.6f\n",
+                 atom, coord, cpp_force, py_force, error);
 
       max_error = std::max(max_error, error);
     }
   }
 
-  fprintf(stderr, "Max absolute error: %.6f eV/A\n", max_error);
+  fmt::print("Max absolute error: %.6f eV/A\n", max_error);
   INFO("Max absolute error: " << max_error << " eV/A");
 
   // Require very tight tolerance
@@ -168,7 +166,7 @@ TEST_CASE("PET stress matches Python reference (Si crystal)",
   REQUIRE(result.stress.size() == 6);
 
   // Compare against Python reference
-  fprintf(stderr, "Si crystal stress comparison vs Python PETMADCalculator:\n");
+  fmt::print("Si crystal stress comparison vs Python PETMADCalculator:\n");
   const char *labels[] = {"xx", "yy", "zz", "yz", "xz", "xy"};
   float max_error = 0.0f;
 
@@ -177,13 +175,13 @@ TEST_CASE("PET stress matches Python reference (Si crystal)",
     float py_stress = SI_REF_STRESS[i];
     float error = std::abs(cpp_stress - py_stress);
 
-    fprintf(stderr, "  %s: C++=%10.6f Python=%10.6f error=%.6f\n", labels[i],
-            cpp_stress, py_stress, error);
+    fmt::print("  {}: C++=%10.6f Python=%10.6f error=%.6f\n", labels[i],
+               cpp_stress, py_stress, error);
 
     max_error = std::max(max_error, error);
   }
 
-  fprintf(stderr, "Max absolute error: %.6f eV/A^3\n", max_error);
+  fmt::print("Max absolute error: %.6f eV/A^3\n", max_error);
   INFO("Max absolute error: " << max_error << " eV/A^3");
 
   // Require very tight tolerance
@@ -215,8 +213,8 @@ TEST_CASE("PET forces sum to zero (momentum conservation)", "[pet][gradient]") {
 
   float total_mag = std::sqrt(total_fx * total_fx + total_fy * total_fy +
                               total_fz * total_fz);
-  fprintf(stderr, "Force sum: (%.6f, %.6f, %.6f) magnitude=%.6f\n", total_fx,
-          total_fy, total_fz, total_mag);
+  fmt::print("Force sum: (%.6f, %.6f, %.6f) magnitude=%.6f\n", total_fx,
+             total_fy, total_fz, total_mag);
   INFO("Total force magnitude: " << total_mag);
 
   // Forces should sum to approximately zero

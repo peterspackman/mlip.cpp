@@ -11,12 +11,14 @@ target_link_libraries(test_pet
         mlipcpp
         Catch2::Catch2WithMain
         ggml
+        fmt::fmt
 )
 
 target_include_directories(test_pet
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/models/pet
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
 )
 
 # Create symlink to model file for CTest
@@ -34,6 +36,7 @@ add_executable(test_ggml_layout
 target_link_libraries(test_ggml_layout
     PRIVATE
         ggml
+        fmt::fmt
 )
 
 target_include_directories(test_ggml_layout
@@ -51,12 +54,14 @@ target_link_libraries(test_pet_gradients
         mlipcpp
         Catch2::Catch2WithMain
         ggml
+        fmt::fmt
 )
 
 target_include_directories(test_pet_gradients
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/models/pet
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
 )
 
 add_custom_command(TARGET test_pet_gradients POST_BUILD
@@ -74,6 +79,7 @@ target_link_libraries(test_io
     PRIVATE
         mlipcpp
         Catch2::Catch2WithMain
+        fmt::fmt
 )
 
 # Neighbor list tests (no model file needed)
@@ -85,6 +91,7 @@ target_link_libraries(test_neighbor_list
     PRIVATE
         mlipcpp
         Catch2::Catch2WithMain
+        fmt::fmt
 )
 
 # System/Cell tests (no model file needed)
@@ -95,6 +102,7 @@ add_executable(test_system
 target_link_libraries(test_system
     PRIVATE
         mlipcpp
+        fmt::fmt
         Catch2::Catch2WithMain
 )
 
