@@ -3,6 +3,7 @@
 #include "system.h"
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mlipcpp {
 
