@@ -276,6 +276,25 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
     throw std::runtime_error("Failed to create backend scheduler");
   }
 
+  // Debug: print out_prod tensor shapes when MLIP_DEBUG_OUT_PROD is set
+  if (std::getenv("MLIP_DEBUG_OUT_PROD")) {
+    int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; i++) {
+      ggml_tensor *node = ggml_graph_node(gf, i);
+      if (node->op == GGML_OP_OUT_PROD) {
+        fprintf(stderr, "OUT_PROD node %d: dst[%ld,%ld,%ld,%ld] = src0[%ld,%ld,%ld,%ld] x src1[%ld,%ld,%ld,%ld]\n",
+                i,
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                node->src[0]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2], node->src[0]->ne[3],
+                node->src[1]->ne[0], node->src[1]->ne[1], node->src[1]->ne[2], node->src[1]->ne[3]);
+        fprintf(stderr, "  src0 strides: nb[%ld,%ld,%ld,%ld]\n",
+                node->src[0]->nb[0], node->src[0]->nb[1], node->src[0]->nb[2], node->src[0]->nb[3]);
+        fprintf(stderr, "  src1 strides: nb[%ld,%ld,%ld,%ld]\n",
+                node->src[1]->nb[0], node->src[1]->nb[1], node->src[1]->nb[2], node->src[1]->nb[3]);
+      }
+    }
+  }
+
   // Allocate graph tensors in backend buffers
   if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
     throw std::runtime_error("Failed to allocate graph in backend buffers");
