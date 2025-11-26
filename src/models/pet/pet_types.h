@@ -212,6 +212,8 @@ struct BatchedInput {
   ggml_tensor *edge_vectors_nef = nullptr; ///< [3, max_neighbors, total_atoms]
   ggml_tensor *neighbor_species_nef =
       nullptr; ///< [max_neighbors, total_atoms] (I32)
+  ggml_tensor *neighbor_species_transposed =
+      nullptr; ///< [total_atoms, max_neighbors] (I32) - pre-transposed for GPU
   ggml_tensor *edge_distances_nef = nullptr; ///< [max_neighbors, total_atoms]
   ggml_tensor *cutoff_factors_nef = nullptr; ///< [max_neighbors, total_atoms]
   ggml_tensor *padding_mask_nef =

@@ -348,6 +348,26 @@ void build_nef_tensors(ggml_context *ctx, BatchedInput &batch,
   memcpy(batch.neighbor_species_nef->data, neighbor_species_nef_cpu.data(),
          sizeof(int32_t) * neighbor_species_nef_cpu.size());
 
+  // Create transposed version for GPU compatibility
+  // CUDA/HIP don't support I32->I32 copy for non-contiguous tensors, so we
+  // pre-compute the transposed layout to avoid ggml_cont(ggml_transpose(...))
+  // Original: [max_neighbors, total_atoms] - slot varies fastest
+  // Transposed: [total_atoms, max_neighbors] - atom varies fastest
+  std::vector<int32_t> neighbor_species_transposed_cpu(
+      batch.max_neighbors * batch.total_atoms, 0);
+  for (int atom = 0; atom < batch.total_atoms; ++atom) {
+    for (int slot = 0; slot < batch.max_neighbors; ++slot) {
+      int src_idx = slot + atom * batch.max_neighbors;  // NEF layout
+      int dst_idx = atom + slot * batch.total_atoms;    // transposed layout
+      neighbor_species_transposed_cpu[dst_idx] = neighbor_species_nef_cpu[src_idx];
+    }
+  }
+  batch.neighbor_species_transposed = ggml_new_tensor_2d(
+      ctx, GGML_TYPE_I32, batch.total_atoms, batch.max_neighbors);
+  memcpy(batch.neighbor_species_transposed->data,
+         neighbor_species_transposed_cpu.data(),
+         sizeof(int32_t) * neighbor_species_transposed_cpu.size());
+
   // Gather edge distances
   std::vector<float> edge_distances_nef_cpu(
       batch.max_neighbors * batch.total_atoms, 0.0f);

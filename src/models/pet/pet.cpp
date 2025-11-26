@@ -208,6 +208,8 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
 
   batch.neighbor_species_nef =
       create_input_tensor(batch_src.neighbor_species_nef);
+  batch.neighbor_species_transposed =
+      create_input_tensor(batch_src.neighbor_species_transposed);
   batch.padding_mask_nef = create_input_tensor(batch_src.padding_mask_nef);
   batch.neighbor_indices_nef =
       create_input_tensor(batch_src.neighbor_indices_nef);
@@ -322,6 +324,8 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
   copy_tensor_data(batch.edge_neighbor_indices, batch_src.edge_neighbor_indices);
 
   copy_tensor_data(batch.neighbor_species_nef, batch_src.neighbor_species_nef);
+  copy_tensor_data(batch.neighbor_species_transposed,
+                   batch_src.neighbor_species_transposed);
   copy_tensor_data(batch.padding_mask_nef, batch_src.padding_mask_nef);
   copy_tensor_data(batch.neighbor_indices_nef, batch_src.neighbor_indices_nef);
   copy_tensor_data(batch.reversed_neighbor_list, batch_src.reversed_neighbor_list);
@@ -550,21 +554,16 @@ ggml_tensor *PETModel::initial_embeddings(const BatchedInput &batch) {
   // Note: batch.max_neighbors is always >= 1 even for isolated atoms
   // (batch preparation sets it to 1 when there are no edges)
 
-  // Flatten neighbor_species_nef for embedding lookup
-  // neighbor_species_nef is [max_neighbors, n_atoms] in GGML (NEF format)
-  // Row-major flatten gives: slot0_atom0, slot0_atom1, ..., slot0_atomN,
-  // slot1_atom0, ... But ggml_get_rows + reshape expects atom-major order!
+  // Flatten neighbor_species for embedding lookup
+  // neighbor_species_transposed is [n_atoms, max_neighbors] (pre-transposed on CPU)
+  // This avoids ggml_cont(ggml_transpose(...)) which triggers unsupported
+  // I32->I32 copy on CUDA/HIP for non-contiguous tensors.
   //
-  // Solution: Transpose to [n_atoms, max_neighbors], flatten to get atom-major
-  // order, then gather, then reshape to [d_pet, n_atoms, max_neighbors], then
-  // permute back to NEF
-
-  ggml_tensor *neighbor_species_transposed = ggml_cont(
-      ctx_compute_, ggml_transpose(ctx_compute_, batch.neighbor_species_nef));
-  // Now [n_atoms, max_neighbors]
+  // Row-major flatten gives atom-major order: atom0_all_slots, atom1_all_slots, ...
+  // Then gather, reshape to [d_pet, n_atoms, max_neighbors], permute back to NEF
 
   ggml_tensor *neighbor_species_flat =
-      ggml_reshape_1d(ctx_compute_, neighbor_species_transposed,
+      ggml_reshape_1d(ctx_compute_, batch.neighbor_species_transposed,
                       batch.max_neighbors * batch.total_atoms);
   // Flattened order: atom0_all_slots, atom1_all_slots, ...
 
