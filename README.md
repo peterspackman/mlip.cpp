@@ -5,7 +5,7 @@
 
 Standalone C++ implementation of Machine Learning Interatomic Potentials (MLIPs) using [ggml](https://github.com/ggml-org/ggml).
 
-Currently supports **PET-MAD** (Point Edge Transformer trained on Massive Atomic Diversity).
+Currently supports [PET-MAD](https://github.com/lab-cosmo/pet-mad) for energies, forces, stresses
 
 ## Dependencies
 
