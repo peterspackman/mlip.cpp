@@ -109,7 +109,7 @@ endif()
 CPMAddPackage(
     NAME ggml
     GITHUB_REPOSITORY peterspackman/ggml
-    GIT_TAG master
+    GIT_TAG d850966f  # Fix out_prod backward pass for non-contiguous tensors
     EXCLUDE_FROM_ALL YES
 )
 
