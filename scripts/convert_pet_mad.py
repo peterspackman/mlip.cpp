@@ -77,17 +77,26 @@ def extract_pet_hypers(model) -> dict[str, Any]:
 
 
 def extract_composition_energies(model) -> dict[int, float] | None:
-    """Extract composition energies from PET model's additive models."""
+    """Extract composition energies from PET model's additive models.
+
+    Handles different model structures:
+    - v1.0.x: model.module.model.additive_models
+    - v1.1.x: model.module.additive_models
+    """
     try:
         if not hasattr(model, "module"):
             return None
-        if not hasattr(model.module, "model"):
-            return None
-        if not hasattr(model.module.model, "additive_models"):
-            return None
 
-        additive_models = model.module.model.additive_models
-        if len(additive_models) == 0:
+        # Try different paths to find additive_models
+        additive_models = None
+        if hasattr(model.module, "additive_models"):
+            # v1.1.x structure
+            additive_models = model.module.additive_models
+        elif hasattr(model.module, "model") and hasattr(model.module.model, "additive_models"):
+            # v1.0.x structure
+            additive_models = model.module.model.additive_models
+
+        if additive_models is None or len(additive_models) == 0:
             return None
 
         comp_model = additive_models[0]
@@ -109,25 +118,67 @@ def extract_composition_energies(model) -> dict[int, float] | None:
 
             composition_energies = {}
             for i in range(len(samples)):
-                z = int(samples[i][0])
-                energy = float(values[i][0])
+                # samples is structured array with 'center_type' field
+                z = int(samples[i][0]) if hasattr(samples[i], '__len__') else int(samples[i])
+                energy = float(values[i][0]) if hasattr(values[i], '__len__') else float(values[i])
                 composition_energies[z] = energy
 
             return composition_energies
 
     except Exception as e:
         print(f"Warning: Failed to extract composition energies: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def convert_pet_to_gguf(model, hypers: dict[str, Any], output_path: str):
+def detect_model_features(state_dict: dict) -> dict[str, bool]:
+    """Detect which features are available in the model."""
+    features = {
+        "has_nc_forces": False,
+        "has_nc_stress": False,
+        "has_uncertainty": False,
+    }
+
+    for name in state_dict.keys():
+        if "non_conservative_forces" in name or "nc_forces" in name:
+            features["has_nc_forces"] = True
+        if "non_conservative_stress" in name or "nc_stress" in name:
+            features["has_nc_stress"] = True
+        if "uncertainty" in name.lower() or "covariance" in name.lower():
+            features["has_uncertainty"] = True
+
+    return features
+
+
+def convert_pet_to_gguf(
+    model, hypers: dict[str, Any], output_path: str, version: str = "unknown"
+):
     """Convert PET model to GGUF format."""
     writer = gguf.GGUFWriter(output_path, arch="pet")
 
-    writer.add_name("PET-MAD")
-    writer.add_description(
-        "Point Edge Transformer trained on Massive Atomic Diversity dataset"
-    )
+    # Detect model features
+    state_dict = model.state_dict() if hasattr(model, "state_dict") else {}
+    features = detect_model_features(state_dict)
+
+    # Model metadata
+    writer.add_name(f"PET-MAD v{version}")
+    description = "Point Edge Transformer trained on Massive Atomic Diversity dataset"
+    if features["has_nc_forces"]:
+        description += " (with non-conservative force heads)"
+    if features["has_nc_stress"]:
+        description += " (with non-conservative stress heads)"
+    writer.add_description(description)
+
+    # Version info
+    writer.add_string("pet.version", version)
+    writer.add_bool("pet.has_nc_forces", features["has_nc_forces"])
+    writer.add_bool("pet.has_nc_stress", features["has_nc_stress"])
+
+    print(f"Model features:")
+    print(f"  Non-conservative forces: {features['has_nc_forces']}")
+    print(f"  Non-conservative stress: {features['has_nc_stress']}")
+    print()
 
     # Hyperparameters
     writer.add_float32("pet.cutoff", float(hypers.get("cutoff", 6.0)))
@@ -163,23 +214,25 @@ def convert_pet_to_gguf(model, hypers: dict[str, Any], output_path: str):
     print("Extracting composition energies...")
     composition_energies = extract_composition_energies(model)
 
-    state_dict = model.state_dict() if hasattr(model, "state_dict") else {}
-
     if composition_energies is not None:
         atomic_numbers = sorted(composition_energies.keys())
         energies_list = [composition_energies[z] for z in atomic_numbers]
-
-        writer.add_tensor(
-            "composition.atomic_numbers", np.array(atomic_numbers, dtype=np.int32)
-        )
-        writer.add_tensor(
-            "composition.energies", np.array(energies_list, dtype=np.float32)
-        )
-        writer.add_int32("pet.composition.num_species", len(atomic_numbers))
-
-        print(f"  Added composition energies for {len(atomic_numbers)} elements")
+        print(f"  Found composition energies for {len(atomic_numbers)} elements")
     else:
-        print("  Warning: No composition energies found")
+        # Fallback: use atomic_types with zero energies
+        print("  No composition energies found, using zero energies for all atomic types")
+        atomic_numbers = atomic_types
+        energies_list = [0.0] * len(atomic_types)
+
+    # Always write composition tensors for consistent loader behavior
+    writer.add_tensor(
+        "composition.atomic_numbers", np.array(atomic_numbers, dtype=np.int32)
+    )
+    writer.add_tensor(
+        "composition.energies", np.array(energies_list, dtype=np.float32)
+    )
+    writer.add_int32("pet.composition.num_species", len(atomic_numbers))
+    print(f"  Written composition data for {len(atomic_numbers)} elements")
 
     # Model weights
     print(f"Extracting {len(state_dict)} tensors...")
@@ -194,10 +247,20 @@ def convert_pet_to_gguf(model, hypers: dict[str, Any], output_path: str):
         (".norm_attention.", ".norm_a."),
         (".norm_mlp.", ".norm_m."),
         ("gnn_layers.", "gnn."),
+        # Non-conservative heads (v1.1.0+)
+        ("non_conservative_forces", "nc_forces"),
+        ("non_conservative_stress", "nc_stress"),
+        ("nc_forces___0", "nc_f"),
+        ("nc_stress___0", "nc_s"),
     ]
 
     for name, param in state_dict.items():
         clean_name = name.replace("module.", "")
+        # Ensure model. prefix for main model weights
+        if not clean_name.startswith("model.") and not clean_name.startswith(
+            "composition."
+        ):
+            clean_name = "model." + clean_name
         for old, new in abbreviations:
             clean_name = clean_name.replace(old, new)
 
@@ -253,7 +316,7 @@ def main():
         print(f"  {key}: {value}")
     print()
 
-    convert_pet_to_gguf(model, hypers, args.output)
+    convert_pet_to_gguf(model, hypers, args.output, version=args.version)
 
     print(f"\nUsage: ./build/bin/simple_inference {args.output} structure.xyz")
 

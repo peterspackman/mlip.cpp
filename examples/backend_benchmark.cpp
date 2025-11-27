@@ -75,6 +75,7 @@ int main(int argc, char **argv) {
     std::cerr << "  --warmup N      Warmup iterations (default: 2)\n";
     std::cerr << "  --iterations N  Timed iterations (default: 3)\n";
     std::cerr << "  --no-forces     Benchmark energy only (no forces)\n";
+    std::cerr << "  --nc-forces     Use non-conservative forces (forward pass only)\n";
     std::cerr << "  --csv           Output CSV format for scripting\n";
     return 1;
   }
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
   int warmup = 2;
   int iterations = 3;
   bool compute_forces = true;
+  bool compute_nc = false;
   bool csv_output = false;
   pet::BackendPreference backend_pref = pet::BackendPreference::Auto;
   std::string backend_name = "auto";
@@ -109,6 +111,9 @@ int main(int argc, char **argv) {
       iterations = std::stoi(argv[++i]);
     } else if (arg == "--no-forces") {
       compute_forces = false;
+    } else if (arg == "--nc-forces") {
+      compute_nc = true;
+      compute_forces = false;  // nc-forces replaces gradient forces
     } else if (arg == "--csv") {
       csv_output = true;
     } else if (arg == "--backend" && i + 1 < argc) {
@@ -151,12 +156,22 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Determine mode string
+  std::string mode_str = "Energy";
+  if (compute_forces) {
+    mode_str += " + Forces (gradient)";
+  } else if (compute_nc) {
+    mode_str += " + NC-Forces (forward)";
+  } else {
+    mode_str += " only";
+  }
+
   if (csv_output) {
     // CSV header
     std::cout << "backend,atoms,time_ms,energy\n";
   } else {
     std::cout << "Backend: " << backend_name << "\n";
-    std::cout << "Mode: Energy" << (compute_forces ? " + Forces" : " only") << "\n";
+    std::cout << "Mode: " << mode_str << "\n";
     std::cout << "Warmup: " << warmup << ", Iterations: " << iterations << "\n";
     std::cout << std::string(50, '-') << "\n";
     std::cout << std::setw(8) << "Atoms" << std::setw(12) << "Time (ms)"
@@ -170,14 +185,15 @@ int main(int argc, char **argv) {
 
     // Warmup
     for (int i = 0; i < warmup; ++i) {
-      model.predict(system, compute_forces);
+      model.predict_batch({system}, compute_forces, compute_nc);
     }
 
     // Timed runs
     auto start = std::chrono::high_resolution_clock::now();
     ModelResult last_result;
     for (int i = 0; i < iterations; ++i) {
-      last_result = model.predict(system, compute_forces);
+      auto results = model.predict_batch({system}, compute_forces, compute_nc);
+      last_result = results[0];
     }
     auto end = std::chrono::high_resolution_clock::now();
 

@@ -34,9 +34,14 @@ int main(int argc, char **argv) {
     std::cerr << "Usage: " << argv[0]
               << " <model.gguf> <structure.xyz> [options]\n";
     std::cerr << "\nOptions:\n";
-    std::cerr << "  --forces          Compute and print forces\n";
-    std::cerr << "  --stress          Compute and print stress tensor "
+    std::cerr << "  --forces          Compute forces via gradient (conservative "
+                 "+ non-conservative)\n";
+    std::cerr << "  --nc-forces       Compute only non-conservative forces "
+                 "(faster, no gradient)\n";
+    std::cerr << "  --stress          Compute stress tensor via gradient "
                  "(periodic only)\n";
+    std::cerr << "  --nc-stress       Compute only non-conservative stress "
+                 "(faster, no gradient)\n";
     std::cerr << "  --backend B       Set backend: auto, cpu, cuda, hip, metal, "
                  "vulkan, sycl, cann (default: auto)\n";
     std::cerr << "  --precision P     Set compute precision: f32, f16 "
@@ -66,6 +71,8 @@ int main(int argc, char **argv) {
   float cutoff_override = -1.0f;           // -1 means use model's default
   bool compute_forces = false;
   bool compute_stress = false;
+  bool show_nc_forces = false;  // Show non-conservative forces only
+  bool show_nc_stress = false;  // Show non-conservative stress only
   bool quiet_mode = false;
   bool profile_mode = false;
   pet::BackendPreference backend_pref = pet::BackendPreference::Auto;
@@ -100,9 +107,13 @@ int main(int argc, char **argv) {
       cutoff_override = std::stof(argv[++i]);
     } else if (arg == "--forces") {
       compute_forces = true;
+    } else if (arg == "--nc-forces") {
+      show_nc_forces = true;
     } else if (arg == "--stress") {
       compute_stress = true;
       compute_forces = true; // Stress requires gradient computation
+    } else if (arg == "--nc-stress") {
+      show_nc_stress = true;
     } else if (arg == "--quiet") {
       quiet_mode = true;
       log_level = log::Level::Warn; // Suppress info messages
@@ -234,7 +245,10 @@ int main(int argc, char **argv) {
     pet_model.set_profiling(profile_mode);
 
     log::info("Running inference...");
-    auto result = pet_model.predict(system, compute_forces);
+    // Use predict_batch for full control over compute_nc parameter
+    bool compute_nc = show_nc_forces || show_nc_stress;
+    auto results = pet_model.predict_batch({system}, compute_forces, compute_nc);
+    auto result = results[0];
 
     // Print results
     if (quiet_mode) {
@@ -246,25 +260,38 @@ int main(int argc, char **argv) {
     }
 
     // Print forces if requested
-    if (compute_forces && result.has_forces) {
-      printf("\nForces (eV/A):\n");
+    // Note: result.has_forces is true if gradient forces OR nc_forces are available
+    bool should_show_forces =
+        (compute_forces && result.has_forces) || (show_nc_forces && result.has_forces);
+    if (should_show_forces) {
+      const char *force_type =
+          compute_forces ? "Forces" : "Non-conservative Forces";
+      printf("\n%s (eV/A):\n", force_type);
       const int32_t *atomic_nums = system.atomic_numbers();
       for (int i = 0; i < system.num_atoms(); ++i) {
         printf("  Atom %d (%s): [%12.6f, %12.6f, %12.6f]\n", i,
                element_symbol(atomic_nums[i]), result.forces[i * 3 + 0],
                result.forces[i * 3 + 1], result.forces[i * 3 + 2]);
       }
+    } else if (show_nc_forces && !result.has_forces) {
+      printf("\nNon-conservative forces: not available (model lacks nc_forces heads)\n");
     }
 
     // Print stress if requested and available
-    if (compute_stress && result.has_stress) {
-      printf("\nStress (Voigt, eV/A^3):\n");
+    bool should_show_stress =
+        (compute_stress && result.has_stress) || (show_nc_stress && result.has_stress);
+    if (should_show_stress) {
+      const char *stress_type =
+          compute_stress ? "Stress" : "Non-conservative Stress";
+      printf("\n%s (Voigt, eV/A^3):\n", stress_type);
       printf("  xx=%.6f, yy=%.6f, zz=%.6f\n", result.stress[0],
              result.stress[1], result.stress[2]);
       printf("  yz=%.6f, xz=%.6f, xy=%.6f\n", result.stress[3],
              result.stress[4], result.stress[5]);
     } else if (compute_stress && !result.has_stress) {
       printf("\nStress: not available (non-periodic system)\n");
+    } else if (show_nc_stress && !result.has_stress) {
+      printf("\nNon-conservative stress: not available (model lacks nc_stress heads)\n");
     }
 
     // Print timing summary (unless quiet)

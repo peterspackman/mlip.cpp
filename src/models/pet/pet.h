@@ -134,11 +134,13 @@ public:
    *
    * @param systems Vector of atomic systems
    * @param compute_forces If true, compute forces via backpropagation
+   * @param compute_nc If true, compute non-conservative forces/stress from forward pass
    * @return Vector of model results (same order as input)
    */
   std::vector<ModelResult>
   predict_batch(const std::vector<AtomicSystem> &systems,
-                bool compute_forces = false);
+                bool compute_forces = false,
+                bool compute_nc = false);
 
   /**
    * Load weights from GGUF file
@@ -156,6 +158,10 @@ private:
   BackendPreference backend_preference_ = BackendPreference::Auto;
   ComputePrecision compute_precision_ = ComputePrecision::F32;
   bool profiling_enabled_ = false;
+
+  // Non-conservative outputs (set during graph building, extracted after compute)
+  ggml_tensor *nc_forces_output_ = nullptr;  // [3, total_atoms] if available
+  ggml_tensor *nc_stress_output_ = nullptr;  // [9, total_atoms] if available
 
   // GGML contexts
   ggml_context *ctx_weights_ =
@@ -189,9 +195,13 @@ private:
    * - Phase 4: Aggregation and output
    *
    * @param batch Batched input structure
+   * @param compute_nc_forces Build non-conservative force outputs
+   * @param compute_nc_stress Build non-conservative stress outputs
    * @return System energies tensor [n_systems]
    */
-  ggml_tensor *build_forward_graph(const BatchedInput &batch);
+  ggml_tensor *build_forward_graph(const BatchedInput &batch,
+                                   bool compute_nc_forces = false,
+                                   bool compute_nc_stress = false);
 
   // Phase implementations (see PET_CLEAN_DESIGN.md for details)
 

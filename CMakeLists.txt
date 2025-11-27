@@ -76,6 +76,9 @@ endif()
 include(${CPM_DOWNLOAD_LOCATION})
 
 # ggml (forked version with gradient support)
+# Use MLIPCPP_GGML_SOURCE_DIR to point to a local ggml checkout for development
+set(MLIPCPP_GGML_SOURCE_DIR "" CACHE PATH "Path to local ggml source directory (for development)")
+
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -106,12 +109,17 @@ if(MLIPCPP_USE_BLAS)
     set(GGML_BLAS ON CACHE BOOL "" FORCE)
 endif()
 
-CPMAddPackage(
-    NAME ggml
-    GITHUB_REPOSITORY peterspackman/ggml
-    GIT_TAG master
-    EXCLUDE_FROM_ALL YES
-)
+if(MLIPCPP_GGML_SOURCE_DIR)
+    message(STATUS "Using local ggml from: ${MLIPCPP_GGML_SOURCE_DIR}")
+    add_subdirectory(${MLIPCPP_GGML_SOURCE_DIR} ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+else()
+    CPMAddPackage(
+        NAME ggml
+        GITHUB_REPOSITORY peterspackman/ggml
+        GIT_TAG 25574148
+        EXCLUDE_FROM_ALL YES
+    )
+endif()
 
 # fmt
 if(MLIPCPP_USE_SYSTEM_FMT)
