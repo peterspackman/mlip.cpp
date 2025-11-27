@@ -1179,10 +1179,17 @@ bool PETModel::load_from_gguf(const std::string &path) {
         NeighborListBuilder(NeighborListOptions{hypers_.cutoff, true, false});
 
     // Get weight tensors by name (they now have data in backend buffer)
+    // Mark all weights with NO_GRAD flag to prevent gradient propagation through them
     auto get_weight_tensor = [&](const std::string &name) -> ggml_tensor * {
       ggml_tensor *t = ggml_get_tensor(ctx_weights_, name.c_str());
       // Don't log missing tensors - optional properties (nc_forces, nc_stress)
       // may not exist in older models
+      if (t) {
+        // Mark weight tensor as NO_GRAD - stops gradient propagation through it
+        // This dramatically reduces backward pass overhead since we only need
+        // gradients w.r.t. positions, not all intermediate tensors
+        ggml_set_no_grad(t);
+      }
       return t;
     };
 
