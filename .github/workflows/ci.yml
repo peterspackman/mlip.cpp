@@ -53,6 +53,10 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j $(nproc)
 
+        # needed for test running
+      - name: Convert PET-MAD
+        run: uv run scripts/convert_pet_mad.py --output build/pet-mad.gguf
+
       - name: Run tests
         working-directory: build
         run: ctest -C ${{ env.BUILD_TYPE }} --output-on-failure -j $(nproc)
