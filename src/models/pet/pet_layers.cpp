@@ -208,8 +208,7 @@ ggml_tensor *build_edge_embedding(pet_graph_context &gctx, int layer_idx) {
   // Step 4: Reshape back to 3D NEF format
   // PyTorch: [n_atoms, max_neighbors, d_pet]
   // GGML:    [d_pet, max_neighbors, n_atoms]
-  edge_embed_2d =
-      ggml_cont(gctx.ctx, edge_embed_2d); // Ensure contiguous before reshape
+  // Note: ggml_add output is contiguous, no need for ggml_cont
   ggml_tensor *edge_embeds =
       ggml_reshape_3d(gctx.ctx, edge_embed_2d, gctx.hypers.d_pet,
                       gctx.batch.max_neighbors, gctx.batch.total_atoms);
@@ -245,43 +244,36 @@ ggml_tensor *build_transformer_block(pet_graph_context &gctx, int layer_idx,
                                      [[maybe_unused]] ggml_tensor *attn_mask,
                                      ggml_tensor *&attn_out) {
 
-  // This is a placeholder - the actual multi-head attention is complex
-  // and remains in pet.cpp for now. This function will handle the
-  // residual connections and layer norms around the attention.
+  // This function handles the residual + norm + MLP + residual + norm
+  // around the attention output.
+  //
+  // Optimized to minimize reshapes by keeping tensors in 2D where possible.
+  // Key insight: layer_norm and MLP operate on dimension 0 (d_pet) independently
+  // of higher dimensions, so we can process in 2D and only reshape for
+  // operations that truly need 3D (residual connections).
 
   const auto &tl = gctx.weights.gnn[layer_idx].tl[transformer_idx];
   int seq_len = input->ne[1];
   int total_atoms = input->ne[2];
-
-  // Store input for residual
-  ggml_tensor *cur = input;
-
-  // Note: attn_out is computed by caller (multi_head_attention remains in
-  // pet.cpp) This function handles the residual + norm + MLP + residual + norm
+  const int64_t batch_size = seq_len * total_atoms;
 
   // Residual + LayerNorm after attention
-  cur = ggml_add(gctx.ctx, cur, attn_out);
-  cur = ggml_cont(gctx.ctx, cur); // Ensure contiguous before reshape
+  // Both input and attn_out are 3D, add needs 3D
+  ggml_tensor *cur = ggml_add(gctx.ctx, input, attn_out);
 
-  // Flatten for layer norm
+  // Flatten for layer norm and MLP (stay in 2D until we need 3D again)
   ggml_tensor *cur_2d =
-      ggml_reshape_2d(gctx.ctx, cur, gctx.hypers.d_pet, seq_len * total_atoms);
+      ggml_reshape_2d(gctx.ctx, cur, gctx.hypers.d_pet, batch_size);
 
   cur_2d =
       build_layer_norm(gctx, tl.norm_a_weight, tl.norm_a_bias, cur_2d, 1e-5f);
 
-  cur = ggml_reshape_3d(gctx.ctx, cur_2d, gctx.hypers.d_pet, seq_len,
-                        total_atoms);
+  // Save for residual (still 2D)
+  ggml_tensor *residual_2d = cur_2d;
 
-  // MLP
-  ggml_tensor *mlp_input = cur;
-  mlp_input =
-      ggml_cont(gctx.ctx, mlp_input); // Ensure contiguous before reshape
-  ggml_tensor *mlp_2d = ggml_reshape_2d(gctx.ctx, mlp_input, gctx.hypers.d_pet,
-                                        seq_len * total_atoms);
-
+  // MLP: stays in 2D, no reshape needed
   ggml_tensor *mlp_hidden = ggml_mul_mat(
-      gctx.ctx, maybe_cast(gctx.ctx, tl.mlp_0_weight, gctx.precision), mlp_2d);
+      gctx.ctx, maybe_cast(gctx.ctx, tl.mlp_0_weight, gctx.precision), cur_2d);
   mlp_hidden = ggml_add(gctx.ctx, mlp_hidden, tl.mlp_0_bias);
   mlp_hidden = ggml_silu(gctx.ctx, mlp_hidden);
 
@@ -290,19 +282,14 @@ ggml_tensor *build_transformer_block(pet_graph_context &gctx, int layer_idx,
       mlp_hidden);
   mlp_out = ggml_add(gctx.ctx, mlp_out, tl.mlp_3_bias);
 
-  mlp_out = ggml_cont(gctx.ctx, mlp_out); // Ensure contiguous before reshape
-  mlp_out = ggml_reshape_3d(gctx.ctx, mlp_out, gctx.hypers.d_pet, seq_len,
-                            total_atoms);
+  // Residual in 2D (both are [d_pet, batch_size])
+  cur_2d = ggml_add(gctx.ctx, residual_2d, mlp_out);
 
-  // Residual + LayerNorm
-  cur = ggml_add(gctx.ctx, cur, mlp_out);
-  cur = ggml_cont(gctx.ctx, cur); // Ensure contiguous before reshape
-
-  cur_2d =
-      ggml_reshape_2d(gctx.ctx, cur, gctx.hypers.d_pet, seq_len * total_atoms);
+  // Second layer norm (still 2D)
   cur_2d =
       build_layer_norm(gctx, tl.norm_m_weight, tl.norm_m_bias, cur_2d, 1e-5f);
 
+  // Only reshape back to 3D at the end
   cur = ggml_reshape_3d(gctx.ctx, cur_2d, gctx.hypers.d_pet, seq_len,
                         total_atoms);
   cur = ggml_cont(gctx.ctx, cur); // Ensure contiguous for view operations
@@ -354,16 +341,10 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
       input_2d);
   qkv = ggml_add(gctx.ctx, qkv, tl.attn_in_bias);
 
-  // Reshape back to 3D
-  // PyTorch: [n_atoms, seq_len, 3*d_pet]
-  // GGML:    [3*d_pet, seq_len, n_atoms]
-  qkv = ggml_cont(gctx.ctx, qkv); // Ensure contiguous after add
-  qkv = ggml_reshape_3d(gctx.ctx, qkv, 3 * gctx.hypers.d_pet, seq_len,
-                        total_atoms);
-
-  // Split into heads
+  // Reshape directly to 4D for head splitting (skip intermediate 3D reshape)
   // PyTorch: qkv.reshape(n_atoms, seq_len, 3, num_heads, head_dim)
   // GGML:    qkv.reshape(head_dim, 3*num_heads, seq_len, n_atoms)
+  // Note: ggml_add output is contiguous, no need for ggml_cont
   int head_dim = gctx.hypers.d_pet / gctx.hypers.num_heads;
 
   ggml_tensor *qkv_split = ggml_reshape_4d(
@@ -439,7 +420,7 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
     // Reshape KQ to separate heads and atoms
     // PyTorch: [n_atoms, num_heads, seq_len, seq_len]
     // GGML:    [seq_len, seq_len, num_heads, n_atoms]
-    KQ = ggml_cont(gctx.ctx, KQ); // Ensure contiguous after scale
+    // Note: ggml_scale output is contiguous, no need for ggml_cont
     ggml_tensor *KQ_4d = ggml_reshape_4d(gctx.ctx, KQ, seq_len, seq_len,
                                          gctx.hypers.num_heads, total_atoms);
 
@@ -453,7 +434,7 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
     KQ_4d = ggml_add(gctx.ctx, KQ_4d, mask_4d);
 
     // Reshape back to 3D for softmax
-    KQ_4d = ggml_cont(gctx.ctx, KQ_4d); // Ensure contiguous after add
+    // Note: ggml_add output is contiguous, no need for ggml_cont
     KQ = ggml_reshape_3d(gctx.ctx, KQ_4d, seq_len, seq_len,
                          gctx.hypers.num_heads * total_atoms);
   }
@@ -481,7 +462,7 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
   // Reshape to separate heads and atoms
   // PyTorch: [n_atoms, num_heads, seq_len, head_dim]
   // GGML:    [head_dim, seq_len, num_heads, n_atoms]
-  attn_out = ggml_cont(gctx.ctx, attn_out); // Ensure contiguous after matmul
+  // Note: ggml_mul_mat output is contiguous, no need for ggml_cont
   attn_out = ggml_reshape_4d(gctx.ctx, attn_out, head_dim, seq_len,
                              gctx.hypers.num_heads, total_atoms);
 
@@ -493,13 +474,9 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
   attn_out = ggml_permute(gctx.ctx, attn_out, 0, 2, 1, 3);
   attn_out = ggml_cont(gctx.ctx, attn_out);
 
-  // Merge heads back to d_pet
-  // PyTorch: [n_atoms, seq_len, d_pet]
-  // GGML:    [d_pet, seq_len, n_atoms]
-  attn_out = ggml_reshape_3d(gctx.ctx, attn_out, gctx.hypers.d_pet, seq_len,
-                             total_atoms);
-
-  // Output projection
+  // Merge heads and flatten to 2D for output projection (skip intermediate 3D)
+  // attn_out is [head_dim, num_heads, seq_len, n_atoms] after permute+cont
+  // We want [d_pet, seq_len * n_atoms] for the matmul
   ggml_tensor *attn_2d = ggml_reshape_2d(gctx.ctx, attn_out, gctx.hypers.d_pet,
                                          seq_len * total_atoms);
 
@@ -508,7 +485,7 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
       attn_2d);
   output = ggml_add(gctx.ctx, output, tl.attn_out_bias);
 
-  output = ggml_cont(gctx.ctx, output); // Ensure contiguous after add
+  // Note: ggml_add output is contiguous, no need for ggml_cont
   output = ggml_reshape_3d(gctx.ctx, output, gctx.hypers.d_pet, seq_len,
                            total_atoms);
 
@@ -645,35 +622,28 @@ ggml_tensor *build_tokens(pet_graph_context &gctx, int layer_idx,
         compressed);
     compressed = ggml_add(gctx.ctx, compressed, layer_weights.compress_2_bias);
 
-    compressed =
-        ggml_cont(gctx.ctx, compressed); // Ensure contiguous before reshape
+    // Note: ggml_add output is contiguous, no need for ggml_cont
     tokens = ggml_reshape_3d(gctx.ctx, compressed, d_pet,
                              gctx.batch.max_neighbors, gctx.batch.total_atoms);
   } else {
     // Later layers: also embed neighbor species
-    ggml_tensor *neighbor_species_flat =
-        ggml_reshape_1d(gctx.ctx, gctx.batch.neighbor_species_nef,
-                        gctx.batch.max_neighbors * gctx.batch.total_atoms);
+    // Keep everything in 2D until final reshape to minimize operations
+    const int64_t N = gctx.batch.max_neighbors * gctx.batch.total_atoms;
+    const int64_t d_pet = gctx.hypers.d_pet;
 
-    ggml_tensor *neighbor_embeds_flat =
+    ggml_tensor *neighbor_species_flat =
+        ggml_reshape_1d(gctx.ctx, gctx.batch.neighbor_species_nef, N);
+
+    // get_rows returns [d_pet, N] - already 2D, no intermediate 3D needed
+    ggml_tensor *neighbor_2d =
         ggml_get_rows(gctx.ctx, layer_weights.neighbor_embedder_weight,
                       neighbor_species_flat);
-
-    ggml_tensor *neighbor_embeds =
-        ggml_reshape_3d(gctx.ctx, neighbor_embeds_flat, gctx.hypers.d_pet,
-                        gctx.batch.max_neighbors, gctx.batch.total_atoms);
 
     // Process [edge_embeds, neighbor_embeds, input_messages] without concat
     // compress_0_weight shape: ne=[3*d_pet, d_ff]
     // Split into W_edge, W_neighbor, W_msg each [d_pet, d_ff]
 
-    const int64_t N = gctx.batch.max_neighbors * gctx.batch.total_atoms;
-    const int64_t d_pet = gctx.hypers.d_pet;
-
     ggml_tensor *edge_2d = ggml_reshape_2d(gctx.ctx, edge_embeds, d_pet, N);
-
-    ggml_tensor *neighbor_2d =
-        ggml_reshape_2d(gctx.ctx, neighbor_embeds, d_pet, N);
 
     ggml_tensor *msg_2d = ggml_reshape_2d(gctx.ctx, input_messages, d_pet, N);
 
@@ -708,8 +678,7 @@ ggml_tensor *build_tokens(pet_graph_context &gctx, int layer_idx,
         compressed);
     compressed = ggml_add(gctx.ctx, compressed, layer_weights.compress_2_bias);
 
-    compressed =
-        ggml_cont(gctx.ctx, compressed); // Ensure contiguous before reshape
+    // Note: ggml_add output is contiguous, no need for ggml_cont
     tokens = ggml_reshape_3d(gctx.ctx, compressed, gctx.hypers.d_pet,
                              gctx.batch.max_neighbors, gctx.batch.total_atoms);
   }
@@ -796,7 +765,7 @@ ggml_tensor *build_property_output(pet_graph_context &gctx,
   int output_dim = head.output_dim();
 
   // Reshape edge output to 3D
-  edge_head_out = ggml_cont(gctx.ctx, edge_head_out);
+  // Note: apply_mlp_head ends with ggml_add which is contiguous
   edge_head_out = ggml_reshape_3d(gctx.ctx, edge_head_out, output_dim,
                                   gctx.batch.max_neighbors,
                                   gctx.batch.total_atoms);
@@ -892,23 +861,14 @@ ggml_tensor *build_aggregation_and_output(
     edge_head = ggml_add(gctx.ctx, edge_head, head.edge_head_2_bias);
     edge_head = ggml_silu(gctx.ctx, edge_head);
 
-    edge_head =
-        ggml_cont(gctx.ctx, edge_head); // Ensure contiguous after add+silu
-    edge_head =
-        ggml_reshape_3d(gctx.ctx, edge_head, gctx.hypers.d_head,
-                        gctx.batch.max_neighbors, gctx.batch.total_atoms);
-
-    // Apply edge last layer
-    ggml_tensor *edge_head_2d =
-        ggml_reshape_2d(gctx.ctx, edge_head, gctx.hypers.d_head,
-                        gctx.batch.max_neighbors * gctx.batch.total_atoms);
-
+    // Apply edge last layer - edge_head is already 2D [d_head, max_neighbors * total_atoms]
+    // Note: ggml_silu output is contiguous, no need for ggml_cont or intermediate reshape
     ggml_tensor *edge_preds = ggml_mul_mat(
         gctx.ctx, maybe_cast(gctx.ctx, head.edge_last_weight, gctx.precision),
-        edge_head_2d);
+        edge_head);
     edge_preds = ggml_add(gctx.ctx, edge_preds, head.edge_last_bias);
 
-    edge_preds = ggml_cont(gctx.ctx, edge_preds); // Ensure contiguous after add
+    // Note: ggml_add output is contiguous, no need for ggml_cont
     edge_preds = ggml_reshape_2d(gctx.ctx, edge_preds, gctx.batch.max_neighbors,
                                  gctx.batch.total_atoms);
     // [max_neighbors, total_atoms]

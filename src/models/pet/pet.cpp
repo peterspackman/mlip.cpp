@@ -849,8 +849,7 @@ ggml_tensor *PETModel::apply_gnn_layer(int layer_idx, const BatchedInput &batch,
       ctx_compute_, node_embeds, hypers_.d_pet, 1, batch.total_atoms);
 
   ggml_tensor *all_tokens = ggml_concat(ctx_compute_, node_tokens, tokens, 1);
-  all_tokens = ggml_cont(ctx_compute_,
-                         all_tokens); // Ensure contiguous before transformer
+  // Note: ggml_concat should produce contiguous output
   // [d_pet, 1+max_neighbors, total_atoms]
 
   // Step 3.5: Get pre-computed attention mask from batch
@@ -1179,17 +1178,10 @@ bool PETModel::load_from_gguf(const std::string &path) {
         NeighborListBuilder(NeighborListOptions{hypers_.cutoff, true, false});
 
     // Get weight tensors by name (they now have data in backend buffer)
-    // Mark all weights with NO_GRAD flag to prevent gradient propagation through them
     auto get_weight_tensor = [&](const std::string &name) -> ggml_tensor * {
       ggml_tensor *t = ggml_get_tensor(ctx_weights_, name.c_str());
       // Don't log missing tensors - optional properties (nc_forces, nc_stress)
       // may not exist in older models
-      if (t) {
-        // Mark weight tensor as NO_GRAD - stops gradient propagation through it
-        // This dramatically reduces backward pass overhead since we only need
-        // gradients w.r.t. positions, not all intermediate tensors
-        ggml_set_no_grad(t);
-      }
       return t;
     };
 

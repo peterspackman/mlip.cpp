@@ -116,7 +116,7 @@ else()
     CPMAddPackage(
         NAME ggml
         GITHUB_REPOSITORY peterspackman/ggml
-        GIT_TAG d87e62b6  # Add NO_GRAD flag to stop gradient propagation through weights
+        GIT_TAG d850966f  # Fix out_prod backward pass for non-contiguous tensors
         EXCLUDE_FROM_ALL YES
     )
 endif()
