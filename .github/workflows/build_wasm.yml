@@ -1,0 +1,147 @@
+name: Build WASM/JavaScript Package
+
+on:
+  push:
+    branches: [main]
+    tags: "v*"
+    paths:
+      - 'packages/mlip.js/**'
+      - 'src/api/wasm/**'
+      - 'scripts/build_wasm.sh'
+      - '.github/workflows/build_wasm.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/mlip.js/**'
+      - 'src/api/wasm/**'
+      - 'scripts/build_wasm.sh'
+      - '.github/workflows/build_wasm.yml'
+  workflow_dispatch:
+    inputs:
+      upload_to_npm:
+        description: 'Upload to npm after building'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  BUILD_TYPE: Release
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm_cache
+
+jobs:
+  build-wasm:
+    name: Build WASM Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: packages/mlip.js/package-lock.json
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.69'
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Cache CPM Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: wasm-cpm-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            wasm-cpm-${{ runner.os }}-
+
+      - name: Build WASM module
+        working-directory: packages/mlip.js
+        run: |
+          rm -rf ../../wasm/CMakeCache.txt ../../wasm/CMakeFiles
+          npm run build:wasm
+
+      - name: Install package dependencies
+        working-directory: packages/mlip.js
+        run: npm ci
+
+      - name: Build package
+        working-directory: packages/mlip.js
+        run: npm run build:wrapper
+
+      - name: Pack package
+        working-directory: packages/mlip.js
+        run: npm pack
+
+      - name: Upload WASM build artifacts
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build
+          path: packages/mlip.js/dist/
+          retention-days: 30
+
+      - name: Upload package artifact
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlipjs-package
+          path: packages/mlip.js/*.tgz
+          retention-days: 30
+
+  publish-npm:
+    name: Publish to npm
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.upload_to_npm)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download WASM build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-build
+          path: packages/mlip.js/dist/
+
+      - name: Install dependencies
+        working-directory: packages/mlip.js
+        run: npm ci
+
+      - name: Check if version changed
+        id: version
+        working-directory: packages/mlip.js
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          NPM_VERSION=$(npm view @peterspackman/mlip.js version 2>/dev/null || echo "0.0.0")
+          echo "package_version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+          echo "npm_version=$NPM_VERSION" >> $GITHUB_OUTPUT
+          if [ "$PACKAGE_VERSION" != "$NPM_VERSION" ]; then
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish to npm
+        if: steps.version.outputs.should_publish == 'true'
+        working-directory: packages/mlip.js
+        run: npm publish --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

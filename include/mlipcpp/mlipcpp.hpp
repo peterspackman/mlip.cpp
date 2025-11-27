@@ -89,6 +89,15 @@ public:
    */
   explicit Predictor(const std::string &path, const ModelOptions &options = {});
 
+  /**
+   * @brief Load a model from a memory buffer
+   * @param data Pointer to GGUF data in memory
+   * @param size Size of the buffer in bytes
+   * @param options Optional configuration
+   * @throws std::runtime_error if loading fails
+   */
+  Predictor(const uint8_t *data, size_t size, const ModelOptions &options = {});
+
   ~Predictor();
 
   // Move-only semantics

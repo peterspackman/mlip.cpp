@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mlip.js Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 { color: #333; }
+        .output {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #modelInput { margin: 10px 0; }
+        .status { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>mlip.js Demo</h1>
+    <p>Run machine learning interatomic potentials in your browser!</p>
+
+    <div>
+        <label for="modelFile">Load GGUF model file:</label><br>
+        <input type="file" id="modelFile" accept=".gguf">
+    </div>
+
+    <div style="margin: 15px 0;">
+        <button id="predictWater" disabled>Predict Water Energy</button>
+        <button id="predictSilicon" disabled>Predict Silicon Energy</button>
+    </div>
+
+    <div id="status" class="status">Loading mlip.js...</div>
+    <div id="output" class="output"></div>
+
+    <script type="module">
+        // Import mlip.js (adjust path as needed)
+        import createMlip from '../dist/index.browser.js';
+
+        let Module = null;
+        let model = null;
+
+        const output = document.getElementById('output');
+        const status = document.getElementById('status');
+        const predictWaterBtn = document.getElementById('predictWater');
+        const predictSiliconBtn = document.getElementById('predictSilicon');
+        const modelFileInput = document.getElementById('modelFile');
+
+        function log(msg) {
+            output.textContent += msg + '\n';
+            console.log(msg);
+        }
+
+        function clearOutput() {
+            output.textContent = '';
+        }
+
+        // Initialize mlip.js
+        async function init() {
+            try {
+                Module = await createMlip();
+                status.textContent = `mlip.js loaded (version ${Module.getVersion()}). Please load a model file.`;
+                log(`mlip.js version: ${Module.getVersion()}`);
+            } catch (err) {
+                status.textContent = 'Failed to load mlip.js: ' + err.message;
+                console.error(err);
+            }
+        }
+
+        // Load model from file
+        modelFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            status.textContent = `Loading model: ${file.name}...`;
+            clearOutput();
+
+            try {
+                const buffer = await file.arrayBuffer();
+                model = Module.Model.loadFromBuffer(buffer);
+
+                log(`Model loaded: ${file.name}`);
+                log(`  Type: ${model.modelType()}`);
+                log(`  Cutoff: ${model.cutoff().toFixed(2)} Å`);
+                log('');
+
+                status.textContent = 'Model loaded! Click a button to predict.';
+                predictWaterBtn.disabled = false;
+                predictSiliconBtn.disabled = false;
+            } catch (err) {
+                status.textContent = 'Failed to load model: ' + err.message;
+                log('Error: ' + err.message);
+                console.error(err);
+            }
+        });
+
+        // Predict water molecule
+        predictWaterBtn.addEventListener('click', () => {
+            if (!model) return;
+
+            clearOutput();
+            log('=== Water Molecule ===');
+
+            // H2O geometry (Å)
+            const positions = new Float64Array([
+                0.0, 0.0, 0.117,      // O
+                0.0, 0.757, -0.469,   // H
+                0.0, -0.757, -0.469   // H
+            ]);
+            const atomicNumbers = new Int32Array([8, 1, 1]);
+
+            const water = Module.AtomicSystem.create(positions, atomicNumbers, null, false);
+            log(`Atoms: ${water.numAtoms()}`);
+            log(`Periodic: ${water.isPeriodic()}`);
+            log('');
+
+            const startTime = performance.now();
+            const result = model.predict(water);
+            const elapsed = performance.now() - startTime;
+
+            log(`Energy: ${result.energy.toFixed(6)} eV`);
+            log('');
+            log('Forces (eV/Å):');
+            const elements = ['O', 'H', 'H'];
+            for (let i = 0; i < 3; i++) {
+                const fx = result.forces[i*3].toFixed(6);
+                const fy = result.forces[i*3+1].toFixed(6);
+                const fz = result.forces[i*3+2].toFixed(6);
+                log(`  ${elements[i]}: [${fx}, ${fy}, ${fz}]`);
+            }
+            log('');
+            log(`Prediction time: ${elapsed.toFixed(1)} ms`);
+        });
+
+        // Predict silicon crystal
+        predictSiliconBtn.addEventListener('click', () => {
+            if (!model) return;
+
+            clearOutput();
+            log('=== Silicon Crystal (2 atoms) ===');
+
+            // Diamond cubic Si, 2 atom basis
+            const a = 5.43;  // lattice constant in Å
+            const positions = new Float64Array([
+                0.0, 0.0, 0.0,
+                a*0.25, a*0.25, a*0.25
+            ]);
+            const atomicNumbers = new Int32Array([14, 14]);
+
+            // Cubic cell
+            const cell = new Float64Array([
+                a, 0, 0,
+                0, a, 0,
+                0, 0, a
+            ]);
+
+            const silicon = Module.AtomicSystem.create(positions, atomicNumbers, cell, true);
+            log(`Atoms: ${silicon.numAtoms()}`);
+            log(`Periodic: ${silicon.isPeriodic()}`);
+            log(`Cell: ${a.toFixed(2)} × ${a.toFixed(2)} × ${a.toFixed(2)} Å`);
+            log('');
+
+            const startTime = performance.now();
+            const result = model.predict(silicon);
+            const elapsed = performance.now() - startTime;
+
+            log(`Energy: ${result.energy.toFixed(6)} eV`);
+            log(`Energy/atom: ${(result.energy/2).toFixed(6)} eV`);
+            log('');
+            log('Forces (eV/Å):');
+            for (let i = 0; i < 2; i++) {
+                const fx = result.forces[i*3].toFixed(6);
+                const fy = result.forces[i*3+1].toFixed(6);
+                const fz = result.forces[i*3+2].toFixed(6);
+                log(`  Si${i+1}: [${fx}, ${fy}, ${fz}]`);
+            }
+
+            if (result.stress) {
+                log('');
+                log('Stress (Voigt, eV/Å³):');
+                log(`  xx: ${result.stress[0].toFixed(6)}`);
+                log(`  yy: ${result.stress[1].toFixed(6)}`);
+                log(`  zz: ${result.stress[2].toFixed(6)}`);
+                log(`  yz: ${result.stress[3].toFixed(6)}`);
+                log(`  xz: ${result.stress[4].toFixed(6)}`);
+                log(`  xy: ${result.stress[5].toFixed(6)}`);
+            }
+
+            log('');
+            log(`Prediction time: ${elapsed.toFixed(1)} ms`);
+        });
+
+        // Start initialization
+        init();
+    </script>
+</body>
+</html>

@@ -63,7 +63,7 @@ target_include_directories(mlipcpp
 target_link_libraries(mlipcpp
     PRIVATE
         ggml
-        fmt::fmt
+        $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:fmt::fmt>
 )
 
 target_compile_options(mlipcpp PRIVATE

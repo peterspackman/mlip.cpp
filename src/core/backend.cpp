@@ -2,9 +2,11 @@
 #include "log.h"
 #include <array>
 #include <ggml.h>
+#include <ggml-cpu.h>
 
 namespace mlipcpp {
 
+#ifndef __EMSCRIPTEN__
 namespace log {
 
 // No-op callback for suppressing ggml logging
@@ -16,6 +18,7 @@ static void ggml_log_noop(enum ggml_log_level /*level*/, const char * /*text*/,
 void suppress_ggml_logging() { ggml_log_set(ggml_log_noop, nullptr); }
 
 } // namespace log
+#endif
 
 BackendProvider::~BackendProvider() {
   if (primary_ && primary_ != cpu_) {
@@ -92,6 +95,11 @@ BackendProvider::create(BackendPreference pref) {
       return false;
     }
   };
+
+  // For WASM/Emscripten, set threads to 1 (no pthread support)
+#ifdef __EMSCRIPTEN__
+  ggml_backend_cpu_set_n_threads(provider->cpu_, 1);
+#endif
 
   // CPU-only mode
   if (pref == BackendPreference::CPU) {

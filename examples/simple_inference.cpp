@@ -163,10 +163,12 @@ int main(int argc, char **argv) {
     const int32_t *atomic_nums = system.atomic_numbers();
     std::set<int32_t> unique_species(atomic_nums,
                                      atomic_nums + system.num_atoms());
-    std::vector<int32_t> species_vec(unique_species.begin(),
-                                     unique_species.end());
-    log::info("Elements: {} ({})", fmt::join(species_vec, ", "),
-              unique_species.size());
+    std::string elements_str;
+    for (int32_t z : unique_species) {
+      if (!elements_str.empty()) elements_str += ", ";
+      elements_str += element_symbol(z);
+    }
+    log::info("Elements: {} ({})", elements_str, unique_species.size());
 
     if (system.is_periodic()) {
       const Cell *cell = system.cell();

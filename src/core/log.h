@@ -12,18 +12,12 @@
 #pragma once
 
 #include <cstdio>
-#include <fmt/color.h>
-#include <fmt/core.h>
-#include <fmt/ranges.h>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
-#ifdef _WIN32
-#include <io.h>
-#define isatty _isatty
-#define fileno _fileno
-#else
-#include <unistd.h>
+#ifndef __EMSCRIPTEN__
+#include <fmt/core.h>
 #endif
 
 namespace mlipcpp {
@@ -38,6 +32,28 @@ enum class Level {
   Off = 5
 };
 
+#ifdef __EMSCRIPTEN__
+
+// No-op logging for WASM builds
+inline void set_level(Level) {}
+inline Level get_level() { return Level::Off; }
+inline void set_level_from_env() {}
+
+template <typename... Args>
+inline void error(const char*, Args&&...) {}
+template <typename... Args>
+inline void warn(const char*, Args&&...) {}
+template <typename... Args>
+inline void info(const char*, Args&&...) {}
+template <typename... Args>
+inline void debug(const char*, Args&&...) {}
+template <typename... Args>
+inline void trace(const char*, Args&&...) {}
+
+inline void suppress_ggml_logging() {}
+
+#else
+
 namespace detail {
 
 inline Level &current_level() {
@@ -45,25 +61,10 @@ inline Level &current_level() {
   return level;
 }
 
-inline bool is_tty() {
-  static int result = -1;
-  if (result < 0) {
-    result = isatty(fileno(stderr)) ? 1 : 0;
-  }
-  return result == 1;
-}
-
-inline void write(Level level, std::string_view prefix, fmt::text_style style,
-                  std::string_view msg) {
+inline void write(Level level, std::string_view msg) {
   if (level < current_level())
     return;
-
-  if (is_tty()) {
-    fmt::print(stderr, style, "{}", prefix);
-    fmt::print(stderr, "{}\n", msg);
-  } else {
-    fmt::print(stderr, "{}{}\n", prefix, msg);
-  }
+  fmt::print(stderr, "{}\n", msg);
 }
 
 } // namespace detail
@@ -93,29 +94,23 @@ inline void set_level_from_env() {
 // Logging functions
 template <typename... Args>
 inline void error(fmt::format_string<Args...> format, Args &&...args) {
-  detail::write(Level::Error, "",
-                fmt::fg(fmt::color::red) | fmt::emphasis::bold,
-                fmt::format(format, std::forward<Args>(args)...));
+  detail::write(Level::Error, fmt::format(format, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 inline void warn(fmt::format_string<Args...> format, Args &&...args) {
-  detail::write(Level::Warn, "",
-                fmt::fg(fmt::color::yellow) | fmt::emphasis::bold,
-                fmt::format(format, std::forward<Args>(args)...));
+  detail::write(Level::Warn, fmt::format(format, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 inline void info(fmt::format_string<Args...> format, Args &&...args) {
-  detail::write(Level::Info, "", fmt::fg(fmt::color::white),
-                fmt::format(format, std::forward<Args>(args)...));
+  detail::write(Level::Info, fmt::format(format, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 inline void debug(fmt::format_string<Args...> format, Args &&...args) {
 #ifndef NDEBUG
-  detail::write(Level::Debug, "", fmt::fg(fmt::color::cyan),
-                fmt::format(format, std::forward<Args>(args)...));
+  detail::write(Level::Debug, fmt::format(format, std::forward<Args>(args)...));
 #else
   (void)format;
   ((void)args, ...);
@@ -125,8 +120,7 @@ inline void debug(fmt::format_string<Args...> format, Args &&...args) {
 template <typename... Args>
 inline void trace(fmt::format_string<Args...> format, Args &&...args) {
 #ifndef NDEBUG
-  detail::write(Level::Trace, "", fmt::fg(fmt::color::gray),
-                fmt::format(format, std::forward<Args>(args)...));
+  detail::write(Level::Trace, fmt::format(format, std::forward<Args>(args)...));
 #else
   (void)format;
   ((void)args, ...);
@@ -135,6 +129,8 @@ inline void trace(fmt::format_string<Args...> format, Args &&...args) {
 
 // Suppress verbose GGML logging - implemented in backend.cpp
 void suppress_ggml_logging();
+
+#endif // __EMSCRIPTEN__
 
 } // namespace log
 } // namespace mlipcpp

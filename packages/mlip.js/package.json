@@ -1,0 +1,65 @@
+{
+  "name": "@peterspackman/mlip.js",
+  "version": "0.1.0",
+  "description": "JavaScript/WebAssembly bindings for mlipcpp - Machine Learning Interatomic Potentials",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "node": "./dist/index-node.js",
+      "browser": "./dist/index.browser.js",
+      "default": "./dist/index.browser.js"
+    },
+    "./wasm": {
+      "default": "./dist/mlipcpp_wasm.wasm"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:wrapper",
+    "build:wasm": "cd ../.. && ./scripts/build_wasm.sh",
+    "build:wrapper": "node scripts/build.js",
+    "clean": "rm -rf dist src/mlipcpp_wasm.js src/mlipcpp_wasm.wasm",
+    "rebuild": "npm run clean && npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/peterspackman/mlipcpp.git",
+    "directory": "packages/mlip.js"
+  },
+  "keywords": [
+    "machine-learning",
+    "interatomic-potentials",
+    "molecular-dynamics",
+    "atomistic-simulation",
+    "wasm",
+    "webassembly",
+    "pet",
+    "mace",
+    "ggml"
+  ],
+  "author": "Peter Spackman",
+  "license": "BSD-3-Clause",
+  "bugs": {
+    "url": "https://github.com/peterspackman/mlipcpp/issues"
+  },
+  "homepage": "https://github.com/peterspackman/mlipcpp#readme",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

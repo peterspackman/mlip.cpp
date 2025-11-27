@@ -36,6 +36,23 @@ option(MLIPCPP_USE_CANN "Enable CANN backend via ggml (Huawei Ascend)" OFF)
 option(MLIPCPP_USE_BLAS "Enable BLAS acceleration via ggml" OFF)
 option(MLIPCPP_USE_SYSTEM_FMT "Use system-installed fmtlib instead of bundled" OFF)
 
+# WASM-specific settings
+if(EMSCRIPTEN)
+    set(MLIPCPP_BUILD_WASM ON)
+    set(MLIPCPP_BUILD_EXAMPLES OFF)
+    set(MLIPCPP_BUILD_TESTS OFF)
+    set(MLIPCPP_BUILD_PYTHON OFF)
+    set(MLIPCPP_BUILD_FORTRAN OFF)
+    # Disable all GPU backends for WASM
+    set(MLIPCPP_USE_CUDA OFF)
+    set(MLIPCPP_USE_HIP OFF)
+    set(MLIPCPP_USE_METAL OFF)
+    set(MLIPCPP_USE_VULKAN OFF)
+    set(MLIPCPP_USE_SYCL OFF)
+    set(MLIPCPP_USE_CANN OFF)
+    set(MLIPCPP_USE_BLAS OFF)
+endif()
+
 # Enable Fortran if requested
 if(MLIPCPP_BUILD_FORTRAN)
     enable_language(Fortran)
@@ -109,6 +126,16 @@ if(MLIPCPP_USE_BLAS)
     set(GGML_BLAS ON CACHE BOOL "" FORCE)
 endif()
 
+# WASM-specific ggml configuration
+if(EMSCRIPTEN)
+    set(GGML_WASM_SINGLE_FILE ON CACHE BOOL "" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+endif()
+
 if(MLIPCPP_GGML_SOURCE_DIR)
     message(STATUS "Using local ggml from: ${MLIPCPP_GGML_SOURCE_DIR}")
     add_subdirectory(${MLIPCPP_GGML_SOURCE_DIR} ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
@@ -121,10 +148,10 @@ else()
     )
 endif()
 
-# fmt
+# fmt (not needed for WASM builds - logging is disabled)
 if(MLIPCPP_USE_SYSTEM_FMT)
     find_package(fmt REQUIRED)
-else()
+elseif(NOT EMSCRIPTEN)
     CPMAddPackage(
         NAME fmt
         GITHUB_REPOSITORY fmtlib/fmt
@@ -266,5 +293,43 @@ if(MLIPCPP_INSTALL)
     export(EXPORT mlipcppTargets
         FILE ${CMAKE_CURRENT_BINARY_DIR}/mlipcppTargets.cmake
         NAMESPACE mlipcpp::
+    )
+endif()
+
+# =============================================================================
+# WASM Build
+# =============================================================================
+if(EMSCRIPTEN)
+    # Create WASM module with embind bindings
+    add_executable(mlipcpp_wasm
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/wasm/mlipcpp_wasm.cpp
+    )
+
+    target_link_libraries(mlipcpp_wasm PRIVATE mlipcpp)
+    target_include_directories(mlipcpp_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    # Emscripten-specific link flags
+    set_target_properties(mlipcpp_wasm PROPERTIES
+        SUFFIX ".js"
+        LINK_FLAGS "\
+            -s WASM=1 \
+            -s MODULARIZE=1 \
+            -s EXPORT_ES6=1 \
+            -s EXPORT_NAME='createMlipcpp' \
+            -s ALLOW_MEMORY_GROWTH=1 \
+            -s MAXIMUM_MEMORY=4GB \
+            -s STACK_SIZE=1MB \
+            -s SINGLE_FILE=1 \
+            -s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall'] \
+            -s FORCE_FILESYSTEM=1 \
+            --bind \
+            -O3 \
+        "
+    )
+
+    # Install WASM output
+    install(FILES
+        ${CMAKE_BINARY_DIR}/bin/mlipcpp_wasm.js
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/mlipcpp/wasm
     )
 endif()
