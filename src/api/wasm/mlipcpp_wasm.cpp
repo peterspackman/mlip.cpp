@@ -201,11 +201,20 @@ public:
         return result.energy;
     }
 
-    // Predict energy and forces
+    // Predict energy and forces (conservative, via gradient)
     val predict(const AtomicSystemWrapper& system) {
+        return predictWithOptions(system, false);
+    }
+
+    // Predict with options - useNCForces uses forward pass heads instead of gradients
+    val predictWithOptions(const AtomicSystemWrapper& system, bool useNCForces) {
         if (!predictor_) {
             throw std::runtime_error("Model not loaded");
         }
+
+        mlipcpp::PredictOptions options;
+        options.compute_forces = true;
+        options.use_nc_forces = useNCForces;
 
         auto result = predictor_->predict(
             system.numAtoms(),
@@ -213,7 +222,7 @@ public:
             system.atomicNumbersPtr(),
             system.cellPtr(),
             system.pbcPtr(),
-            true  // compute_forces = true
+            options
         );
 
         val output = val::object();
@@ -271,6 +280,7 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .function("cutoff", &PredictorWrapper::cutoff)
         .function("predictEnergy", &PredictorWrapper::predictEnergy)
         .function("predict", &PredictorWrapper::predict)
+        .function("predictWithOptions", &PredictorWrapper::predictWithOptions)
         .function("isLoaded", &PredictorWrapper::isLoaded);
 
     // Utility functions

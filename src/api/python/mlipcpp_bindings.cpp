@@ -62,6 +62,16 @@ NB_MODULE(_mlipcpp, m) {
       .def_rw("cutoff_override", &mlipcpp::ModelOptions::cutoff_override,
               "Override model cutoff (0 = use default)");
 
+  // PredictOptions
+  nb::class_<mlipcpp::PredictOptions>(m, "PredictOptions", "Prediction options")
+      .def(nb::init<>())
+      .def_rw("compute_forces", &mlipcpp::PredictOptions::compute_forces,
+              "Whether to compute forces (default: True)")
+      .def_rw("compute_stress", &mlipcpp::PredictOptions::compute_stress,
+              "Whether to compute stress tensor (default: False)")
+      .def_rw("use_nc_forces", &mlipcpp::PredictOptions::use_nc_forces,
+              "Use non-conservative forces from forward pass heads (faster, not energy-conserving)");
+
   // Result struct
   nb::class_<mlipcpp::Result>(m, "Result", "Prediction results")
       .def_ro("energy", &mlipcpp::Result::energy, "Total energy in eV")
@@ -155,6 +165,66 @@ Returns
 -------
 Result
     Object containing energy, forces, and stress
+)doc")
+      .def(
+          "predict_with_options",
+          [](mlipcpp::Predictor &self,
+             nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig> positions,
+             nb::ndarray<const int32_t, nb::shape<-1>, nb::c_contig>
+                 atomic_numbers,
+             std::optional<nb::ndarray<const float, nb::shape<3, 3>, nb::c_contig>> cell,
+             std::optional<std::array<bool, 3>> pbc,
+             const mlipcpp::PredictOptions &options) {
+            size_t n_atoms = positions.shape(0);
+            if (atomic_numbers.shape(0) != n_atoms) {
+              throw std::runtime_error(
+                  "positions and atomic_numbers must have same length");
+            }
+
+            const float *cell_ptr = nullptr;
+            const bool *pbc_ptr = nullptr;
+            std::array<bool, 3> pbc_arr = {true, true, true};
+
+            if (cell.has_value()) {
+              cell_ptr = cell->data();
+              if (pbc.has_value()) {
+                pbc_arr = *pbc;
+              }
+              pbc_ptr = pbc_arr.data();
+            }
+
+            return self.predict(static_cast<int32_t>(n_atoms), positions.data(),
+                                atomic_numbers.data(), cell_ptr, pbc_ptr,
+                                options);
+          },
+          "positions"_a, "atomic_numbers"_a, "cell"_a = nb::none(),
+          "pbc"_a = nb::none(), "options"_a = mlipcpp::PredictOptions{},
+          R"doc(
+Predict energy and forces with full options control.
+
+Parameters
+----------
+positions : ndarray[float32, (n_atoms, 3)]
+    Atomic positions in Angstroms
+atomic_numbers : ndarray[int32, (n_atoms,)]
+    Atomic numbers (e.g., 1 for H, 6 for C)
+cell : ndarray[float32, (3, 3)], optional
+    Lattice vectors as rows for periodic systems
+pbc : tuple[bool, bool, bool], optional
+    Periodic boundary conditions (default: all True if cell provided)
+options : PredictOptions
+    Prediction options (compute_forces, compute_stress, use_nc_forces)
+
+Returns
+-------
+Result
+    Object containing energy, forces, and stress
+
+Notes
+-----
+When use_nc_forces is True, forces are computed from the model's forward pass
+force heads instead of as gradients of energy. This is faster but the forces
+are not energy-conserving.
 )doc");
 
   // Module-level functions

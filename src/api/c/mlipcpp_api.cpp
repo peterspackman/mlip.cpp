@@ -319,6 +319,25 @@ mlipcpp_error_t mlipcpp_model_get_cutoff(mlipcpp_model_t model, float *cutoff) {
 }
 
 // ============================================================================
+// Prediction Options
+// ============================================================================
+
+mlipcpp_error_t
+mlipcpp_predict_options_default(mlipcpp_predict_options_t *options) {
+  if (!options) {
+    set_error("NULL pointer for options");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+
+  options->compute_forces = true;
+  options->compute_stress = false;
+  options->use_nc_forces = false;
+
+  clear_error();
+  return MLIPCPP_OK;
+}
+
+// ============================================================================
 // Prediction
 // ============================================================================
 
@@ -419,6 +438,123 @@ mlipcpp_error_t mlipcpp_predict_ptr(mlipcpp_model_t model, int32_t n_atoms,
   system.pbc = pbc;
 
   return mlipcpp_predict(model, &system, compute_forces, result);
+}
+
+mlipcpp_error_t mlipcpp_predict_with_options(mlipcpp_model_t model,
+                                              const mlipcpp_system_t *system,
+                                              const mlipcpp_predict_options_t *options,
+                                              mlipcpp_result_t *result) {
+  if (!model) {
+    set_error("Invalid model handle");
+    return MLIPCPP_ERROR_INVALID_HANDLE;
+  }
+  if (!system) {
+    set_error("NULL system pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  if (!result) {
+    set_error("NULL result pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  if (!model->weights_loaded) {
+    set_error("Model weights not loaded");
+    return MLIPCPP_ERROR_MODEL_NOT_LOADED;
+  }
+
+  // Use default options if not provided
+  mlipcpp_predict_options_t default_opts;
+  if (!options) {
+    mlipcpp_predict_options_default(&default_opts);
+    options = &default_opts;
+  }
+
+  // Validate system data
+  if (system->n_atoms <= 0) {
+    set_error("Invalid number of atoms");
+    return MLIPCPP_ERROR_INVALID_PARAMETER;
+  }
+  if (!system->positions || !system->atomic_numbers) {
+    set_error("NULL positions or atomic_numbers");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+
+  try {
+    // Build AtomicSystem from C data
+    const mlipcpp::Cell *cell_ptr = nullptr;
+    mlipcpp::Cell cell;
+
+    if (system->cell) {
+      bool pbc[3] = {true, true, true};
+      if (system->pbc) {
+        pbc[0] = system->pbc[0];
+        pbc[1] = system->pbc[1];
+        pbc[2] = system->pbc[2];
+      }
+
+      // Unpack flattened cell matrix (row-major)
+      float lattice[3][3];
+      for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+          lattice[i][j] = system->cell[i * 3 + j];
+        }
+      }
+
+      cell = mlipcpp::Cell(lattice, pbc[0], pbc[1], pbc[2]);
+      cell_ptr = &cell;
+    }
+
+    // Create AtomicSystem using the constructor
+    mlipcpp::AtomicSystem cpp_system(system->n_atoms, system->positions,
+                                     system->atomic_numbers, cell_ptr);
+
+    // Run prediction using predict_batch for NC forces support
+    auto *pet_model = dynamic_cast<mlipcpp::pet::PETModel *>(model->model.get());
+    if (pet_model) {
+      auto results = pet_model->predict_batch(
+          {cpp_system},
+          options->compute_forces && !options->use_nc_forces,  // gradient-based forces
+          options->use_nc_forces  // NC forces from forward pass
+      );
+      model->last_result = std::move(results[0]);
+    } else {
+      // Fallback for non-PET models
+      model->last_result = model->model->predict(cpp_system, options->compute_forces);
+    }
+    model->last_n_atoms = system->n_atoms;
+
+    // Create result handle pointing to the stored result
+    auto result_impl = std::make_unique<mlipcpp_result_impl>();
+    result_impl->result = &model->last_result;
+    result_impl->n_atoms = system->n_atoms;
+
+    *result = result_impl.release();
+
+    clear_error();
+    return MLIPCPP_OK;
+  } catch (const std::exception &e) {
+    set_error(std::string("Prediction failed: ") + e.what());
+    return MLIPCPP_ERROR_COMPUTATION;
+  } catch (...) {
+    set_error("Prediction failed: unknown error");
+    return MLIPCPP_ERROR_INTERNAL;
+  }
+}
+
+mlipcpp_error_t mlipcpp_predict_ptr_with_options(mlipcpp_model_t model, int32_t n_atoms,
+                                                  const float *positions,
+                                                  const int32_t *atomic_numbers,
+                                                  const float *cell, const bool *pbc,
+                                                  const mlipcpp_predict_options_t *options,
+                                                  mlipcpp_result_t *result) {
+  // Construct mlipcpp_system_t and delegate to mlipcpp_predict_with_options
+  mlipcpp_system_t system;
+  system.n_atoms = n_atoms;
+  system.positions = positions;
+  system.atomic_numbers = atomic_numbers;
+  system.cell = cell;
+  system.pbc = pbc;
+
+  return mlipcpp_predict_with_options(model, &system, options, result);
 }
 
 // ============================================================================

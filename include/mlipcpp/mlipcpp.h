@@ -245,6 +245,33 @@ void mlipcpp_model_free(mlipcpp_model_t model);
 mlipcpp_error_t mlipcpp_model_get_cutoff(mlipcpp_model_t model, float *cutoff);
 
 /* ============================================================================
+ * Prediction Options
+ * ============================================================================
+ */
+
+/**
+ * @brief Options for prediction
+ */
+typedef struct {
+  bool compute_forces;  /**< Whether to compute forces (default: true) */
+  bool compute_stress;  /**< Whether to compute stress tensor (default: false) */
+  bool use_nc_forces;   /**< Use non-conservative forces from forward pass heads
+                             (faster, but forces are not gradient of energy) */
+} mlipcpp_predict_options_t;
+
+/**
+ * @brief Get default prediction options
+ * @param options Pointer to options struct to initialize
+ * @return MLIPCPP_OK on success
+ *
+ * Default values:
+ * - compute_forces: true
+ * - compute_stress: false
+ * - use_nc_forces: false
+ */
+mlipcpp_error_t mlipcpp_predict_options_default(mlipcpp_predict_options_t *options);
+
+/* ============================================================================
  * Prediction
  * ============================================================================
  */
@@ -289,6 +316,48 @@ mlipcpp_error_t mlipcpp_predict_ptr(mlipcpp_model_t model, int32_t n_atoms,
                                     const float *cell, const bool *pbc,
                                     bool compute_forces,
                                     mlipcpp_result_t *result);
+
+/**
+ * @brief Run prediction on an atomic system with full options control
+ * @param model Model handle
+ * @param system Atomic system to predict on
+ * @param options Prediction options (NULL for defaults)
+ * @param result Pointer to result handle to store output
+ * @return MLIPCPP_OK on success, error code on failure
+ *
+ * The result handle is internally managed and valid until the next prediction
+ * call on the same model, or until the model is freed. No need to free.
+ *
+ * When use_nc_forces is true, forces are computed from the model's forward pass
+ * force heads instead of as gradients of energy. This is faster but the forces
+ * are not energy-conserving.
+ */
+mlipcpp_error_t mlipcpp_predict_with_options(mlipcpp_model_t model,
+                                              const mlipcpp_system_t *system,
+                                              const mlipcpp_predict_options_t *options,
+                                              mlipcpp_result_t *result);
+
+/**
+ * @brief Run prediction using raw pointers with full options control
+ * @param model Model handle
+ * @param n_atoms Number of atoms
+ * @param positions Atom positions [n_atoms * 3]
+ * @param atomic_numbers Atomic numbers [n_atoms]
+ * @param cell Lattice matrix [9] or NULL
+ * @param pbc Periodicity flags [3] or NULL
+ * @param options Prediction options (NULL for defaults)
+ * @param result Pointer to result handle to store output
+ * @return MLIPCPP_OK on success, error code on failure
+ *
+ * Convenience function that constructs mlipcpp_system_t internally.
+ * Same lifetime and semantics as mlipcpp_predict_with_options().
+ */
+mlipcpp_error_t mlipcpp_predict_ptr_with_options(mlipcpp_model_t model, int32_t n_atoms,
+                                                  const float *positions,
+                                                  const int32_t *atomic_numbers,
+                                                  const float *cell, const bool *pbc,
+                                                  const mlipcpp_predict_options_t *options,
+                                                  mlipcpp_result_t *result);
 
 /* ============================================================================
  * Result Access

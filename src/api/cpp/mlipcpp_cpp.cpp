@@ -126,6 +126,32 @@ struct Predictor::Impl {
     }
     return result;
   }
+
+  Result predict_impl(const AtomicSystem &system, const PredictOptions &options) {
+    // Use predict_batch for NC forces support
+    auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
+    if (pet_model) {
+      auto internal_results = pet_model->predict_batch(
+          {system},
+          options.compute_forces && !options.use_nc_forces,  // gradient-based forces
+          options.use_nc_forces  // NC forces from forward pass
+      );
+      auto &internal_result = internal_results[0];
+
+      Result result;
+      result.energy = internal_result.energy;
+      if (internal_result.has_forces) {
+        result.forces = std::move(internal_result.forces);
+      }
+      if (internal_result.has_stress) {
+        result.stress = std::move(internal_result.stress);
+      }
+      return result;
+    } else {
+      // Fallback for non-PET models
+      return predict_impl(system, options.compute_forces);
+    }
+  }
 };
 
 Predictor::Predictor(const std::string &path, const ModelOptions &options)
@@ -210,6 +236,39 @@ Result Predictor::predict(int32_t n_atoms, const float *positions,
     // Non-periodic system
     AtomicSystem system(n_atoms, positions, atomic_numbers, nullptr);
     return impl_->predict_impl(system, compute_forces);
+  }
+}
+
+Result Predictor::predict(int32_t n_atoms, const float *positions,
+                          const int32_t *atomic_numbers, const float *cell,
+                          const bool *pbc, const PredictOptions &options) {
+  if (!positions || !atomic_numbers) {
+    throw std::invalid_argument(
+        "positions and atomic_numbers must not be null");
+  }
+
+  if (cell) {
+    // Periodic system
+    float lattice[3][3];
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        lattice[i][j] = cell[i * 3 + j];
+      }
+    }
+    bool pbc_flags[3] = {true, true, true};
+    if (pbc) {
+      pbc_flags[0] = pbc[0];
+      pbc_flags[1] = pbc[1];
+      pbc_flags[2] = pbc[2];
+    }
+    Cell periodic_cell(lattice, pbc_flags[0], pbc_flags[1], pbc_flags[2]);
+
+    AtomicSystem system(n_atoms, positions, atomic_numbers, &periodic_cell);
+    return impl_->predict_impl(system, options);
+  } else {
+    // Non-periodic system
+    AtomicSystem system(n_atoms, positions, atomic_numbers, nullptr);
+    return impl_->predict_impl(system, options);
   }
 }
 

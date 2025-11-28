@@ -24,6 +24,7 @@ module mlipcpp
     ! Public types
     public :: mlipcpp_model
     public :: mlipcpp_options
+    public :: mlipcpp_predict_options
 
     ! Public constants
     public :: MLIPCPP_OK
@@ -84,6 +85,13 @@ module mlipcpp
         real(c_float) :: cutoff_override = 0.0
     end type
 
+    !> Prediction options
+    type, bind(c) :: mlipcpp_predict_options
+        logical(c_bool) :: compute_forces = .true._c_bool  !< Compute forces
+        logical(c_bool) :: compute_stress = .false._c_bool !< Compute stress tensor
+        logical(c_bool) :: use_nc_forces = .false._c_bool  !< Use non-conservative forces
+    end type
+
     !> Main model type with object-oriented interface
     type :: mlipcpp_model
         type(c_ptr), private :: handle = c_null_ptr
@@ -94,6 +102,8 @@ module mlipcpp
         procedure :: cutoff => model_cutoff
         procedure :: predict => model_predict
         procedure :: predict_periodic => model_predict_periodic
+        procedure :: predict_with_options => model_predict_with_options
+        procedure :: predict_periodic_with_options => model_predict_periodic_with_options
         procedure :: is_loaded => model_is_loaded
     end type
 
@@ -177,6 +187,28 @@ module mlipcpp
             logical(c_bool), value :: compute_forces
             type(c_ptr), intent(out) :: result
             integer(c_int) :: c_mlipcpp_predict_ptr
+        end function
+
+        function c_mlipcpp_predict_options_default(options) &
+                                        bind(c, name='mlipcpp_predict_options_default')
+            import :: c_int, mlipcpp_predict_options
+            type(mlipcpp_predict_options), intent(out) :: options
+            integer(c_int) :: c_mlipcpp_predict_options_default
+        end function
+
+        function c_mlipcpp_predict_ptr_with_options(model, n_atoms, positions, atomic_numbers, &
+                                        cell, pbc, options, result) &
+                                        bind(c, name='mlipcpp_predict_ptr_with_options')
+            import :: c_ptr, c_int, c_float, mlipcpp_predict_options
+            type(c_ptr), value :: model
+            integer(c_int), value :: n_atoms
+            real(c_float), intent(in) :: positions(*)
+            integer(c_int), intent(in) :: atomic_numbers(*)
+            type(c_ptr), value :: cell
+            type(c_ptr), value :: pbc
+            type(mlipcpp_predict_options), intent(in) :: options
+            type(c_ptr), intent(out) :: result
+            integer(c_int) :: c_mlipcpp_predict_ptr_with_options
         end function
 
         function c_mlipcpp_result_get_energy(result, energy) bind(c, name='mlipcpp_result_get_energy')
@@ -386,6 +418,111 @@ contains
         ! Call C API
         ierr = c_mlipcpp_predict_ptr(self%handle, n_atoms, positions, atomic_numbers, &
                                       c_loc(c_cell), c_loc(c_pbc), compute_forces, self%result_handle)
+        if (ierr /= MLIPCPP_OK) return
+
+        ! Get energy
+        ierr = c_mlipcpp_result_get_energy(self%result_handle, energy)
+        if (ierr /= MLIPCPP_OK) return
+
+        ! Get forces if requested
+        if (present(forces)) then
+            ierr = c_mlipcpp_result_get_forces(self%result_handle, forces, n_atoms)
+            if (ierr /= MLIPCPP_OK) return
+        end if
+
+        ! Get stress if requested
+        if (present(stress)) then
+            ierr = c_mlipcpp_result_get_stress(self%result_handle, stress)
+        end if
+    end function
+
+    !> Predict energy and forces for non-periodic system with options
+    !> @param positions Atomic positions [3, n_atoms] (column-major)
+    !> @param atomic_numbers Atomic numbers [n_atoms]
+    !> @param options Prediction options (use_nc_forces, etc.)
+    !> @param energy Output energy in eV
+    !> @param forces Output forces [3, n_atoms] in eV/Angstrom (optional)
+    function model_predict_with_options(self, positions, atomic_numbers, options, &
+                                         energy, forces) result(ierr)
+        class(mlipcpp_model), intent(inout) :: self
+        real(c_float), intent(in), contiguous :: positions(:,:)
+        integer(c_int), intent(in), contiguous :: atomic_numbers(:)
+        type(mlipcpp_predict_options), intent(in) :: options
+        real(c_float), intent(out) :: energy
+        real(c_float), intent(out), optional, contiguous :: forces(:,:)
+        integer(c_int) :: ierr
+
+        integer(c_int) :: n_atoms
+        type(mlipcpp_predict_options) :: opts
+
+        n_atoms = size(atomic_numbers)
+        opts = options
+        ! Override compute_forces based on whether forces array is present
+        opts%compute_forces = present(forces)
+
+        ! Call C API
+        ierr = c_mlipcpp_predict_ptr_with_options(self%handle, n_atoms, positions, atomic_numbers, &
+                                      c_null_ptr, c_null_ptr, opts, self%result_handle)
+        if (ierr /= MLIPCPP_OK) return
+
+        ! Get energy
+        ierr = c_mlipcpp_result_get_energy(self%result_handle, energy)
+        if (ierr /= MLIPCPP_OK) return
+
+        ! Get forces if requested
+        if (present(forces)) then
+            ierr = c_mlipcpp_result_get_forces(self%result_handle, forces, n_atoms)
+        end if
+    end function
+
+    !> Predict energy and forces for periodic system with options
+    !> @param positions Atomic positions [3, n_atoms] (column-major)
+    !> @param atomic_numbers Atomic numbers [n_atoms]
+    !> @param cell Lattice vectors [3, 3] as columns (a, b, c)
+    !> @param pbc Periodic boundary conditions [3]
+    !> @param options Prediction options (use_nc_forces, etc.)
+    !> @param energy Output energy in eV
+    !> @param forces Output forces [3, n_atoms] in eV/Angstrom (optional)
+    !> @param stress Output stress [6] in Voigt notation (optional)
+    function model_predict_periodic_with_options(self, positions, atomic_numbers, cell, pbc, &
+                                     options, energy, forces, stress) result(ierr)
+        class(mlipcpp_model), intent(inout) :: self
+        real(c_float), intent(in), contiguous, target :: positions(:,:)
+        integer(c_int), intent(in), contiguous :: atomic_numbers(:)
+        real(c_float), intent(in), target :: cell(3,3)
+        logical, intent(in) :: pbc(3)
+        type(mlipcpp_predict_options), intent(in) :: options
+        real(c_float), intent(out) :: energy
+        real(c_float), intent(out), optional, contiguous :: forces(:,:)
+        real(c_float), intent(out), optional :: stress(6)
+        integer(c_int) :: ierr
+
+        integer(c_int) :: n_atoms
+        type(mlipcpp_predict_options) :: opts
+        logical(c_bool), target :: c_pbc(3)
+        real(c_float), target :: c_cell(9)
+        integer :: i, j
+
+        n_atoms = size(atomic_numbers)
+        opts = options
+        ! Override compute_forces based on whether forces array is present
+        opts%compute_forces = present(forces)
+
+        ! Convert cell from column-major [3,3] to row-major [9]
+        ! Fortran: cell(:,1) = a, cell(:,2) = b, cell(:,3) = c
+        ! C expects: cell[0:2] = a, cell[3:5] = b, cell[6:8] = c (row-major)
+        do i = 1, 3
+            do j = 1, 3
+                c_cell((i-1)*3 + j) = cell(j, i)
+            end do
+        end do
+
+        ! Convert logical to c_bool
+        c_pbc = pbc
+
+        ! Call C API
+        ierr = c_mlipcpp_predict_ptr_with_options(self%handle, n_atoms, positions, atomic_numbers, &
+                                      c_loc(c_cell), c_loc(c_pbc), opts, self%result_handle)
         if (ierr /= MLIPCPP_OK) return
 
         ! Get energy

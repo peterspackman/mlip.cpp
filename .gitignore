@@ -39,3 +39,8 @@ node_modules/
 *.tgz
 packages/mlip.js/dist/
 packages/mlip.js/src/mlipcpp_wasm.js
+
+# Website build output
+website/dist/
+website/node_modules/
+a.out.*

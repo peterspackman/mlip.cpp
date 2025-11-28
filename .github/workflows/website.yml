@@ -1,0 +1,88 @@
+name: Deploy Website
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.50'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache CPM packages
+        uses: actions/cache@v4
+        with:
+          path: .cpm_cache
+          key: cpm-wasm-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cpm-wasm-
+
+      - name: Build WASM
+        run: |
+          ./scripts/build_wasm.sh
+        env:
+          CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm_cache
+
+      - name: Build mlip.js package
+        working-directory: packages/mlip.js
+        run: |
+          npm install
+          node scripts/build.js
+
+      - name: Install website dependencies
+        working-directory: website
+        run: npm install
+
+      - name: Build website
+        working-directory: website
+        run: npm run build
+
+      - name: Convert PET-MAD model
+        run: |
+          uv run scripts/convert_pet_mad.py --output website/dist/pet-mad.gguf
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

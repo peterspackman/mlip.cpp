@@ -65,6 +65,16 @@ struct ModelOptions {
 };
 
 /**
+ * @brief Options for prediction
+ */
+struct PredictOptions {
+  bool compute_forces = true;   ///< Compute forces
+  bool compute_stress = false;  ///< Compute stress tensor
+  bool use_nc_forces = false;   ///< Use non-conservative forces from forward pass heads
+                                ///< (faster, but forces are not gradient of energy)
+};
+
+/**
  * @brief RAII wrapper for MLIP models
  *
  * Example usage:
@@ -157,6 +167,21 @@ public:
   Result predict(int32_t n_atoms, const float *positions,
                  const int32_t *atomic_numbers, const float *cell = nullptr,
                  const bool *pbc = nullptr, bool compute_forces = true);
+
+  /**
+   * @brief Predict with full options control
+   *
+   * @param n_atoms Number of atoms
+   * @param positions Positions array [n_atoms * 3]
+   * @param atomic_numbers Atomic numbers array [n_atoms]
+   * @param cell Lattice matrix [9] or nullptr for non-periodic
+   * @param pbc PBC flags [3] or nullptr
+   * @param options Prediction options
+   * @return Prediction results
+   */
+  Result predict(int32_t n_atoms, const float *positions,
+                 const int32_t *atomic_numbers, const float *cell,
+                 const bool *pbc, const PredictOptions &options);
 
 private:
   struct Impl;
