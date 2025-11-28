@@ -427,3 +427,45 @@
   font-family: monospace;
   font-weight: 600;
 }
+
+/* Supercell inputs */
+.supercell-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.supercell-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.supercell-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.supercell-cell label {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.supercell-input {
+  width: 100%;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.supercell-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import * as NGL from 'ngl'
+import { getAtomicNumber, getCovalentRadius, getSymbol } from '../data/elements'
 import './MolecularDynamics.css'
 
 // Sample structures for MD - molecules and crystals
@@ -94,12 +95,6 @@ const SAMPLE_STRUCTURES: Record<string, string> = {
   ...SAMPLE_CRYSTALS,
 }
 
-// Covalent radii in Angstroms for bond detection
-const COVALENT_RADII: Record<number, number> = {
-  1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66, 9: 0.57,
-  12: 1.41, 14: 1.11, 15: 1.07, 16: 1.05, 17: 1.02
-}
-
 // Detect bonds based on distance and covalent radii
 function detectBonds(positions: number[], atomicNumbers: number[]): [number, number][] {
   const numAtoms = atomicNumbers.length
@@ -107,13 +102,13 @@ function detectBonds(positions: number[], atomicNumbers: number[]): [number, num
   const tolerance = 0.4  // Angstroms tolerance
 
   for (let i = 0; i < numAtoms; i++) {
-    const ri = COVALENT_RADII[atomicNumbers[i]] || 0.77
+    const ri = getCovalentRadius(atomicNumbers[i])
     const xi = positions[i * 3]
     const yi = positions[i * 3 + 1]
     const zi = positions[i * 3 + 2]
 
     for (let j = i + 1; j < numAtoms; j++) {
-      const rj = COVALENT_RADII[atomicNumbers[j]] || 0.77
+      const rj = getCovalentRadius(atomicNumbers[j])
       const xj = positions[j * 3]
       const yj = positions[j * 3 + 1]
       const zj = positions[j * 3 + 2]
@@ -134,20 +129,23 @@ function detectBonds(positions: number[], atomicNumbers: number[]): [number, num
 }
 
 // Generate supercell positions for periodic visualization
-// Returns expanded positions and atomic numbers for a 3x3x3 supercell (-1 to +1)
+// supercellSize: [na, nb, nc] - number of cells in each direction (1 = unit cell only)
 function generateSupercell(
   positions: number[],
   atomicNumbers: number[],
-  lattice: { a: number[], b: number[], c: number[] }
+  lattice: { a: number[], b: number[], c: number[] },
+  supercellSize: [number, number, number] = [1, 1, 1]
 ): { positions: number[], atomicNumbers: number[] } {
   const numAtoms = atomicNumbers.length
   const supercellPositions: number[] = []
   const supercellAtomicNumbers: number[] = []
 
-  // Generate 3x3x3 supercell (from -1 to +1 in each direction)
-  for (let na = -1; na <= 1; na++) {
-    for (let nb = -1; nb <= 1; nb++) {
-      for (let nc = -1; nc <= 1; nc++) {
+  const [na_max, nb_max, nc_max] = supercellSize
+
+  // Generate supercell (from 0 to n-1 in each direction)
+  for (let na = 0; na < na_max; na++) {
+    for (let nb = 0; nb < nb_max; nb++) {
+      for (let nc = 0; nc < nc_max; nc++) {
         // Translation vector for this cell
         const tx = na * lattice.a[0] + nb * lattice.b[0] + nc * lattice.c[0]
         const ty = na * lattice.a[1] + nb * lattice.b[1] + nc * lattice.c[1]
@@ -172,10 +170,6 @@ function generateSupercell(
 // Convert positions array to SDF/MOL format for NGL (better element support)
 function positionsToSdf(positions: number[], atomicNumbers: number[]): string {
   const numAtoms = atomicNumbers.length
-  const elements: Record<number, string> = {
-    1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 12: 'Mg', 14: 'Si', 15: 'P', 16: 'S', 17: 'Cl'
-  }
-
   const bonds = detectBonds(positions, atomicNumbers)
 
   let sdf = '\n'  // molecule name (blank)
@@ -189,11 +183,11 @@ function positionsToSdf(positions: number[], atomicNumbers: number[]): string {
 
   // Atom block: x, y, z, symbol, mass diff, charge, etc.
   for (let i = 0; i < numAtoms; i++) {
-    const element = elements[atomicNumbers[i]] || 'C'
+    const symbol = getSymbol(atomicNumbers[i])
     const x = positions[i * 3].toFixed(4).padStart(10)
     const y = positions[i * 3 + 1].toFixed(4).padStart(10)
     const z = positions[i * 3 + 2].toFixed(4).padStart(10)
-    const sym = element.padEnd(3)
+    const sym = symbol.padEnd(3)
     sdf += `${x}${y}${z} ${sym} 0  0  0  0  0  0  0  0  0  0  0  0\n`
   }
 
@@ -208,10 +202,6 @@ function positionsToSdf(positions: number[], atomicNumbers: number[]): string {
 
 // Parse XYZ to get atomic numbers
 function parseXyzAtomicNumbers(xyz: string): number[] {
-  const elementToZ: Record<string, number> = {
-    'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Mg': 12, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17
-  }
-
   const lines = xyz.trim().split('\n')
   const numAtoms = parseInt(lines[0])
   const atomicNumbers: number[] = []
@@ -219,7 +209,7 @@ function parseXyzAtomicNumbers(xyz: string): number[] {
   for (let i = 0; i < numAtoms; i++) {
     const parts = lines[i + 2].trim().split(/\s+/)
     const element = parts[0]
-    atomicNumbers.push(elementToZ[element] || 6)
+    atomicNumbers.push(getAtomicNumber(element))
   }
 
   return atomicNumbers
@@ -288,6 +278,7 @@ export default function MolecularDynamics() {
   })
 
   const lastStepTimeRef = useRef<number>(0)
+  const lastBondsRef = useRef<string>('')  // Serialized bonds for comparison
   const [energyHistory, setEnergyHistory] = useState<number[]>([])
 
   const [targetTemperature, setTargetTemperature] = useState(300)
@@ -298,6 +289,10 @@ export default function MolecularDynamics() {
   const [maxOptSteps, setMaxOptSteps] = useState(100)
   const [forceThreshold, setForceThreshold] = useState(0.05)
   const [rattleAmount, setRattleAmount] = useState(0.1)  // Angstroms
+  const [supercellSize, setSupercellSize] = useState<[number, number, number]>([2, 2, 2])
+  const supercellSizeRef = useRef<[number, number, number]>([2, 2, 2])
+  const [viewStyle, setViewStyle] = useState<'ball+stick' | 'spacefill' | 'licorice'>('ball+stick')
+  const viewStyleRef = useRef<string>('ball+stick')
 
   // Initialize NGL Stage
   useEffect(() => {
@@ -449,9 +444,72 @@ export default function MolecularDynamics() {
     }
   }
 
-  // Update visualization with new positions (in-place update, no flashing)
+  // Add representation based on style
+  const addRepresentationForStyle = (component: any, style: string) => {
+    if (style === 'spacefill') {
+      component.addRepresentation('spacefill', {
+        colorScheme: 'element',
+        radiusScale: 1.0,
+      })
+    } else if (style === 'licorice') {
+      component.addRepresentation('licorice', {
+        colorScheme: 'element',
+        radiusScale: 0.3,
+      })
+    } else {
+      // ball+stick
+      component.addRepresentation('ball+stick', {
+        colorScheme: 'element',
+        radiusScale: 0.8,
+        bondScale: 0.3,
+      })
+    }
+  }
+
+  // Reload structure with updated bonds (for showing reactions)
+  const reloadStructureWithBonds = useCallback((positions: number[], style: string = 'ball+stick') => {
+    if (!stageRef.current || atomicNumbersRef.current.length === 0) return
+
+    // For periodic structures, generate supercell for visualization
+    let displayPositions = positions
+    let displayAtomicNumbers = atomicNumbersRef.current
+    if (latticeRef.current) {
+      const supercell = generateSupercell(positions, atomicNumbersRef.current, latticeRef.current, supercellSizeRef.current)
+      displayPositions = supercell.positions
+      displayAtomicNumbers = supercell.atomicNumbers
+    }
+
+    const sdf = positionsToSdf(displayPositions, displayAtomicNumbers)
+    const blob = new Blob([sdf], { type: 'text/plain' })
+
+    // Store current view state
+    const stage = stageRef.current
+
+    // Remove old molecule component but keep unit cell
+    if (componentRef.current) {
+      (stage as any).removeComponent(componentRef.current)
+    }
+
+    stage.loadFile(blob, { ext: 'sdf', defaultRepresentation: false })
+      .then((component: any) => {
+        componentRef.current = component
+        addRepresentationForStyle(component, style)
+      })
+  }, [])
+
+  // Update visualization with new positions
   const updateVisualization = useCallback((positions: number[]) => {
     if (!stageRef.current || !componentRef.current || atomicNumbersRef.current.length === 0) return
+
+    // Check if bonds have changed
+    const currentBonds = detectBonds(positions, atomicNumbersRef.current)
+    const bondsKey = currentBonds.map(([a, b]) => `${a}-${b}`).join(',')
+
+    if (bondsKey !== lastBondsRef.current) {
+      lastBondsRef.current = bondsKey
+      reloadStructureWithBonds(positions, viewStyleRef.current)
+      return
+    }
 
     const structure = componentRef.current.structure
     if (!structure || !structure.atomStore) return
@@ -459,20 +517,22 @@ export default function MolecularDynamics() {
     const atomStore = structure.atomStore
     const numAtoms = atomicNumbersRef.current.length
 
-    // For periodic structures, we have 27 copies (3x3x3 supercell)
+    // For periodic structures, we have supercell copies
     const isPeriodic = latticeRef.current !== null
-    const expectedAtoms = isPeriodic ? numAtoms * 27 : numAtoms
+    const [na_max, nb_max, nc_max] = supercellSizeRef.current
+    const numCells = na_max * nb_max * nc_max
+    const expectedAtoms = isPeriodic ? numAtoms * numCells : numAtoms
 
     // Check if atom count matches
     if (atomStore.count !== expectedAtoms) return
 
     if (isPeriodic && latticeRef.current) {
-      // Update all 27 copies of each atom
+      // Update all copies of each atom in supercell
       const { a, b, c } = latticeRef.current
       let atomIdx = 0
-      for (let na = -1; na <= 1; na++) {
-        for (let nb = -1; nb <= 1; nb++) {
-          for (let nc = -1; nc <= 1; nc++) {
+      for (let na = 0; na < na_max; na++) {
+        for (let nb = 0; nb < nb_max; nb++) {
+          for (let nc = 0; nc < nc_max; nc++) {
             const tx = na * a[0] + nb * b[0] + nc * c[0]
             const ty = na * a[1] + nb * b[1] + nc * c[1]
             const tz = na * a[2] + nb * b[2] + nc * c[2]
@@ -498,10 +558,14 @@ export default function MolecularDynamics() {
     // Rebuild the structure to reflect new positions
     structure.refreshPosition()
     componentRef.current.rebuildRepresentations()
-  }, [])
+  }, [reloadStructureWithBonds])
 
   // Create unit cell visualization using NGL Shape
-  const createUnitCellShape = useCallback((lattice: { a: number[], b: number[], c: number[] }) => {
+  // Shows all unit cell boxes for the supercell
+  const createUnitCellShape = useCallback((
+    lattice: { a: number[], b: number[], c: number[] },
+    scSize: [number, number, number]
+  ) => {
     if (!stageRef.current) return
 
     // Remove existing unit cell
@@ -512,48 +576,44 @@ export default function MolecularDynamics() {
 
     const { a, b, c } = lattice
 
-    // Calculate the 8 corners of the unit cell (at origin)
-    const corners = [
-      [0, 0, 0],
-      [1, 0, 0],
-      [0, 1, 0],
-      [0, 0, 1],
-      [1, 1, 0],
-      [1, 0, 1],
-      [0, 1, 1],
-      [1, 1, 1]
-    ].map(([na, nb, nc]) => [
-      na * a[0] + nb * b[0] + nc * c[0],
-      na * a[1] + nb * b[1] + nc * c[1],
-      na * a[2] + nb * b[2] + nc * c[2]
-    ])
-
     // Create shape with unit cell edges
     const shape = new NGL.Shape('unitcell')
 
-    // Define the 12 edges of a cube
-    const edges = [
-      [0, 1], [0, 2], [0, 3], // from origin
-      [1, 4], [1, 5], // from (1,0,0)
-      [2, 4], [2, 6], // from (0,1,0)
-      [3, 5], [3, 6], // from (0,0,1)
-      [4, 7], [5, 7], [6, 7] // to (1,1,1)
+    // Define the 12 edges of a unit cube (in fractional coords)
+    const edges: [number[], number[]][] = [
+      [[0, 0, 0], [1, 0, 0]], [[0, 0, 0], [0, 1, 0]], [[0, 0, 0], [0, 0, 1]], // from origin
+      [[1, 0, 0], [1, 1, 0]], [[1, 0, 0], [1, 0, 1]], // from (1,0,0)
+      [[0, 1, 0], [1, 1, 0]], [[0, 1, 0], [0, 1, 1]], // from (0,1,0)
+      [[0, 0, 1], [1, 0, 1]], [[0, 0, 1], [0, 1, 1]], // from (0,0,1)
+      [[1, 1, 0], [1, 1, 1]], [[1, 0, 1], [1, 1, 1]], [[0, 1, 1], [1, 1, 1]] // to (1,1,1)
     ]
 
-    // Add thick lines for each edge (orange color)
-    edges.forEach(([i, j]) => {
-      shape.addWideline(
-        corners[i] as [number, number, number],
-        corners[j] as [number, number, number],
-        [1, 0.5, 0] // orange
-      )
-    })
+    // Convert fractional to Cartesian
+    const toCartesian = (frac: number[]): [number, number, number] => [
+      frac[0] * a[0] + frac[1] * b[0] + frac[2] * c[0],
+      frac[0] * a[1] + frac[1] * b[1] + frac[2] * c[1],
+      frac[0] * a[2] + frac[1] * b[2] + frac[2] * c[2]
+    ]
+
+    // Add edges for each cell in the supercell
+    for (let na = 0; na < scSize[0]; na++) {
+      for (let nb = 0; nb < scSize[1]; nb++) {
+        for (let nc = 0; nc < scSize[2]; nc++) {
+          const offset = [na, nb, nc]
+          edges.forEach(([start, end]) => {
+            const p1 = toCartesian([start[0] + offset[0], start[1] + offset[1], start[2] + offset[2]])
+            const p2 = toCartesian([end[0] + offset[0], end[1] + offset[1], end[2] + offset[2]])
+            shape.addWideline(p1, p2, [1, 0.5, 0]) // orange
+          })
+        }
+      }
+    }
 
     // Add the shape to the stage
     const shapeComp = (stageRef.current as any).addComponentFromObject(shape)
     shapeComp.addRepresentation('buffer', {
-      linewidth: 4,
-      opacity: 0.9
+      linewidth: 3,
+      opacity: 0.8
     })
     unitCellRef.current = shapeComp
   }, [])
@@ -562,11 +622,11 @@ export default function MolecularDynamics() {
   const loadStructureVisualization = useCallback((positions: number[], atomicNumbers: number[]) => {
     if (!stageRef.current) return
 
-    // For periodic structures, generate 3x3x3 supercell for visualization
+    // For periodic structures, generate supercell for visualization
     let displayPositions = positions
     let displayAtomicNumbers = atomicNumbers
     if (latticeRef.current) {
-      const supercell = generateSupercell(positions, atomicNumbers, latticeRef.current)
+      const supercell = generateSupercell(positions, atomicNumbers, latticeRef.current, supercellSizeRef.current)
       displayPositions = supercell.positions
       displayAtomicNumbers = supercell.atomicNumbers
     }
@@ -580,15 +640,11 @@ export default function MolecularDynamics() {
     stageRef.current.loadFile(blob, { ext: 'sdf', defaultRepresentation: false })
       .then((component: any) => {
         componentRef.current = component
-        component.addRepresentation('ball+stick', {
-          colorScheme: 'element',
-          radiusScale: 0.8,
-          bondScale: 0.3,
-        })
+        addRepresentationForStyle(component, viewStyleRef.current)
 
         // Add unit cell visualization if we have lattice data
         if (latticeRef.current) {
-          createUnitCellShape(latticeRef.current)
+          createUnitCellShape(latticeRef.current, supercellSizeRef.current)
         }
 
         // Small delay to let DOM settle, then resize and auto-view
@@ -656,6 +712,24 @@ export default function MolecularDynamics() {
       forceThreshold,
     })
   }, [timestep, targetTemperature, mode, maxOptSteps, forceThreshold])
+
+  // Update supercell visualization when size changes
+  useEffect(() => {
+    supercellSizeRef.current = supercellSize
+    // Only reload if we have a structure and lattice
+    if (latticeRef.current && atomicNumbersRef.current.length > 0 && componentRef.current) {
+      // Get current positions from worker by requesting them
+      // For now, just reload the structure from the XYZ (initial positions)
+      const lines = customXyz.trim().split('\n')
+      const numAtoms = parseInt(lines[0])
+      const positions: number[] = []
+      for (let i = 0; i < numAtoms; i++) {
+        const parts = lines[i + 2].trim().split(/\s+/)
+        positions.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]))
+      }
+      loadStructureVisualization(positions, atomicNumbersRef.current)
+    }
+  }, [supercellSize, customXyz, loadStructureVisualization])
 
   // Control functions
   const startSimulation = () => {
@@ -830,6 +904,84 @@ export default function MolecularDynamics() {
               <p className="nc-note">
                 FIRE optimization. Rattle perturbs atom positions.
               </p>
+            </>
+          )}
+        </div>
+
+        {/* View options */}
+        <div className="panel-section">
+          <h3>View Options</h3>
+          <div className="params-row">
+            <div className="control-group">
+              <label>Style</label>
+              <select
+                value={viewStyle}
+                onChange={e => {
+                  const style = e.target.value as 'ball+stick' | 'spacefill' | 'licorice'
+                  setViewStyle(style)
+                  viewStyleRef.current = style
+                  // Reload visualization with new style
+                  if (componentRef.current && stageRef.current) {
+                    componentRef.current.removeAllRepresentations()
+                    addRepresentationForStyle(componentRef.current, style)
+                  }
+                }}
+                className="structure-select"
+              >
+                <option value="ball+stick">Ball & Stick</option>
+                <option value="spacefill">Spacefill</option>
+                <option value="licorice">Licorice</option>
+              </select>
+            </div>
+          </div>
+          {/* Supercell options - only for crystals */}
+          {latticeRef.current && (
+            <>
+              <label className="supercell-label">Supercell</label>
+              <div className="supercell-grid">
+                <div className="supercell-cell">
+                  <label>a</label>
+                  <input
+                    type="number"
+                    value={supercellSize[0]}
+                    onChange={e => {
+                      const newSize: [number, number, number] = [Number(e.target.value), supercellSize[1], supercellSize[2]]
+                      setSupercellSize(newSize)
+                    }}
+                    min={1}
+                    max={5}
+                    className="supercell-input"
+                  />
+                </div>
+                <div className="supercell-cell">
+                  <label>b</label>
+                  <input
+                    type="number"
+                    value={supercellSize[1]}
+                    onChange={e => {
+                      const newSize: [number, number, number] = [supercellSize[0], Number(e.target.value), supercellSize[2]]
+                      setSupercellSize(newSize)
+                    }}
+                    min={1}
+                    max={5}
+                    className="supercell-input"
+                  />
+                </div>
+                <div className="supercell-cell">
+                  <label>c</label>
+                  <input
+                    type="number"
+                    value={supercellSize[2]}
+                    onChange={e => {
+                      const newSize: [number, number, number] = [supercellSize[0], supercellSize[1], Number(e.target.value)]
+                      setSupercellSize(newSize)
+                    }}
+                    min={1}
+                    max={5}
+                    className="supercell-input"
+                  />
+                </div>
+              </div>
             </>
           )}
         </div>
