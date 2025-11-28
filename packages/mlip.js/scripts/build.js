@@ -118,6 +118,7 @@ export interface Model {
     isLoaded(): boolean;
     predictEnergy(system: AtomicSystem): number;
     predict(system: AtomicSystem): PredictionResult;
+    predictWithOptions(system: AtomicSystem, useNcForces: boolean): PredictionResult;
 }
 
 export interface ModelStatic {

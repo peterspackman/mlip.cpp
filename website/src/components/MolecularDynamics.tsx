@@ -500,7 +500,7 @@ export default function MolecularDynamics() {
 
     // Remove existing unit cell
     if (unitCellRef.current) {
-      stageRef.current.removeComponent(unitCellRef.current)
+      (stageRef.current as any).removeComponent(unitCellRef.current)
       unitCellRef.current = null
     }
 
@@ -544,7 +544,7 @@ export default function MolecularDynamics() {
     })
 
     // Add the shape to the stage
-    const shapeComp = stageRef.current.addComponentFromObject(shape)
+    const shapeComp = (stageRef.current as any).addComponentFromObject(shape)
     shapeComp.addRepresentation('buffer', {
       linewidth: 4,
       opacity: 0.9
@@ -662,14 +662,6 @@ export default function MolecularDynamics() {
 
   const stopMD = () => {
     workerRef.current?.postMessage({ type: 'stop' })
-  }
-
-  const stepMD = () => {
-    workerRef.current?.postMessage({ type: 'step' })
-  }
-
-  const resetView = () => {
-    stageRef.current?.autoView(500)
   }
 
   return (
