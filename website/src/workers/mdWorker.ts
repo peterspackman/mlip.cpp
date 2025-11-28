@@ -389,15 +389,42 @@ const FIRE_F_DEC = 0.5
 const FIRE_N_MIN = 5
 const FIRE_DT_MAX = 1.0  // fs
 
-// Reset FIRE optimizer state
+// Reset FIRE optimizer state and initialize velocities along force direction
 function resetFIRE(): void {
   state.fireAlpha = FIRE_ALPHA_START
   state.fireNpos = 0
   state.fireDt = 0.1  // Start with small timestep
   state.optStep = 0
-  // Zero velocities
-  if (state.velocities) {
-    state.velocities.fill(0)
+
+  // Initialize velocities along force direction for faster startup
+  if (state.module && state.model && state.positions && state.velocities && state.masses) {
+    // Get initial forces
+    const system = state.module.AtomicSystem.create(
+      state.positions,
+      state.atomicNumbers!,
+      state.cell,
+      state.isPeriodic
+    )
+    const result = state.model.predictWithOptions(system, false)
+    const forces = new Float64Array(result.forces)
+
+    // Calculate force magnitude
+    let fNorm = 0
+    for (let i = 0; i < forces.length; i++) {
+      fNorm += forces[i] * forces[i]
+    }
+    fNorm = Math.sqrt(fNorm)
+
+    // Set initial velocity along force direction with small magnitude
+    // v = dt * F / |F| gives unit velocity in force direction scaled by timestep
+    if (fNorm > 1e-10) {
+      const vScale = state.fireDt * 0.1  // Small initial velocity
+      for (let i = 0; i < state.velocities.length; i++) {
+        state.velocities[i] = vScale * forces[i] / fNorm
+      }
+    } else {
+      state.velocities.fill(0)
+    }
   }
 }
 
@@ -607,7 +634,17 @@ function runMDStep(): void {
   }
 }
 
-function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize' }): void {
+// Apply random perturbations to positions
+function rattlePositions(amount: number): void {
+  if (!state.positions || amount <= 0) return
+
+  for (let i = 0; i < state.positions.length; i++) {
+    // Uniform random in [-amount, +amount]
+    state.positions[i] += (Math.random() * 2 - 1) * amount
+  }
+}
+
+function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): void {
   if (state.isRunning) return
 
   // Update mode if provided
@@ -620,6 +657,11 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize' })
   if (state.mode === 'optimize') {
     // Reset FIRE state for new optimization
     resetFIRE()
+
+    // Apply rattle if requested
+    if (data.rattleAmount && data.rattleAmount > 0) {
+      rattlePositions(data.rattleAmount)
+    }
 
     // Run optimization steps at ~30 fps
     mdInterval = setInterval(() => {
@@ -656,6 +698,21 @@ function handleStep(): void {
   runMDStep()
 }
 
+function handleRattle(data: { amount: number }): void {
+  if (!state.positions) {
+    self.postMessage({ type: 'error', message: 'No system loaded' })
+    return
+  }
+
+  rattlePositions(data.amount)
+
+  // Send back the new positions so visualization can update
+  self.postMessage({
+    type: 'rattled',
+    positions: Array.from(state.positions),
+  })
+}
+
 // Message router
 self.onmessage = async (e: MessageEvent) => {
   const { type, ...data } = e.data
@@ -684,6 +741,9 @@ self.onmessage = async (e: MessageEvent) => {
       break
     case 'step':
       handleStep()
+      break
+    case 'rattle':
+      handleRattle(data)
       break
     default:
       self.postMessage({ type: 'error', message: `Unknown message type: ${type}` })

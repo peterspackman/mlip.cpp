@@ -297,6 +297,7 @@ export default function MolecularDynamics() {
   const [mode, setMode] = useState<'md' | 'optimize'>('md')
   const [maxOptSteps, setMaxOptSteps] = useState(100)
   const [forceThreshold, setForceThreshold] = useState(0.05)
+  const [rattleAmount, setRattleAmount] = useState(0.1)  // Angstroms
 
   // Initialize NGL Stage
   useEffect(() => {
@@ -406,6 +407,11 @@ export default function MolecularDynamics() {
 
         case 'stopped':
           setState(s => ({ ...s, isRunning: false }))
+          break
+
+        case 'rattled':
+          // Update visualization with rattled positions
+          updateVisualization(msg.positions)
           break
 
         case 'error':
@@ -657,11 +663,19 @@ export default function MolecularDynamics() {
     setEnergyHistory([])
     setState(s => ({ ...s, step: 0, optimizationConverged: false }))
     lastStepTimeRef.current = 0
-    workerRef.current?.postMessage({ type: 'start', stepsPerFrame: 1, mode })
+    workerRef.current?.postMessage({
+      type: 'start',
+      stepsPerFrame: 1,
+      mode,
+    })
   }
 
   const stopMD = () => {
     workerRef.current?.postMessage({ type: 'stop' })
+  }
+
+  const rattleStructure = () => {
+    workerRef.current?.postMessage({ type: 'rattle', amount: rattleAmount })
   }
 
   return (
@@ -789,8 +803,32 @@ export default function MolecularDynamics() {
                   />
                 </div>
               </div>
+              <div className="params-row">
+                <div className="control-group">
+                  <label>Rattle (Å)</label>
+                  <input
+                    type="number"
+                    value={rattleAmount}
+                    onChange={e => setRattleAmount(Number(e.target.value))}
+                    min={0}
+                    max={1.0}
+                    step={0.05}
+                    className="number-input"
+                  />
+                </div>
+                <div className="control-group">
+                  <label>&nbsp;</label>
+                  <button
+                    onClick={rattleStructure}
+                    className="control-button"
+                    disabled={!state.isModelLoaded || atomicNumbersRef.current.length === 0 || state.isRunning}
+                  >
+                    Rattle
+                  </button>
+                </div>
+              </div>
               <p className="nc-note">
-                FIRE geometry optimization using gradient forces.
+                FIRE optimization. Rattle perturbs atom positions.
               </p>
             </>
           )}
@@ -867,15 +905,16 @@ export default function MolecularDynamics() {
                         stroke="rgba(59, 130, 246, 0.9)"
                         strokeWidth="2.5"
                       />
-                      {/* Show dot at current position */}
-                      {dots.length > 0 && (
+                      {/* Show small dots at each data point */}
+                      {dots.map((dot, i) => (
                         <circle
-                          cx={dots[dots.length - 1].x}
-                          cy={dots[dots.length - 1].y}
-                          r="8"
+                          key={i}
+                          cx={dot.x}
+                          cy={dot.y}
+                          r={i === dots.length - 1 ? 6 : 3}
                           fill="rgba(59, 130, 246, 1)"
                         />
-                      )}
+                      ))}
                       <text x="10" y="18" className="energy-label">
                         {mode === 'md' ? 'Total E' : 'E'} (eV)
                       </text>

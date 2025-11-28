@@ -64,10 +64,6 @@ jobs:
         working-directory: website
         run: npm run build
 
-      - name: Convert PET-MAD model
-        run: |
-          uv run scripts/convert_pet_mad.py --output website/dist/pet-mad.gguf
-
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
