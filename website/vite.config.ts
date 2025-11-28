@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/mlipcpp/',
+  base: '/mlip.cpp/',
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
