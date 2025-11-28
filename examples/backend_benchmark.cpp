@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     std::cerr << "\nOptions:\n";
     std::cerr << "  --backend B     Backend: auto, cpu, metal, cuda, etc. (default: auto)\n";
     std::cerr << "  --warmup N      Warmup iterations (default: 2)\n";
-    std::cerr << "  --iterations N  Timed iterations (default: 3)\n";
+    std::cerr << "  --iterations N  Timed iterations (default: 10)\n";
     std::cerr << "  --no-forces     Benchmark energy only (no forces)\n";
     std::cerr << "  --nc-forces     Use non-conservative forces (forward pass only)\n";
     std::cerr << "  --csv           Output CSV format for scripting\n";
@@ -82,7 +82,7 @@ int main(int argc, char **argv) {
 
   std::string model_path = argv[1];
   int warmup = 2;
-  int iterations = 3;
+  int iterations = 10;
   bool compute_forces = true;
   bool compute_nc = false;
   bool csv_output = false;
@@ -132,11 +132,13 @@ int main(int argc, char **argv) {
   std::vector<std::array<int, 3>> sizes = {
       {1, 1, 1},  // 2 atoms
       {2, 2, 2},  // 16 atoms
-      {3, 3, 3},  // 54 atoms
+      {4, 4, 2},  // 64 atoms
       {4, 4, 4},  // 128 atoms
       {4, 4, 8},  // 256 atoms
       {4, 8, 8},  // 512 atoms
       {8, 8, 8},  // 1024 atoms
+      {16, 8, 8},  // 2048 atoms
+      {16, 16, 8},  // 4096 atoms
   };
 
   // Load model once
@@ -168,15 +170,15 @@ int main(int argc, char **argv) {
 
   if (csv_output) {
     // CSV header
-    std::cout << "backend,atoms,time_ms,energy\n";
+    std::cout << "backend,atoms,time_ms,us_per_atom,energy\n";
   } else {
     std::cout << "Backend: " << backend_name << "\n";
     std::cout << "Mode: " << mode_str << "\n";
     std::cout << "Warmup: " << warmup << ", Iterations: " << iterations << "\n";
-    std::cout << std::string(50, '-') << "\n";
+    std::cout << std::string(60, '-') << "\n";
     std::cout << std::setw(8) << "Atoms" << std::setw(12) << "Time (ms)"
-              << std::setw(15) << "Energy (eV)" << "\n";
-    std::cout << std::string(50, '-') << "\n";
+              << std::setw(12) << "us/atom" << std::setw(15) << "Energy (eV)" << "\n";
+    std::cout << std::string(60, '-') << "\n";
   }
 
   for (const auto &size : sizes) {
@@ -200,20 +202,23 @@ int main(int argc, char **argv) {
     double time_ms =
         std::chrono::duration<double, std::milli>(end - start).count() /
         iterations;
+    double us_per_atom = (time_ms * 1000.0) / n_atoms;
 
     if (csv_output) {
       std::cout << backend_name << "," << n_atoms << "," << std::fixed
-                << std::setprecision(2) << time_ms << "," << std::setprecision(6)
+                << std::setprecision(2) << time_ms << "," << std::setprecision(2)
+                << us_per_atom << "," << std::setprecision(6)
                 << last_result.energy << "\n";
     } else {
       std::cout << std::setw(8) << n_atoms << std::setw(12) << std::fixed
-                << std::setprecision(2) << time_ms << std::setw(15)
+                << std::setprecision(2) << time_ms << std::setw(12)
+                << std::setprecision(2) << us_per_atom << std::setw(15)
                 << std::setprecision(4) << last_result.energy << "\n";
     }
   }
 
   if (!csv_output) {
-    std::cout << std::string(50, '-') << "\n";
+    std::cout << std::string(60, '-') << "\n";
   }
 
   return 0;

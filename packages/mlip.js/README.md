@@ -1,13 +1,13 @@
 # mlip.js
 
-JavaScript/WebAssembly bindings for [mlipcpp](https://github.com/peterspackman/mlipcpp) - Machine Learning Interatomic Potentials.
+JavaScript/WebAssembly bindings for [mlip.cpp](https://github.com/peterspackman/mlip.cpp) - Machine Learning Interatomic Potentials.
 
 Run ML potentials (PET, MACE, etc.) directly in the browser or Node.js with no native dependencies.
 
 ## Installation
 
 ```bash
-npm install @mlipcpp/mlip.js
+npm install @peterspackman/mlip.js
 ```
 
 ## Usage
@@ -19,7 +19,7 @@ npm install @mlipcpp/mlip.js
 <html>
 <head>
     <script type="module">
-        import createMlip from '@mlipcpp/mlip.js';
+        import createMlip from '@peterspackman/mlip.js';
 
         async function main() {
             const Module = await createMlip();
@@ -65,7 +65,7 @@ npm install @mlipcpp/mlip.js
 ### Node.js
 
 ```javascript
-import createMlip from '@mlipcpp/mlip.js';
+import createMlip from '@peterspackman/mlip.js';
 import fs from 'fs';
 
 async function main() {
@@ -136,7 +136,7 @@ console.log('Stress (Voigt):', result.stress); // [xx, yy, zz, yz, xz, xy]
 
 ### Module Functions
 
-- `getVersion()` - Returns mlipcpp version string
+- `getVersion()` - Returns mlip.cpp version string
 
 ### AtomicSystem
 
@@ -187,11 +187,11 @@ Returns object with:
 - **PET** (Pretrained Equivariant Transformer)
 - More coming soon (MACE, etc.)
 
-Models must be in GGUF format. See mlipcpp documentation for model conversion.
+Models must be in GGUF format. See mlip.cpp documentation for model conversion.
 
 ## Performance
 
-WebAssembly runs ~2-3x slower than native code. For large systems or many evaluations, consider using the native mlipcpp library.
+WebAssembly performance isn't too bad, usually runnng ~2x slower than native code, and it's only single threaded for now, makes no use of GPU acceleration in wasm.
 
 ## Building from Source
 

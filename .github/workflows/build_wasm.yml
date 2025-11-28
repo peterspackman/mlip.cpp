@@ -104,6 +104,9 @@ jobs:
     needs: build-wasm
     runs-on: ubuntu-latest
     if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.upload_to_npm)
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -142,6 +145,4 @@ jobs:
       - name: Publish to npm
         if: steps.version.outputs.should_publish == 'true'
         working-directory: packages/mlip.js
-        run: npm publish --ignore-scripts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public --ignore-scripts
