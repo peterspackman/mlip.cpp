@@ -311,6 +311,7 @@ if(EMSCRIPTEN)
     # Emscripten-specific link flags
     set_target_properties(mlipcpp_wasm PROPERTIES
         SUFFIX ".js"
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         LINK_FLAGS "\
             -s WASM=1 \
             -s MODULARIZE=1 \
