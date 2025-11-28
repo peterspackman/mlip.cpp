@@ -21,13 +21,6 @@ target_include_directories(test_pet
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/
 )
 
-# Create symlink to model file for CTest
-add_custom_command(TARGET test_pet POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${CMAKE_CURRENT_SOURCE_DIR}/../pet-mad.gguf
-        ${CMAKE_CURRENT_BINARY_DIR}/pet-mad.gguf
-)
-
 # GGML layout test (standalone, no Catch2)
 add_executable(test_ggml_layout
     test_ggml_layout.cpp
@@ -62,12 +55,6 @@ target_include_directories(test_pet_gradients
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/models/pet
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/
-)
-
-add_custom_command(TARGET test_pet_gradients POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        ${CMAKE_CURRENT_SOURCE_DIR}/../pet-mad.gguf
-        ${CMAKE_CURRENT_BINARY_DIR}/pet-mad.gguf
 )
 
 # IO tests (no model file needed)
