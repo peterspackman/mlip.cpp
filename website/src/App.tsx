@@ -22,8 +22,8 @@ function App() {
       <footer className="footer">
         <div className="container">
           <p>
-            Powered by <a href="https://github.com/peterspackman/mlipcpp">mlip.cpp</a> |{' '}
-            <a href="https://github.com/peterspackman/mlipcpp">GitHub</a>
+            Powered by <a href="https://github.com/peterspackman/mlip.cpp">mlip.cpp</a> |{' '}
+            <a href="https://github.com/peterspackman/mlip.cpp">GitHub</a>
           </p>
         </div>
       </footer>

@@ -405,7 +405,7 @@ function resetFIRE(): void {
       state.cell,
       state.isPeriodic
     )
-    const result = state.model.predictWithOptions(system, false)
+    const result = state.model.predictWithOptions(system, true)
     const forces = new Float64Array(result.forces)
 
     // Calculate force magnitude
@@ -460,8 +460,8 @@ function runFIREStep(): boolean {
       state.isPeriodic
     )
 
-    // Get forces (use gradient forces for optimization, not NC forces)
-    const result = state.model.predictWithOptions(state.system, false)
+    // Get forces (NC forces for speed)
+    const result = state.model.predictWithOptions(state.system, true)
     const forces = new Float64Array(result.forces)
 
     // Calculate max force
@@ -540,7 +540,7 @@ function runFIREStep(): boolean {
       state.cell,
       state.isPeriodic
     )
-    const resultNew = state.model.predictWithOptions(state.system, false)
+    const resultNew = state.model.predictWithOptions(state.system, true)
     const forcesNew = new Float64Array(resultNew.forces)
 
     // Second half of velocity update
