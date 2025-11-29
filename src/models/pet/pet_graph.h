@@ -19,6 +19,7 @@ struct pet_graph_context {
   const BatchedInput &batch;  // Batched input data
   const Weights &weights;     // Model weights
   ComputePrecision precision; // Compute precision for matmuls
+  bool use_flash_attention;   // Use flash attention (disabled for backward pass)
 };
 
 /**
@@ -150,6 +151,25 @@ ggml_tensor *build_attention_mask(pet_graph_context &gctx, int layer_idx);
 ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
                                         int transformer_idx, ggml_tensor *input,
                                         ggml_tensor *attn_mask);
+
+/**
+ * Multi-head self-attention using GGML flash attention
+ *
+ * Uses ggml_flash_attn_ext for fused, optimized attention computation.
+ * Requires mask in F16 format with shape [seq_len, seq_len_padded, 1, n_atoms].
+ *
+ * @param gctx Graph context
+ * @param layer_idx GNN layer index
+ * @param transformer_idx Transformer block index
+ * @param input Input tokens [d_pet, seq_len, total_atoms]
+ * @param attn_mask Flash attention mask [seq_len, seq_len_padded, 1, total_atoms] (F16)
+ * @return Attention output [d_pet, seq_len, total_atoms]
+ */
+ggml_tensor *build_multi_head_attention_flash(pet_graph_context &gctx,
+                                               int layer_idx,
+                                               int transformer_idx,
+                                               ggml_tensor *input,
+                                               ggml_tensor *attn_mask);
 
 /**
  * Compute reversed message averaging for message passing between layers

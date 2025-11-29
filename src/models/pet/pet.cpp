@@ -287,7 +287,7 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
   ggml_cgraph *gf;
   {
     ScopedTimer graph_timer(TimerCategory::GraphBuild);
-    atomic_energies = build_forward_graph(batch, compute_nc_forces, compute_nc_stress);
+    atomic_energies = build_forward_graph(batch, compute_nc_forces, compute_nc_stress, compute_forces);
 
     // For gradient computation, we need a scalar loss
     if (compute_forces) {
@@ -319,6 +319,10 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
       }
     }
   }
+
+  // Log graph size for tuning allocation (info level for investigation)
+  log::info("Graph nodes: {} (max: {})", ggml_graph_n_nodes(gf),
+            compute_forces ? MAX_GRAPH_NODES_BACKWARD : MAX_GRAPH_NODES_FORWARD);
 
   // Create or recreate scheduler if needed
   if (sched_) {
@@ -691,10 +695,15 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
 
 ggml_tensor *PETModel::build_forward_graph(const BatchedInput &batch,
                                            bool compute_nc_forces,
-                                           bool compute_nc_stress) {
+                                           bool compute_nc_stress,
+                                           bool compute_forces) {
+  // Flash attention is only used when NOT computing gradient-based forces
+  // (ggml_flash_attn_ext doesn't have backward pass yet)
+  use_flash_attention_ = !compute_forces;
+
   // Create graph context for helper functions
   pet_graph_context gctx = {ctx_compute_, hypers_, batch, weights_,
-                            compute_precision_};
+                            compute_precision_, use_flash_attention_};
 
   // Reset non-conservative outputs
   nc_forces_output_ = nullptr;
@@ -831,7 +840,7 @@ ggml_tensor *PETModel::apply_gnn_layer(int layer_idx, const BatchedInput &batch,
 
   // Create graph context for helper functions
   pet_graph_context gctx = {ctx_compute_, hypers_, batch, weights_,
-                            compute_precision_};
+                            compute_precision_, use_flash_attention_};
 
   // Step 3.1: Embed center atom species
   ggml_tensor *node_embeds = build_node_embedding(
@@ -865,9 +874,13 @@ ggml_tensor *PETModel::apply_gnn_layer(int layer_idx, const BatchedInput &batch,
   }
 
   for (int tf_idx = 0; tf_idx < hypers_.num_attention_layers; ++tf_idx) {
-    // Multi-head attention using extracted helper
-    ggml_tensor *attn_out =
-        build_multi_head_attention(gctx, layer_idx, tf_idx, cur, attn_mask);
+    // Multi-head attention - use flash attention when not computing gradients
+    ggml_tensor *attn_out;
+    if (gctx.use_flash_attention) {
+      attn_out = build_multi_head_attention_flash(gctx, layer_idx, tf_idx, cur, attn_mask);
+    } else {
+      attn_out = build_multi_head_attention(gctx, layer_idx, tf_idx, cur, attn_mask);
+    }
 
     // Apply transformer block (residual + norm + MLP + residual + norm)
     cur = build_transformer_block(gctx, layer_idx, tf_idx, cur, attn_mask,

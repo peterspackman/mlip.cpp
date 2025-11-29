@@ -158,6 +158,7 @@ private:
   BackendPreference backend_preference_ = BackendPreference::Auto;
   ComputePrecision compute_precision_ = ComputePrecision::F32;
   bool profiling_enabled_ = false;
+  bool use_flash_attention_ = true;  // Set per-inference based on compute_forces
 
   // Non-conservative outputs (set during graph building, extracted after compute)
   ggml_tensor *nc_forces_output_ = nullptr;  // [3, total_atoms] if available
@@ -201,7 +202,8 @@ private:
    */
   ggml_tensor *build_forward_graph(const BatchedInput &batch,
                                    bool compute_nc_forces = false,
-                                   bool compute_nc_stress = false);
+                                   bool compute_nc_stress = false,
+                                   bool compute_forces = false);
 
   // Phase implementations (see PET_CLEAN_DESIGN.md for details)
 

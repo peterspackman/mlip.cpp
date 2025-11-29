@@ -299,86 +299,70 @@ void build_nef_tensors(ggml_context *ctx, BatchedInput &batch,
     padding_mask_cpu[nef_pos] = 1.0f;
   }
 
-  // Gather edge vectors into NEF format
-  std::vector<float> edge_vectors_nef_cpu(
-      3 * batch.max_neighbors * batch.total_atoms, 0.0f);
+  // Allocate all NEF arrays
+  const int nef_size = batch.max_neighbors * batch.total_atoms;
+  std::vector<float> edge_vectors_nef_cpu(3 * nef_size, 0.0f);
+  std::vector<int32_t> neighbor_species_nef_cpu(nef_size, 0);
+  std::vector<int32_t> neighbor_species_transposed_cpu(nef_size, 0);
+  std::vector<float> edge_distances_nef_cpu(nef_size, 0.0f);
+  std::vector<float> cutoff_factors_nef_cpu(nef_size, 0.0f);
+  std::vector<int32_t> neighbor_indices_nef_cpu(nef_size, 0);
+
+  // Fused gather loop - single pass through all NEF positions
+  // This improves cache locality by accessing edge_data once per position
   if (batch.total_edges > 0) {
     for (int atom = 0; atom < batch.total_atoms; ++atom) {
       for (int slot = 0; slot < batch.max_neighbors; ++slot) {
-        int nef_idx = slot + atom * batch.max_neighbors;
-        int edge_idx = nef_indices_cpu[nef_idx];
+        const int nef_pos = slot + atom * batch.max_neighbors;
+        const int edge_idx = nef_indices_cpu[nef_pos];
 
         if (edge_idx != -1) {
-          for (int dim = 0; dim < 3; ++dim) {
-            int target_idx = dim + slot * 3 + atom * (3 * batch.max_neighbors);
-            int source_idx = dim + edge_idx * 3;
-            edge_vectors_nef_cpu[target_idx] =
-                edge_data.edge_vectors_cpu[source_idx];
-          }
-        }
-      }
-    }
-  }
+          // Edge vectors (3D) - use memcpy for the 3 floats
+          const int vec_target = slot * 3 + atom * (3 * batch.max_neighbors);
+          const int vec_source = edge_idx * 3;
+          edge_vectors_nef_cpu[vec_target] = edge_data.edge_vectors_cpu[vec_source];
+          edge_vectors_nef_cpu[vec_target + 1] = edge_data.edge_vectors_cpu[vec_source + 1];
+          edge_vectors_nef_cpu[vec_target + 2] = edge_data.edge_vectors_cpu[vec_source + 2];
 
-  batch.edge_vectors_nef = ggml_new_tensor_3d(
-      ctx, GGML_TYPE_F32, 3, batch.max_neighbors, batch.total_atoms);
-  memcpy(batch.edge_vectors_nef->data, edge_vectors_nef_cpu.data(),
-         sizeof(float) * edge_vectors_nef_cpu.size());
+          // Edge distance (scalar)
+          edge_distances_nef_cpu[nef_pos] = edge_data.edge_distances_cpu[edge_idx];
 
-  // Gather neighbor species
-  std::vector<int32_t> neighbor_species_nef_cpu(
-      batch.max_neighbors * batch.total_atoms, 0);
-  if (batch.total_edges > 0) {
-    for (int atom = 0; atom < batch.total_atoms; ++atom) {
-      for (int slot = 0; slot < batch.max_neighbors; ++slot) {
-        int nef_pos = slot + atom * batch.max_neighbors;
-        int edge_idx_raw = nef_indices_cpu[nef_pos];
+          // Cutoff factor (scalar)
+          cutoff_factors_nef_cpu[nef_pos] = edge_data.cutoff_factors_cpu[edge_idx];
 
-        if (edge_idx_raw != -1) {
-          int neighbor_atom = edge_data.edge_neighbor_indices_cpu[edge_idx_raw];
-          neighbor_species_nef_cpu[nef_pos] =
+          // Neighbor index (scalar)
+          const int neighbor_atom = edge_data.edge_neighbor_indices_cpu[edge_idx];
+          neighbor_indices_nef_cpu[nef_pos] = neighbor_atom;
+
+          // Neighbor species (requires lookup through neighbor atom)
+          neighbor_species_nef_cpu[nef_pos] = atom_data.species_indices_cpu[neighbor_atom];
+
+          // Transposed species (different memory layout)
+          const int transposed_pos = atom + slot * batch.total_atoms;
+          neighbor_species_transposed_cpu[transposed_pos] =
               atom_data.species_indices_cpu[neighbor_atom];
         }
       }
     }
   }
 
+  // Create tensors and copy data
+  batch.edge_vectors_nef = ggml_new_tensor_3d(
+      ctx, GGML_TYPE_F32, 3, batch.max_neighbors, batch.total_atoms);
+  memcpy(batch.edge_vectors_nef->data, edge_vectors_nef_cpu.data(),
+         sizeof(float) * edge_vectors_nef_cpu.size());
+
   batch.neighbor_species_nef = ggml_new_tensor_2d(
       ctx, GGML_TYPE_I32, batch.max_neighbors, batch.total_atoms);
   memcpy(batch.neighbor_species_nef->data, neighbor_species_nef_cpu.data(),
          sizeof(int32_t) * neighbor_species_nef_cpu.size());
 
-  // Create transposed version for GPU compatibility
-  // CUDA/HIP don't support I32->I32 copy for non-contiguous tensors, so we
-  // pre-compute the transposed layout to avoid ggml_cont(ggml_transpose(...))
-  // Original: [max_neighbors, total_atoms] - slot varies fastest
-  // Transposed: [total_atoms, max_neighbors] - atom varies fastest
-  std::vector<int32_t> neighbor_species_transposed_cpu(
-      batch.max_neighbors * batch.total_atoms, 0);
-  for (int atom = 0; atom < batch.total_atoms; ++atom) {
-    for (int slot = 0; slot < batch.max_neighbors; ++slot) {
-      int src_idx = slot + atom * batch.max_neighbors;  // NEF layout
-      int dst_idx = atom + slot * batch.total_atoms;    // transposed layout
-      neighbor_species_transposed_cpu[dst_idx] = neighbor_species_nef_cpu[src_idx];
-    }
-  }
+  // Transposed version for GPU compatibility (CUDA/HIP I32 limitation)
   batch.neighbor_species_transposed = ggml_new_tensor_2d(
       ctx, GGML_TYPE_I32, batch.total_atoms, batch.max_neighbors);
   memcpy(batch.neighbor_species_transposed->data,
          neighbor_species_transposed_cpu.data(),
          sizeof(int32_t) * neighbor_species_transposed_cpu.size());
-
-  // Gather edge distances
-  std::vector<float> edge_distances_nef_cpu(
-      batch.max_neighbors * batch.total_atoms, 0.0f);
-  if (batch.total_edges > 0) {
-    for (int i = 0; i < batch.max_neighbors * batch.total_atoms; ++i) {
-      int edge_idx_raw = nef_indices_cpu[i];
-      if (edge_idx_raw != -1) {
-        edge_distances_nef_cpu[i] = edge_data.edge_distances_cpu[edge_idx_raw];
-      }
-    }
-  }
 
   batch.edge_distances_nef = ggml_new_tensor_2d(
       ctx, GGML_TYPE_F32, batch.max_neighbors, batch.total_atoms);
@@ -392,18 +376,6 @@ void build_nef_tensors(ggml_context *ctx, BatchedInput &batch,
       edge_vectors_nef_cpu[2 * batch.max_neighbors * batch.total_atoms],
       edge_distances_nef_cpu[0]);
 
-  // Gather cutoff factors
-  std::vector<float> cutoff_factors_nef_cpu(
-      batch.max_neighbors * batch.total_atoms, 0.0f);
-  if (batch.total_edges > 0) {
-    for (int i = 0; i < batch.max_neighbors * batch.total_atoms; ++i) {
-      int edge_idx_raw = nef_indices_cpu[i];
-      if (edge_idx_raw != -1) {
-        cutoff_factors_nef_cpu[i] = edge_data.cutoff_factors_cpu[edge_idx_raw];
-      }
-    }
-  }
-
   batch.cutoff_factors_nef = ggml_new_tensor_2d(
       ctx, GGML_TYPE_F32, batch.max_neighbors, batch.total_atoms);
   memcpy(batch.cutoff_factors_nef->data, cutoff_factors_nef_cpu.data(),
@@ -414,19 +386,6 @@ void build_nef_tensors(ggml_context *ctx, BatchedInput &batch,
       ctx, GGML_TYPE_F32, batch.max_neighbors, batch.total_atoms);
   memcpy(batch.padding_mask_nef->data, padding_mask_cpu.data(),
          sizeof(float) * padding_mask_cpu.size());
-
-  // Neighbor indices
-  std::vector<int32_t> neighbor_indices_nef_cpu(
-      batch.max_neighbors * batch.total_atoms, 0);
-  if (batch.total_edges > 0) {
-    for (int i = 0; i < batch.max_neighbors * batch.total_atoms; ++i) {
-      int edge_idx_raw = nef_indices_cpu[i];
-      if (edge_idx_raw != -1) {
-        neighbor_indices_nef_cpu[i] =
-            edge_data.edge_neighbor_indices_cpu[edge_idx_raw];
-      }
-    }
-  }
 
   batch.neighbor_indices_nef = ggml_new_tensor_2d(
       ctx, GGML_TYPE_I32, batch.max_neighbors, batch.total_atoms);
@@ -614,7 +573,17 @@ void build_attention_masks(ggml_context *ctx, BatchedInput &batch,
   ScopedTimer mask_timer(TimerCategory::AttentionMask);
 
   int seq_len = 1 + batch.max_neighbors;
-  std::vector<float> mask_data(seq_len * seq_len * batch.total_atoms, 0.0f);
+
+  // Flash attention requires mask shape [n_kv, n_batch_pad, 1, n_atoms]
+  // where n_batch_pad = GGML_PAD(n_batch, 64) = ((seq_len + 63) / 64) * 64
+  // and mask type must be F16
+  constexpr int KQ_MASK_PAD = 64;  // Same as GGML_KQ_MASK_PAD
+  int seq_len_padded = ((seq_len + KQ_MASK_PAD - 1) / KQ_MASK_PAD) * KQ_MASK_PAD;
+
+  // Allocate mask data in F16 format, initialized to -INFINITY
+  std::vector<ggml_fp16_t> mask_data(seq_len * seq_len_padded * batch.total_atoms);
+  ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-INFINITY);
+  std::fill(mask_data.begin(), mask_data.end(), neg_inf_f16);
 
   // Get padding mask and cutoff factors from batch
   std::vector<float> padding_mask_cpu(batch.max_neighbors * batch.total_atoms);
@@ -656,32 +625,44 @@ void build_attention_masks(ggml_context *ctx, BatchedInput &batch,
       }
     }
 
-    // Take log of clamped values
-    std::vector<float> cutoff_pattern(seq_len);
+    // Convert to log-space mask values (F16)
+    // Flash attention mask is ADDITIVE: score = Q@K^T * scale + mask
+    // Use log(cutoff) for valid edges, -INFINITY for invalid
+    std::vector<ggml_fp16_t> cutoff_pattern_f16(seq_len);
     for (int i = 0; i < seq_len; ++i) {
-      cutoff_pattern[i] = std::log(std::max(cutoff_values[i], 1e-15f));
+      if (cutoff_values[i] > 0.0f) {
+        cutoff_pattern_f16[i] = ggml_fp32_to_fp16(std::log(cutoff_values[i]));
+      } else {
+        cutoff_pattern_f16[i] = neg_inf_f16;
+      }
     }
 
-    // Broadcast to all query positions
+    // Fill mask for this atom
+    // Flash attention mask shape: [n_kv, n_batch_pad, 1, n_atoms]
+    // In our case: [seq_len, seq_len_padded, 1, n_atoms]
+    // Index: key_pos + query_pos * seq_len + 0 * (seq_len * seq_len_padded) + atom_idx * (seq_len * seq_len_padded * 1)
+    // Simplified: key_pos + query_pos * seq_len + atom_idx * (seq_len * seq_len_padded)
     for (int query_pos = 0; query_pos < seq_len; ++query_pos) {
       for (int key_pos = 0; key_pos < seq_len; ++key_pos) {
-        int mask_idx =
-            atom_idx * (seq_len * seq_len) + query_pos * seq_len + key_pos;
-        mask_data[mask_idx] = cutoff_pattern[key_pos];
+        int mask_idx = key_pos + query_pos * seq_len +
+                       atom_idx * (seq_len * seq_len_padded);
+        mask_data[mask_idx] = cutoff_pattern_f16[key_pos];
       }
+      // Padding positions (query_pos < seq_len but key_pos >= seq_len) remain -INFINITY
     }
   }
 
-  // Create identical masks for both GNN layers
-  batch.attn_mask_layer0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, seq_len,
-                                              seq_len, batch.total_atoms);
+  // Create 4D masks in F16 format for flash attention
+  // Shape: [seq_len, seq_len_padded, 1, n_atoms]
+  batch.attn_mask_layer0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, seq_len,
+                                              seq_len_padded, 1, batch.total_atoms);
   memcpy(batch.attn_mask_layer0->data, mask_data.data(),
-         sizeof(float) * mask_data.size());
+         sizeof(ggml_fp16_t) * mask_data.size());
 
-  batch.attn_mask_layer1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, seq_len,
-                                              seq_len, batch.total_atoms);
+  batch.attn_mask_layer1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, seq_len,
+                                              seq_len_padded, 1, batch.total_atoms);
   memcpy(batch.attn_mask_layer1->data, mask_data.data(),
-         sizeof(float) * mask_data.size());
+         sizeof(ggml_fp16_t) * mask_data.size());
 }
 
 } // anonymous namespace

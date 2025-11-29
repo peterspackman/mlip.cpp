@@ -411,30 +411,29 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
 
   // Apply mask
   if (attn_mask) {
-    // PyTorch: attn_mask [n_atoms, seq_len, seq_len]
-    //          KQ [n_atoms * num_heads, seq_len, seq_len]
-    // GGML:    attn_mask [seq_len, seq_len, n_atoms]
-    //          KQ [seq_len, seq_len, num_heads * n_atoms]
-    // Need to broadcast mask across heads
+    // Mask is in flash attention format: [seq_len, seq_len_padded, 1, n_atoms] (F16)
+    // We need [seq_len, seq_len, 1, n_atoms] (F32) for regular attention
+    //
+    // Extract the non-padded portion and cast to F32
+    // View to get [seq_len, seq_len, 1, n_atoms] from the padded tensor
+    ggml_tensor *mask_view = ggml_view_4d(
+        gctx.ctx, attn_mask,
+        seq_len, seq_len, 1, total_atoms,
+        attn_mask->nb[1], seq_len * attn_mask->nb[1], attn_mask->nb[3],
+        0);
+
+    // Cast F16 -> F32 for the add operation
+    ggml_tensor *mask_f32 = ggml_cast(gctx.ctx, mask_view, GGML_TYPE_F32);
 
     // Reshape KQ to separate heads and atoms
-    // PyTorch: [n_atoms, num_heads, seq_len, seq_len]
-    // GGML:    [seq_len, seq_len, num_heads, n_atoms]
-    // Note: ggml_scale output is contiguous, no need for ggml_cont
+    // [seq_len, seq_len, num_heads * n_atoms] -> [seq_len, seq_len, num_heads, n_atoms]
     ggml_tensor *KQ_4d = ggml_reshape_4d(gctx.ctx, KQ, seq_len, seq_len,
                                          gctx.hypers.num_heads, total_atoms);
 
-    // Reshape mask to broadcast across heads
-    // PyTorch: [n_atoms, 1, seq_len, seq_len]
-    // GGML:    [seq_len, seq_len, 1, n_atoms]
-    ggml_tensor *mask_4d =
-        ggml_reshape_4d(gctx.ctx, attn_mask, seq_len, seq_len, 1, total_atoms);
-
     // Add mask (broadcasts across heads dimension)
-    KQ_4d = ggml_add(gctx.ctx, KQ_4d, mask_4d);
+    KQ_4d = ggml_add(gctx.ctx, KQ_4d, mask_f32);
 
     // Reshape back to 3D for softmax
-    // Note: ggml_add output is contiguous, no need for ggml_cont
     KQ = ggml_reshape_3d(gctx.ctx, KQ_4d, seq_len, seq_len,
                          gctx.hypers.num_heads * total_atoms);
   }
@@ -486,6 +485,116 @@ ggml_tensor *build_multi_head_attention(pet_graph_context &gctx, int layer_idx,
   output = ggml_add(gctx.ctx, output, tl.attn_out_bias);
 
   // Note: ggml_add output is contiguous, no need for ggml_cont
+  output = ggml_reshape_3d(gctx.ctx, output, gctx.hypers.d_pet, seq_len,
+                           total_atoms);
+
+  return output;
+}
+
+// ============================================================================
+// Flash Attention Implementation
+// ============================================================================
+
+ggml_tensor *build_multi_head_attention_flash(pet_graph_context &gctx,
+                                               int layer_idx,
+                                               int transformer_idx,
+                                               ggml_tensor *input,
+                                               ggml_tensor *attn_mask) {
+
+  const auto &tl = gctx.weights.gnn[layer_idx].tl[transformer_idx];
+
+  // Input: [d_pet, seq_len, n_atoms]
+  int seq_len = input->ne[1];
+  int total_atoms = input->ne[2];
+  int head_dim = gctx.hypers.d_pet / gctx.hypers.num_heads;
+
+  // ============================================================================
+  // QKV Projection
+  // ============================================================================
+
+  ggml_tensor *input_2d = ggml_reshape_2d(gctx.ctx, input, gctx.hypers.d_pet,
+                                          seq_len * total_atoms);
+
+  ggml_tensor *qkv = ggml_mul_mat(
+      gctx.ctx, maybe_cast(gctx.ctx, tl.attn_in_weight, gctx.precision),
+      input_2d);
+  qkv = ggml_add(gctx.ctx, qkv, tl.attn_in_bias);
+
+  // Reshape to 4D for head splitting
+  // [3*d_pet, seq_len * n_atoms] -> [head_dim, 3*num_heads, seq_len, n_atoms]
+  ggml_tensor *qkv_split = ggml_reshape_4d(
+      gctx.ctx, qkv, head_dim, 3 * gctx.hypers.num_heads, seq_len, total_atoms);
+
+  // Permute to separate Q, K, V
+  // [head_dim, 3*num_heads, seq_len, n_atoms] -> [head_dim, seq_len, 3*num_heads, n_atoms]
+  qkv_split = ggml_permute(gctx.ctx, qkv_split, 0, 2, 1, 3);
+  qkv_split = ggml_cont(gctx.ctx, qkv_split);
+
+  // Extract Q, K, V using views
+  size_t offset_K = gctx.hypers.num_heads * qkv_split->nb[2];
+  size_t offset_V = 2 * gctx.hypers.num_heads * qkv_split->nb[2];
+
+  // Q: [head_dim, seq_len, num_heads, n_atoms]
+  ggml_tensor *Q = ggml_view_4d(
+      gctx.ctx, qkv_split, head_dim, seq_len, gctx.hypers.num_heads,
+      total_atoms, qkv_split->nb[1], qkv_split->nb[2], qkv_split->nb[3], 0);
+  Q = ggml_cont(gctx.ctx, Q);
+
+  // K: [head_dim, seq_len, num_heads, n_atoms]
+  ggml_tensor *K = ggml_view_4d(
+      gctx.ctx, qkv_split, head_dim, seq_len, gctx.hypers.num_heads,
+      total_atoms, qkv_split->nb[1], qkv_split->nb[2], qkv_split->nb[3],
+      offset_K);
+  K = ggml_cont(gctx.ctx, K);
+
+  // V: [head_dim, seq_len, num_heads, n_atoms]
+  ggml_tensor *V = ggml_view_4d(
+      gctx.ctx, qkv_split, head_dim, seq_len, gctx.hypers.num_heads,
+      total_atoms, qkv_split->nb[1], qkv_split->nb[2], qkv_split->nb[3],
+      offset_V);
+  V = ggml_cont(gctx.ctx, V);
+
+  // ============================================================================
+  // Flash Attention
+  // ============================================================================
+
+  // Flash attention expects:
+  // Q: [n_embd_k, n_batch, n_head, ne3] = [head_dim, seq_len, num_heads, n_atoms]
+  // K: [n_embd_k, n_kv, n_head_kv, ne3] = [head_dim, seq_len, num_heads, n_atoms]
+  // V: [n_embd_v, n_kv, n_head_kv, ne3] = [head_dim, seq_len, num_heads, n_atoms]
+  // mask: [n_kv, n_batch_pad, ne32, ne33] = [seq_len, seq_len_pad, 1, n_atoms] (F16!)
+  //
+  // Our shapes match perfectly!
+
+  float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  float max_bias = 0.0f;      // Not using ALiBi
+  float logit_softcap = 0.0f; // Not using softcap
+
+  ggml_tensor *attn_out =
+      ggml_flash_attn_ext(gctx.ctx, Q, K, V, attn_mask, scale, max_bias, logit_softcap);
+
+  // Set precision for flash attention
+  ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+
+  // Flash attention output: [n_embd_v, n_head, n_batch, ne3]
+  //                       = [head_dim, num_heads, seq_len, n_atoms] (permuted!)
+  //
+  // We need [d_pet, seq_len, n_atoms] for output projection
+
+  // ============================================================================
+  // Output Projection
+  // ============================================================================
+
+  // The output is already in [head_dim, num_heads, seq_len, n_atoms] format
+  // Reshape to 2D for matmul: [head_dim * num_heads, seq_len * n_atoms] = [d_pet, seq_len * n_atoms]
+  ggml_tensor *attn_2d = ggml_reshape_2d(gctx.ctx, attn_out, gctx.hypers.d_pet,
+                                         seq_len * total_atoms);
+
+  ggml_tensor *output = ggml_mul_mat(
+      gctx.ctx, maybe_cast(gctx.ctx, tl.attn_out_weight, gctx.precision),
+      attn_2d);
+  output = ggml_add(gctx.ctx, output, tl.attn_out_bias);
+
   output = ggml_reshape_3d(gctx.ctx, output, gctx.hypers.d_pet, seq_len,
                            total_atoms);
 
