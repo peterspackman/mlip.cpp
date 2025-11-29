@@ -199,49 +199,6 @@ function calculateKineticEnergy(velocities: Float64Array, masses: Float64Array, 
   return { ke, temp }
 }
 
-// Velocity Verlet position update
-function velocityVerletPositions(
-  positions: Float64Array,
-  velocities: Float64Array,
-  forces: Float64Array,
-  masses: Float64Array,
-  numAtoms: number,
-  dt: number
-): void {
-  // r(t+dt) = r(t) + v(t)*dt + 0.5*a(t)*dt^2
-  // a = F/m with conversion factor
-  for (let i = 0; i < numAtoms; i++) {
-    const mass = masses[i]
-    const accelFactor = EV_A_AMU_TO_A_FS2 / mass
-    for (let j = 0; j < 3; j++) {
-      const idx = i * 3 + j
-      const accel = forces[idx] * accelFactor  // A/fs^2
-      positions[idx] += velocities[idx] * dt + 0.5 * accel * dt * dt
-    }
-  }
-}
-
-// Velocity Verlet velocity update
-function velocityVerletVelocities(
-  velocities: Float64Array,
-  forcesOld: Float64Array,
-  forcesNew: Float64Array,
-  masses: Float64Array,
-  numAtoms: number,
-  dt: number
-): void {
-  // v(t+dt) = v(t) + 0.5*(a(t) + a(t+dt))*dt
-  for (let i = 0; i < numAtoms; i++) {
-    const mass = masses[i]
-    const accelFactor = EV_A_AMU_TO_A_FS2 / mass
-    for (let j = 0; j < 3; j++) {
-      const idx = i * 3 + j
-      const accelOld = forcesOld[idx] * accelFactor
-      const accelNew = forcesNew[idx] * accelFactor
-      velocities[idx] += 0.5 * (accelOld + accelNew) * dt
-    }
-  }
-}
 
 // Berendsen thermostat velocity scaling
 function berendsenThermostat(
@@ -494,7 +451,7 @@ function calculateMaxStress(stress: Float64Array): number {
 // The cell gradient is: dE/dh = -V * stress * (h^-T) where h is the cell matrix
 // For simplicity, we use: cell_force = -V * stress (works for orthogonal cells)
 // Stress in eV/A^3, cell in A, so cell_force is in eV/A^2
-function stressToCellForce(stress: Float64Array, cell: Float64Array, volume: number): Float64Array {
+function stressToCellForce(stress: Float64Array, _cell: Float64Array, volume: number): Float64Array {
   // Convert Voigt [xx, yy, zz, yz, xz, xy] to 3x3 symmetric tensor
   // Then multiply by -volume to get the "force" on the cell
   // For a general cell, the gradient is more complex, but this approximation works

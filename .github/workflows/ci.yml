@@ -60,6 +60,7 @@ jobs:
       - name: Convert PET-MAD
         run: |
           uv run scripts/convert_pet_mad.py --output pet-mad.gguf
+          rm -f build/tests/pet-mad.gguf
           cp pet-mad.gguf build/tests/
 
       - name: Run tests
