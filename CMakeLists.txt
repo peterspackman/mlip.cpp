@@ -51,6 +51,12 @@ if(EMSCRIPTEN)
     set(MLIPCPP_USE_SYCL OFF)
     set(MLIPCPP_USE_CANN OFF)
     set(MLIPCPP_USE_BLAS OFF)
+    # Tell GGML we're building for WASM so it uses SIMD-optimized kernels
+    # (Emscripten defaults CMAKE_SYSTEM_PROCESSOR to x86, not wasm)
+    set(CMAKE_SYSTEM_PROCESSOR "wasm32" CACHE STRING "" FORCE)
+    # Enable SIMD128 globally for all WASM compilation
+    add_compile_options(-msimd128)
+    add_link_options(-msimd128)
 endif()
 
 # Enable Fortran if requested

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import * as NGL from 'ngl'
 import { getAtomicNumber, getCovalentRadius, getSymbol } from '../data/elements'
+import { fetchFromPubChem } from '../utils/pubchem'
 import './MolecularDynamics.css'
 
 // Sample structures for MD - molecules and crystals
@@ -65,10 +66,16 @@ Si    1.35750    1.35750    1.35750
 Si    4.07250    4.07250    1.35750
 Si    4.07250    1.35750    4.07250
 Si    1.35750    4.07250    4.07250`,
-  'MgO': `2
+  'MgO': `8
 Lattice="4.212 0.0 0.0 0.0 4.212 0.0 0.0 0.0 4.212" pbc="T T T"
 Mg    0.00000    0.00000    0.00000
-O     2.10600    2.10600    2.10600`,
+Mg    0.00000    2.10600    2.10600
+Mg    2.10600    0.00000    2.10600
+Mg    2.10600    2.10600    0.00000
+O     2.10600    0.00000    0.00000
+O     2.10600    2.10600    2.10600
+O     0.00000    0.00000    2.10600
+O     0.00000    2.10600    0.00000`,
   'Urea': `16
 Lattice="5.582 0.0 0.0 0.0 5.582 0.0 0.0 0.0 4.686" pbc="T T T"
 C     0.00000    2.83100    1.55628
@@ -126,6 +133,54 @@ function detectBonds(positions: number[], atomicNumbers: number[]): [number, num
   }
 
   return bonds
+}
+
+// Wrap positions back into the unit cell using fractional coordinates
+function wrapPositionsToCell(
+  positions: number[],
+  lattice: { a: number[], b: number[], c: number[] }
+): number[] {
+  const numAtoms = positions.length / 3
+  const wrapped = new Array(positions.length)
+
+  // Build inverse matrix to convert Cartesian to fractional
+  // lattice matrix: [a, b, c] as columns
+  const ax = lattice.a[0], ay = lattice.a[1], az = lattice.a[2]
+  const bx = lattice.b[0], by = lattice.b[1], bz = lattice.b[2]
+  const cx = lattice.c[0], cy = lattice.c[1], cz = lattice.c[2]
+
+  // Determinant
+  const det = ax * (by * cz - bz * cy) - bx * (ay * cz - az * cy) + cx * (ay * bz - az * by)
+
+  // Inverse matrix (to convert Cartesian -> fractional)
+  const inv = [
+    [(by * cz - bz * cy) / det, (cx * bz - bx * cz) / det, (bx * cy - cx * by) / det],
+    [(az * cy - ay * cz) / det, (ax * cz - cx * az) / det, (cx * ay - ax * cy) / det],
+    [(ay * bz - az * by) / det, (bx * az - ax * bz) / det, (ax * by - bx * ay) / det]
+  ]
+
+  for (let i = 0; i < numAtoms; i++) {
+    const x = positions[i * 3]
+    const y = positions[i * 3 + 1]
+    const z = positions[i * 3 + 2]
+
+    // Convert to fractional coordinates
+    let fa = inv[0][0] * x + inv[0][1] * y + inv[0][2] * z
+    let fb = inv[1][0] * x + inv[1][1] * y + inv[1][2] * z
+    let fc = inv[2][0] * x + inv[2][1] * y + inv[2][2] * z
+
+    // Wrap to [0, 1)
+    fa = fa - Math.floor(fa)
+    fb = fb - Math.floor(fb)
+    fc = fc - Math.floor(fc)
+
+    // Convert back to Cartesian
+    wrapped[i * 3] = fa * ax + fb * bx + fc * cx
+    wrapped[i * 3 + 1] = fa * ay + fb * by + fc * cy
+    wrapped[i * 3 + 2] = fa * az + fb * bz + fc * cz
+  }
+
+  return wrapped
 }
 
 // Generate supercell positions for periodic visualization
@@ -236,6 +291,14 @@ function parseLattice(xyz: string): { a: number[], b: number[], c: number[] } | 
   }
 }
 
+interface TimingInfo {
+  verlet1: number
+  systemCreate: number
+  predict: number
+  verlet2: number
+  total: number
+}
+
 interface MDState {
   isInitialized: boolean
   isLoadingModel: boolean
@@ -248,8 +311,10 @@ interface MDState {
   kineticEnergy: number
   temperature: number
   maxForce: number
+  maxStress: number
   msPerStep: number
   optimizationConverged: boolean
+  timing: TimingInfo | null
 }
 
 export default function MolecularDynamics() {
@@ -273,8 +338,10 @@ export default function MolecularDynamics() {
     kineticEnergy: 0,
     temperature: 0,
     maxForce: 0,
+    maxStress: 0,
     msPerStep: 0,
     optimizationConverged: false,
+    timing: null,
   })
 
   const lastStepTimeRef = useRef<number>(0)
@@ -293,6 +360,10 @@ export default function MolecularDynamics() {
   const supercellSizeRef = useRef<[number, number, number]>([2, 2, 2])
   const [viewStyle, setViewStyle] = useState<'ball+stick' | 'spacefill' | 'licorice'>('ball+stick')
   const viewStyleRef = useRef<string>('ball+stick')
+  const [wrapPositions, setWrapPositions] = useState(false)
+  const wrapPositionsRef = useRef(false)
+  const [pubchemQuery, setPubchemQuery] = useState('')
+  const [pubchemLoading, setPubchemLoading] = useState(false)
 
   // Initialize NGL Stage
   useEffect(() => {
@@ -363,6 +434,7 @@ export default function MolecularDynamics() {
             // For MD, track total energy (potential + kinetic)
             const totalEnergy = msg.energy + msg.kineticEnergy
             setEnergyHistory(h => [...h.slice(-99), totalEnergy])  // Keep last 100 points
+
             setState(s => ({
               ...s,
               step: s.step + 1,
@@ -370,6 +442,7 @@ export default function MolecularDynamics() {
               kineticEnergy: msg.kineticEnergy,
               temperature: msg.temperature,
               msPerStep,
+              timing: msg.timing || null,
             }))
             // Update visualization
             updateVisualization(msg.positions)
@@ -383,11 +456,22 @@ export default function MolecularDynamics() {
             lastStepTimeRef.current = now
             // For optimization, track potential energy
             setEnergyHistory(h => [...h.slice(-99), msg.energy])  // Keep last 100 points
+
+            // Update cell if it changed (for cell optimization)
+            if (msg.cell && latticeRef.current) {
+              latticeRef.current = {
+                a: [msg.cell[0], msg.cell[1], msg.cell[2]],
+                b: [msg.cell[3], msg.cell[4], msg.cell[5]],
+                c: [msg.cell[6], msg.cell[7], msg.cell[8]],
+              }
+            }
+
             setState(s => ({
               ...s,
               step: msg.step,
               energy: msg.energy,
               maxForce: msg.maxForce,
+              maxStress: msg.maxStress ?? 0,
               msPerStep,
               optimizationConverged: msg.converged,
             }))
@@ -501,13 +585,19 @@ export default function MolecularDynamics() {
   const updateVisualization = useCallback((positions: number[]) => {
     if (!stageRef.current || !componentRef.current || atomicNumbersRef.current.length === 0) return
 
+    // Optionally wrap positions into the unit cell for periodic systems
+    let displayPositions = positions
+    if (wrapPositionsRef.current && latticeRef.current) {
+      displayPositions = wrapPositionsToCell(positions, latticeRef.current)
+    }
+
     // Check if bonds have changed
-    const currentBonds = detectBonds(positions, atomicNumbersRef.current)
+    const currentBonds = detectBonds(displayPositions, atomicNumbersRef.current)
     const bondsKey = currentBonds.map(([a, b]) => `${a}-${b}`).join(',')
 
     if (bondsKey !== lastBondsRef.current) {
       lastBondsRef.current = bondsKey
-      reloadStructureWithBonds(positions, viewStyleRef.current)
+      reloadStructureWithBonds(displayPositions, viewStyleRef.current)
       return
     }
 
@@ -538,9 +628,9 @@ export default function MolecularDynamics() {
             const tz = na * a[2] + nb * b[2] + nc * c[2]
 
             for (let i = 0; i < numAtoms; i++) {
-              atomStore.x[atomIdx] = positions[i * 3] + tx
-              atomStore.y[atomIdx] = positions[i * 3 + 1] + ty
-              atomStore.z[atomIdx] = positions[i * 3 + 2] + tz
+              atomStore.x[atomIdx] = displayPositions[i * 3] + tx
+              atomStore.y[atomIdx] = displayPositions[i * 3 + 1] + ty
+              atomStore.z[atomIdx] = displayPositions[i * 3 + 2] + tz
               atomIdx++
             }
           }
@@ -549,9 +639,9 @@ export default function MolecularDynamics() {
     } else {
       // Non-periodic: direct update
       for (let i = 0; i < numAtoms; i++) {
-        atomStore.x[i] = positions[i * 3]
-        atomStore.y[i] = positions[i * 3 + 1]
-        atomStore.z[i] = positions[i * 3 + 2]
+        atomStore.x[i] = displayPositions[i * 3]
+        atomStore.y[i] = displayPositions[i * 3 + 1]
+        atomStore.z[i] = displayPositions[i * 3 + 2]
       }
     }
 
@@ -683,7 +773,7 @@ export default function MolecularDynamics() {
 
     // Clear energy history and reset state
     setEnergyHistory([])
-    setState(s => ({ ...s, step: 0, energy: 0, kineticEnergy: 0, temperature: 0, maxForce: 0, msPerStep: 0, optimizationConverged: false }))
+    setState(s => ({ ...s, step: 0, energy: 0, kineticEnergy: 0, temperature: 0, maxForce: 0, maxStress: 0, msPerStep: 0, optimizationConverged: false }))
   }, [loadStructureVisualization])
 
   // Handle sample structure selection
@@ -752,6 +842,25 @@ export default function MolecularDynamics() {
     workerRef.current?.postMessage({ type: 'rattle', amount: rattleAmount })
   }
 
+  // Load structure from PubChem
+  const loadFromPubChem = async () => {
+    if (!pubchemQuery.trim()) return
+
+    setPubchemLoading(true)
+    setState(s => ({ ...s, error: '' }))
+
+    try {
+      const xyz = await fetchFromPubChem(pubchemQuery.trim())
+      setCustomXyz(xyz)
+      setSelectedStructure('')
+      setStructure(xyz)
+    } catch (err: any) {
+      setState(s => ({ ...s, error: err.message }))
+    } finally {
+      setPubchemLoading(false)
+    }
+  }
+
   return (
     <div className="md-simulation">
       {/* Left panel - Structure and parameters */}
@@ -793,6 +902,24 @@ export default function MolecularDynamics() {
           >
             Load Structure
           </button>
+          <div className="pubchem-search">
+            <input
+              type="text"
+              value={pubchemQuery}
+              onChange={e => setPubchemQuery(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && loadFromPubChem()}
+              placeholder="Search PubChem (e.g. aspirin)"
+              className="pubchem-input"
+              disabled={!state.isModelLoaded || pubchemLoading}
+            />
+            <button
+              onClick={loadFromPubChem}
+              className="pubchem-button"
+              disabled={!state.isModelLoaded || !pubchemQuery.trim() || pubchemLoading}
+            >
+              {pubchemLoading ? '...' : 'Fetch'}
+            </button>
+          </div>
         </div>
 
         <div className="panel-section">
@@ -982,6 +1109,17 @@ export default function MolecularDynamics() {
                   />
                 </div>
               </div>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={wrapPositions}
+                  onChange={e => {
+                    setWrapPositions(e.target.checked)
+                    wrapPositionsRef.current = e.target.checked
+                  }}
+                />
+                Wrap positions
+              </label>
             </>
           )}
         </div>
@@ -1106,15 +1244,31 @@ export default function MolecularDynamics() {
               </div>
             </>
           ) : (
-            <div className="stat">
-              <span className="stat-label">Max Force</span>
-              <span className="stat-value">{state.maxForce?.toFixed(4) ?? '—'} eV/Å</span>
-            </div>
+            <>
+              <div className="stat">
+                <span className="stat-label">Max Force</span>
+                <span className="stat-value">{state.maxForce?.toFixed(4) ?? '—'} eV/Å</span>
+              </div>
+              {latticeRef.current && (
+                <div className="stat">
+                  <span className="stat-label">Max Stress</span>
+                  <span className="stat-value">{state.maxStress?.toFixed(4) ?? '—'} eV/Å³</span>
+                </div>
+              )}
+            </>
           )}
           <div className="stat">
             <span className="stat-label">Speed</span>
             <span className="stat-value">{state.msPerStep.toFixed(0)} ms/step</span>
           </div>
+          {state.timing && (
+            <div className="stat timing-breakdown">
+              <span className="stat-label">Breakdown</span>
+              <span className="stat-value timing-detail">
+                predict: {state.timing.predict.toFixed(1)}ms
+              </span>
+            </div>
+          )}
           <button
             onClick={state.isRunning ? stopMD : startSimulation}
             className={`play-button ${state.isRunning ? 'stop' : 'start'}`}

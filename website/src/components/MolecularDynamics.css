@@ -469,3 +469,65 @@
   outline: none;
   border-color: var(--accent);
 }
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
+}
+
+.pubchem-search {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.pubchem-input {
+  flex: 1;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.pubchem-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pubchem-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.pubchem-button {
+  padding: 0.5rem 0.75rem;
+  background-color: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.pubchem-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.pubchem-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

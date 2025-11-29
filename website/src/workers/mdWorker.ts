@@ -18,6 +18,7 @@ interface WorkerState {
   system: AtomicSystem | null
   positions: Float64Array | null
   velocities: Float64Array | null
+  forces: Float64Array | null  // Cached forces from previous step
   atomicNumbers: Int32Array | null
   masses: Float64Array | null
   cell: Float64Array | null
@@ -31,10 +32,13 @@ interface WorkerState {
   fireNpos: number
   fireDt: number
   fireMaxDt: number
+  cellVelocities: Float64Array | null  // Cell velocities for FIRE (9 components)
   mode: 'md' | 'optimize'
   maxOptSteps: number
   forceThreshold: number
+  stressThreshold: number  // Convergence threshold for stress (eV/A^3)
   optStep: number
+  optimizeCell: boolean  // Whether to optimize cell in FIRE
 }
 
 const state: WorkerState = {
@@ -43,6 +47,7 @@ const state: WorkerState = {
   system: null,
   positions: null,
   velocities: null,
+  forces: null,
   atomicNumbers: null,
   masses: null,
   cell: null,
@@ -56,10 +61,13 @@ const state: WorkerState = {
   fireNpos: 0,
   fireDt: 0.1,  // fs - initial timestep for FIRE
   fireMaxDt: 1.0,  // fs - max timestep
+  cellVelocities: null,
   mode: 'md',
   maxOptSteps: 100,
   forceThreshold: 0.05,  // eV/A
+  stressThreshold: 0.01,  // eV/A^3 (~1.6 GPa)
   optStep: 0,
+  optimizeCell: true,  // Default to optimizing cell for periodic systems
 }
 
 // Atomic masses in amu
@@ -332,8 +340,21 @@ function handleSetSystem(data: { xyz: string }): void {
       state.masses[i] = ATOMIC_MASSES[z] || 12.0  // Default to carbon mass
     }
 
-    // Initialize velocities
+    // Initialize velocities and clear all cached forces/state
     state.velocities = initializeVelocities(state.numAtoms, state.masses, state.temperature)
+    state.forces = null
+
+    // Clear FIRE optimizer cache
+    fireForces = null
+    fireStress = null
+    fireCellForce = null
+
+    // Reset FIRE state
+    state.fireAlpha = FIRE_ALPHA_START
+    state.fireNpos = 0
+    state.fireDt = 0.1
+    state.optStep = 0
+    state.cellVelocities = null
 
     self.postMessage({
       type: 'systemSet',
@@ -379,7 +400,7 @@ function handleSetParameters(data: {
   self.postMessage({ type: 'parametersSet', dt: state.dt, temperature: state.temperature })
 }
 
-let mdInterval: ReturnType<typeof setInterval> | null = null
+let mdTimeout: ReturnType<typeof setTimeout> | null = null
 
 // FIRE optimizer constants
 const FIRE_ALPHA_START = 0.1
@@ -389,12 +410,29 @@ const FIRE_F_DEC = 0.5
 const FIRE_N_MIN = 5
 const FIRE_DT_MAX = 1.0  // fs
 
+// Cached forces/stress for FIRE optimization (like MD)
+let fireForces: Float64Array | null = null
+let fireStress: Float64Array | null = null
+let fireCellForce: Float64Array | null = null
+
 // Reset FIRE optimizer state and initialize velocities along force direction
 function resetFIRE(): void {
   state.fireAlpha = FIRE_ALPHA_START
   state.fireNpos = 0
   state.fireDt = 0.1  // Start with small timestep
   state.optStep = 0
+
+  // Clear cached forces/stress from previous optimization
+  fireForces = null
+  fireStress = null
+  fireCellForce = null
+
+  // Initialize cell velocities for periodic systems
+  if (state.isPeriodic && state.optimizeCell && state.cell) {
+    state.cellVelocities = new Float64Array(9)
+  } else {
+    state.cellVelocities = null
+  }
 
   // Initialize velocities along force direction for faster startup
   if (state.module && state.model && state.positions && state.velocities && state.masses) {
@@ -441,63 +479,165 @@ function calculateMaxForce(forces: Float64Array, numAtoms: number): number {
   return maxF
 }
 
+// Calculate max stress component (absolute value)
+// Stress is in Voigt notation: [xx, yy, zz, yz, xz, xy]
+function calculateMaxStress(stress: Float64Array): number {
+  let maxS = 0
+  for (let i = 0; i < 6; i++) {
+    const s = Math.abs(stress[i])
+    if (s > maxS) maxS = s
+  }
+  return maxS
+}
+
+// Convert Voigt stress to 3x3 tensor and compute cell gradient
+// The cell gradient is: dE/dh = -V * stress * (h^-T) where h is the cell matrix
+// For simplicity, we use: cell_force = -V * stress (works for orthogonal cells)
+// Stress in eV/A^3, cell in A, so cell_force is in eV/A^2
+function stressToCellForce(stress: Float64Array, cell: Float64Array, volume: number): Float64Array {
+  // Convert Voigt [xx, yy, zz, yz, xz, xy] to 3x3 symmetric tensor
+  // Then multiply by -volume to get the "force" on the cell
+  // For a general cell, the gradient is more complex, but this approximation works
+  const cellForce = new Float64Array(9)
+
+  // Diagonal components
+  cellForce[0] = -volume * stress[0]  // xx -> h[0,0]
+  cellForce[4] = -volume * stress[1]  // yy -> h[1,1]
+  cellForce[8] = -volume * stress[2]  // zz -> h[2,2]
+
+  // Off-diagonal (for non-orthogonal cells)
+  cellForce[1] = -volume * stress[5]  // xy -> h[0,1]
+  cellForce[3] = -volume * stress[5]  // xy -> h[1,0]
+  cellForce[2] = -volume * stress[4]  // xz -> h[0,2]
+  cellForce[6] = -volume * stress[4]  // xz -> h[2,0]
+  cellForce[5] = -volume * stress[3]  // yz -> h[1,2]
+  cellForce[7] = -volume * stress[3]  // yz -> h[2,1]
+
+  return cellForce
+}
+
+// Calculate cell volume from 3x3 cell matrix (row-major: a, b, c as rows)
+function calculateVolume(cell: Float64Array): number {
+  // Volume = a · (b × c)
+  const ax = cell[0], ay = cell[1], az = cell[2]
+  const bx = cell[3], by = cell[4], bz = cell[5]
+  const cx = cell[6], cy = cell[7], cz = cell[8]
+
+  // b × c
+  const bcx = by * cz - bz * cy
+  const bcy = bz * cx - bx * cz
+  const bcz = bx * cy - by * cx
+
+  return Math.abs(ax * bcx + ay * bcy + az * bcz)
+}
+
 // Run one step of FIRE optimization
 // FIRE: Fast Inertial Relaxation Engine
 // Reference: Bitzek et al., PRL 97, 170201 (2006)
+// Extended to optimize cell using stress tensor for periodic systems
+// Uses cached forces for single prediction per step (like MD)
 function runFIREStep(): boolean {
   if (!state.module || !state.model || !state.positions || !state.velocities || !state.masses) {
     return true  // converged = done
   }
 
+  const optimizingCell = state.isPeriodic && state.optimizeCell && state.cell && state.cellVelocities
+
   try {
     state.optStep++
 
-    // Create system with current positions
-    state.system = state.module.AtomicSystem.create(
-      state.positions,
-      state.atomicNumbers!,
-      state.cell,
-      state.isPeriodic
-    )
+    // If no cached forces, compute initial forces
+    if (!fireForces) {
+      state.system = state.module.AtomicSystem.create(
+        state.positions,
+        state.atomicNumbers!,
+        state.cell,
+        state.isPeriodic
+      )
+      const result = state.model.predictWithOptions(state.system, true)
+      fireForces = new Float64Array(result.forces)
+      fireStress = result.stress ? new Float64Array(result.stress) : null
+      if (optimizingCell && fireStress && state.cell) {
+        const volume = calculateVolume(state.cell)
+        fireCellForce = stressToCellForce(fireStress, state.cell, volume)
+      }
+    }
 
-    // Get forces (NC forces for speed)
-    const result = state.model.predictWithOptions(state.system, true)
-    const forces = new Float64Array(result.forces)
+    const forces = fireForces
+    const stress = fireStress
+    const cellForce = fireCellForce
 
-    // Calculate max force
+    // Calculate max force and stress
     const maxForce = calculateMaxForce(forces, state.numAtoms)
+    const maxStress = (optimizingCell && stress) ? calculateMaxStress(stress) : 0
 
-    // Check convergence
-    if (maxForce < state.forceThreshold || state.optStep >= state.maxOptSteps) {
+    // Check convergence (both force and stress must be below threshold)
+    const forceConverged = maxForce < state.forceThreshold
+    const stressConverged = !optimizingCell || maxStress < state.stressThreshold
+    const converged = forceConverged && stressConverged
+
+    if (converged || state.optStep >= state.maxOptSteps) {
+      // Get final energy
+      state.system = state.module.AtomicSystem.create(
+        state.positions,
+        state.atomicNumbers!,
+        state.cell,
+        state.isPeriodic
+      )
+      const result = state.model.predictWithOptions(state.system, true)
+
       self.postMessage({
         type: 'optStep',
         positions: Array.from(state.positions),
+        cell: state.cell ? Array.from(state.cell) : null,
         energy: result.energy,
         maxForce,
+        maxStress,
         step: state.optStep,
-        converged: maxForce < state.forceThreshold,
+        converged,
       })
       return true  // Done
     }
 
     // FIRE algorithm
-    // 1. Calculate P = F·v (power)
+    // 1. Calculate P = F·v (power) - include cell DOFs
     let power = 0
     let vNorm = 0
     let fNorm = 0
+
+    // Atomic DOFs
     for (let i = 0; i < state.numAtoms * 3; i++) {
       power += forces[i] * state.velocities[i]
       vNorm += state.velocities[i] * state.velocities[i]
       fNorm += forces[i] * forces[i]
     }
+
+    // Cell DOFs (scaled by cell mass factor for balanced optimization)
+    const cellMassFactor = 1.0
+    if (optimizingCell && cellForce && state.cellVelocities) {
+      for (let i = 0; i < 9; i++) {
+        power += cellForce[i] * state.cellVelocities[i] * cellMassFactor
+        vNorm += state.cellVelocities[i] * state.cellVelocities[i] * cellMassFactor
+        fNorm += cellForce[i] * cellForce[i] * cellMassFactor
+      }
+    }
+
     vNorm = Math.sqrt(vNorm)
     fNorm = Math.sqrt(fNorm)
 
     // 2. Adjust velocity: v = (1-α)v + α|v|F̂
     if (fNorm > 1e-10) {
+      // Atomic velocities
       for (let i = 0; i < state.numAtoms * 3; i++) {
         state.velocities[i] = (1 - state.fireAlpha) * state.velocities[i] +
           state.fireAlpha * vNorm * forces[i] / fNorm
+      }
+      // Cell velocities
+      if (optimizingCell && cellForce && state.cellVelocities) {
+        for (let i = 0; i < 9; i++) {
+          state.cellVelocities[i] = (1 - state.fireAlpha) * state.cellVelocities[i] +
+            state.fireAlpha * vNorm * cellForce[i] / fNorm
+        }
       }
     }
 
@@ -516,24 +656,33 @@ function runFIREStep(): boolean {
       state.fireAlpha = FIRE_ALPHA_START
       // Zero velocities
       state.velocities.fill(0)
+      if (state.cellVelocities) {
+        state.cellVelocities.fill(0)
+      }
     }
 
-    // 4. Euler integration with velocity Verlet-like update
-    // Update velocities: v += F/m * dt
-    // Update positions: r += v * dt
+    // 4. Velocity Verlet with cached forces
+    // Use old forces for position update: r += v*dt + 0.5*a*dt^2
     for (let i = 0; i < state.numAtoms; i++) {
       const mass = state.masses[i]
       const accelFactor = EV_A_AMU_TO_A_FS2 / mass
       for (let j = 0; j < 3; j++) {
         const idx = i * 3 + j
-        // Half-step velocity update
-        state.velocities[idx] += 0.5 * forces[idx] * accelFactor * state.fireDt
-        // Position update
-        state.positions[idx] += state.velocities[idx] * state.fireDt
+        const accel = forces[idx] * accelFactor
+        state.positions[idx] += state.velocities[idx] * state.fireDt + 0.5 * accel * state.fireDt * state.fireDt
       }
     }
 
-    // Get new forces for second velocity update
+    // Update cell if optimizing
+    const cellAccelFactor = 1e-4
+    if (optimizingCell && cellForce && state.cellVelocities && state.cell) {
+      for (let i = 0; i < 9; i++) {
+        const accel = cellForce[i] * cellAccelFactor
+        state.cell[i] += state.cellVelocities[i] * state.fireDt + 0.5 * accel * state.fireDt * state.fireDt
+      }
+    }
+
+    // Get new forces (single prediction per step)
     state.system = state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
@@ -542,25 +691,48 @@ function runFIREStep(): boolean {
     )
     const resultNew = state.model.predictWithOptions(state.system, true)
     const forcesNew = new Float64Array(resultNew.forces)
+    const stressNew = resultNew.stress ? new Float64Array(resultNew.stress) : null
 
-    // Second half of velocity update
+    // Update velocities using average of old and new forces
     for (let i = 0; i < state.numAtoms; i++) {
       const mass = state.masses[i]
       const accelFactor = EV_A_AMU_TO_A_FS2 / mass
       for (let j = 0; j < 3; j++) {
         const idx = i * 3 + j
-        state.velocities[idx] += 0.5 * forcesNew[idx] * accelFactor * state.fireDt
+        const accelOld = forces[idx] * accelFactor
+        const accelNew = forcesNew[idx] * accelFactor
+        state.velocities[idx] += 0.5 * (accelOld + accelNew) * state.fireDt
       }
     }
 
+    // Update cell velocities
+    if (optimizingCell && stressNew && state.cellVelocities && state.cell) {
+      const volume = calculateVolume(state.cell)
+      const cellForceNew = stressToCellForce(stressNew, state.cell, volume)
+      for (let i = 0; i < 9; i++) {
+        const accelOld = (cellForce ? cellForce[i] : 0) * cellAccelFactor
+        const accelNew = cellForceNew[i] * cellAccelFactor
+        state.cellVelocities[i] += 0.5 * (accelOld + accelNew) * state.fireDt
+      }
+      // Cache new cell force
+      fireCellForce = cellForceNew
+    }
+
+    // Cache new forces for next step
+    fireForces = forcesNew
+    fireStress = stressNew
+
     const maxForceNew = calculateMaxForce(forcesNew, state.numAtoms)
+    const maxStressNew = (optimizingCell && stressNew) ? calculateMaxStress(stressNew) : 0
 
     // Send update
     self.postMessage({
       type: 'optStep',
       positions: Array.from(state.positions),
+      cell: state.cell ? Array.from(state.cell) : null,
       energy: resultNew.energy,
       maxForce: maxForceNew,
+      maxStress: maxStressNew,
       step: state.optStep,
       converged: false,
     })
@@ -579,35 +751,65 @@ function runMDStep(): void {
   }
 
   try {
-    // Create system with current positions
+    const t0 = performance.now()
+
+    // If we don't have cached forces, compute them first
+    if (!state.forces) {
+      state.system = state.module.AtomicSystem.create(
+        state.positions,
+        state.atomicNumbers!,
+        state.cell,
+        state.isPeriodic
+      )
+      const result = state.model.predictWithOptions(state.system, true)
+      state.forces = new Float64Array(result.forces)
+    }
+
+    const forcesOld = state.forces
+
+    // Velocity Verlet step 1: update positions using current forces
+    // r(t+dt) = r(t) + v(t)*dt + 0.5*a(t)*dt^2
+    for (let i = 0; i < state.numAtoms; i++) {
+      const mass = state.masses[i]
+      const accelFactor = EV_A_AMU_TO_A_FS2 / mass
+      for (let j = 0; j < 3; j++) {
+        const idx = i * 3 + j
+        const accel = forcesOld[idx] * accelFactor
+        state.positions[idx] += state.velocities[idx] * state.dt + 0.5 * accel * state.dt * state.dt
+      }
+    }
+
+    const t1 = performance.now()
+
+    // Get forces at new positions (single prediction per step)
     state.system = state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
       state.isPeriodic
     )
+    const t2 = performance.now()
 
-    // Get forces at current positions (use NC forces for faster MD)
     const result = state.model.predictWithOptions(state.system, true)
-    const forcesOld = new Float64Array(result.forces)
+    const t3 = performance.now()
 
-    // Update positions (first half of Verlet)
-    velocityVerletPositions(state.positions, state.velocities, forcesOld, state.masses, state.numAtoms, state.dt)
+    const forcesNew = new Float64Array(result.forces)
 
-    // Create system with new positions for new forces
-    state.system = state.module.AtomicSystem.create(
-      state.positions,
-      state.atomicNumbers!,
-      state.cell,
-      state.isPeriodic
-    )
+    // Velocity Verlet step 2: update velocities using average of old and new forces
+    // v(t+dt) = v(t) + 0.5*(a(t) + a(t+dt))*dt
+    for (let i = 0; i < state.numAtoms; i++) {
+      const mass = state.masses[i]
+      const accelFactor = EV_A_AMU_TO_A_FS2 / mass
+      for (let j = 0; j < 3; j++) {
+        const idx = i * 3 + j
+        const accelOld = forcesOld[idx] * accelFactor
+        const accelNew = forcesNew[idx] * accelFactor
+        state.velocities[idx] += 0.5 * (accelOld + accelNew) * state.dt
+      }
+    }
 
-    // Get forces at new positions (use NC forces for faster MD)
-    const resultNew = state.model.predictWithOptions(state.system, true)
-    const forcesNew = new Float64Array(resultNew.forces)
-
-    // Update velocities (second half of Verlet)
-    velocityVerletVelocities(state.velocities, forcesOld, forcesNew, state.masses, state.numAtoms, state.dt)
+    // Cache forces for next step
+    state.forces = forcesNew
 
     // Remove center of mass motion to prevent drift
     removeCOMVelocity(state.velocities, state.masses, state.numAtoms)
@@ -618,15 +820,23 @@ function runMDStep(): void {
 
     // Calculate updated temperature after thermostat
     const { ke: keNew, temp: tempNew } = calculateKineticEnergy(state.velocities, state.masses, state.numAtoms)
+    const t4 = performance.now()
 
-    // Send update
+    // Send update with timing info
     self.postMessage({
       type: 'mdStep',
       positions: Array.from(state.positions),
-      energy: resultNew.energy,
+      energy: result.energy,
       kineticEnergy: keNew,
       temperature: tempNew,
       forces: Array.from(forcesNew),
+      timing: {
+        verlet1: t1 - t0,
+        systemCreate: t2 - t1,
+        predict: t3 - t2,
+        verlet2: t4 - t3,
+        total: t4 - t0,
+      },
     })
   } catch (err: any) {
     handleStop()
@@ -663,32 +873,39 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
       rattlePositions(data.rattleAmount)
     }
 
-    // Run optimization steps at ~30 fps
-    mdInterval = setInterval(() => {
+    // Run optimization steps as fast as possible
+    const runOptLoop = () => {
+      if (!state.isRunning) return
       const done = runFIREStep()
       if (done) {
         handleStop()
+      } else {
+        mdTimeout = setTimeout(runOptLoop, 0)
       }
-    }, 33)
+    }
+    mdTimeout = setTimeout(runOptLoop, 0)
   } else {
     // MD mode
     const stepsPerFrame = data.stepsPerFrame || 1
 
-    // Run MD steps at ~30 fps
-    mdInterval = setInterval(() => {
+    // Run MD steps as fast as possible
+    const runMDLoop = () => {
+      if (!state.isRunning) return
       for (let i = 0; i < stepsPerFrame; i++) {
         runMDStep()
       }
-    }, 33)
+      mdTimeout = setTimeout(runMDLoop, 0)
+    }
+    mdTimeout = setTimeout(runMDLoop, 0)
   }
 
   self.postMessage({ type: 'started' })
 }
 
 function handleStop(): void {
-  if (mdInterval) {
-    clearInterval(mdInterval)
-    mdInterval = null
+  if (mdTimeout) {
+    clearTimeout(mdTimeout)
+    mdTimeout = null
   }
   state.isRunning = false
   self.postMessage({ type: 'stopped' })
