@@ -188,27 +188,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Build neighbor list
-  NeighborListOptions nl_opts;
-  nl_opts.cutoff =
-      5.0f; // PET-MAD uses 5.0 A cutoff (match PyTorch for comparison)
-  nl_opts.full_list = true;
-
-  NeighborListBuilder builder(nl_opts);
-  auto nlist = builder.build(system);
-
-  log::debug("Built neighbor list with {} pairs", nlist.num_pairs());
-
-  // Print first 5 edges
-  for (int e = 0; e < std::min(5, nlist.num_pairs()); ++e) {
-    log::trace(
-        "  {}: ({}->{}) shift=[{},{},{}] D=[{:.3f},{:.3f},{:.3f}] d={:.3f}", e,
-        nlist.centers[e], nlist.neighbors[e], nlist.cell_shifts[e][0],
-        nlist.cell_shifts[e][1], nlist.cell_shifts[e][2],
-        nlist.edge_vectors[e][0], nlist.edge_vectors[e][1],
-        nlist.edge_vectors[e][2], nlist.distances[e]);
-  }
-
   // Load model and run inference
   try {
     log::info("Loading model from {}", model_path);
@@ -232,6 +211,15 @@ int main(int argc, char **argv) {
     if (cutoff_override > 0.0f) {
       pet_model.set_cutoff(cutoff_override);
       log::info("Overriding cutoff to: {:.2f} A", cutoff_override);
+    }
+
+    // Log neighbor count using model's cutoff
+    {
+      NeighborListBuilder nl_builder(
+          NeighborListOptions{pet_model.cutoff(), true, false});
+      auto nlist = nl_builder.build(system);
+      log::info("Neighbor pairs: {} (avg {:.1f} per atom)", nlist.num_pairs(),
+                static_cast<double>(nlist.num_pairs()) / system.num_atoms());
     }
 
     static constexpr std::array backend_names = {"auto", "cpu", "cuda", "hip",

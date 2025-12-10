@@ -67,9 +67,12 @@ struct CellGrid {
 
   std::array<int, 3> position_to_bin(const Vec3 &pos) const {
     double frac[3];
+    // Compute fractional coordinates: frac = pos @ inv_cell (i.e., inv_cell.T @ pos)
+    // For the standard convention where rows of the cell matrix are lattice vectors,
+    // fractional coords are frac[i] = sum_j pos[j] * inv_cell[j,i]
     for (int i = 0; i < 3; ++i) {
-      frac[i] = inv_cell[i * 3 + 0] * pos.x + inv_cell[i * 3 + 1] * pos.y +
-                inv_cell[i * 3 + 2] * pos.z;
+      frac[i] = inv_cell[0 * 3 + i] * pos.x + inv_cell[1 * 3 + i] * pos.y +
+                inv_cell[2 * 3 + i] * pos.z;
     }
     return {static_cast<int>(std::floor(frac[0] * n_bins[0])),
             static_cast<int>(std::floor(frac[1] * n_bins[1])),
