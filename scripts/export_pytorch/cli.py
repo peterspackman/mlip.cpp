@@ -47,14 +47,37 @@ def load_pet_mad(version: str = "latest") -> tuple[torch.nn.Module, dict]:
     return inner_model, {}
 
 
-def create_example_inputs(model, n_atoms: int = 10) -> dict[str, torch.Tensor]:
+def create_example_inputs(model, n_atoms: int = 10, max_neighbors: int = 20) -> dict[str, torch.Tensor]:
     """Create example inputs for model tracing."""
-    # Standard inputs for atomistic models
+    # Standard inputs for atomistic models with neighbor list
+    n_edges = n_atoms * max_neighbors
+
     return {
-        "positions": torch.randn(n_atoms, 3),
-        "species": torch.randint(0, 85, (n_atoms,)),
-        "cell": torch.eye(3) * 10.0,
-        "pbc": torch.tensor([True, True, True]),
+        "positions": torch.randn(n_atoms, 3, dtype=torch.float32),
+        "species": torch.randint(0, 85, (n_atoms,), dtype=torch.long),
+        # Neighbor list format: [center_atom, neighbor_atom] pairs
+        "neighbor_i": torch.randint(0, n_atoms, (n_edges,), dtype=torch.long),
+        "neighbor_j": torch.randint(0, n_atoms, (n_edges,), dtype=torch.long),
+        # Edge vectors and distances (computed from positions in practice)
+        "edge_vectors": torch.randn(n_edges, 3, dtype=torch.float32),
+        "edge_distances": torch.abs(torch.randn(n_edges, dtype=torch.float32)) + 0.5,
+    }
+
+
+def create_pet_gnn_inputs(n_atoms: int = 10, max_neighbors: int = 20, d_pet: int = 256) -> dict[str, torch.Tensor]:
+    """Create inputs for PET GNN layers (bypassing metatensor wrapper)."""
+    n_edges = n_atoms * max_neighbors
+    seq_len = max_neighbors + 1  # neighbors + self
+
+    return {
+        # Initial node embeddings [d_pet, n_atoms] in GGML order
+        "node_features": torch.randn(n_atoms, d_pet, dtype=torch.float32),
+        # Edge features after embedding [d_pet, n_edges]
+        "edge_features": torch.randn(n_edges, d_pet, dtype=torch.float32),
+        # Species indices for each atom
+        "species": torch.randint(0, 85, (n_atoms,), dtype=torch.long),
+        # Attention mask [seq_len, seq_len, n_atoms]
+        "attention_mask": torch.zeros(n_atoms, seq_len, seq_len, dtype=torch.float32),
     }
 
 

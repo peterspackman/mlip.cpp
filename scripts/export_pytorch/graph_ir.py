@@ -20,6 +20,7 @@ class GGMLDtype(Enum):
     I32 = "i32"
     I16 = "i16"
     I8 = "i8"
+    BOOL = "bool"  # Represented as I8 in GGML
 
     @classmethod
     def from_torch_dtype(cls, dtype) -> "GGMLDtype":
@@ -28,11 +29,14 @@ class GGMLDtype(Enum):
         mapping = {
             torch.float32: cls.F32,
             torch.float16: cls.F16,
+            torch.bfloat16: cls.F16,  # Approximate as F16
             torch.int32: cls.I32,
             torch.int16: cls.I16,
             torch.int8: cls.I8,
             torch.int64: cls.I32,  # Downcast
             torch.long: cls.I32,   # Downcast
+            torch.bool: cls.BOOL,
+            torch.uint8: cls.I8,
         }
         if dtype not in mapping:
             raise ValueError(f"Unsupported dtype: {dtype}")
