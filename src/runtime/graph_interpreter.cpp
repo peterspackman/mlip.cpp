@@ -343,6 +343,12 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_index_put(ctx, node);
   } else if (node.op == "WHERE") {
     return build_where(ctx, node);
+  } else if (node.op == "COS") {
+    return build_cos(ctx, node);
+  } else if (node.op == "SIN") {
+    return build_sin(ctx, node);
+  } else if (node.op == "POW") {
+    return build_pow(ctx, node);
   } else {
     throw std::runtime_error("Unknown operation: " + node.op);
   }
@@ -357,19 +363,45 @@ ggml_tensor *GraphInterpreter::build_add(ggml_context *ctx,
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   if (node.inputs.size() == 1) {
+    // Check for scalar addition (tensor + scalar)
+    if (has_param(node, "scalar")) {
+      float scalar = static_cast<float>(get_param<double>(node, "scalar", 0.0));
+      ggml_tensor *s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+      ggml_set_input(s);
+      pending_constants_.push_back({s, scalar});
+      return ggml_add(ctx, a, s);
+    }
     // Single input ADD is identity (e.g., from torch.zeros() + x optimization)
     return a;
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+
+  // ggml_add requires ggml_can_repeat(b, a) - b must broadcast to a's shape.
+  // If a is smaller than b, swap operands (addition is commutative).
+  if (ggml_nelements(a) < ggml_nelements(b)) {
+    std::swap(a, b);
+  }
   return ggml_add(ctx, a, b);
 }
 
 ggml_tensor *GraphInterpreter::build_sub(ggml_context *ctx,
                                          const GIRNode &node) {
-  if (node.inputs.size() < 2) {
-    throw std::runtime_error("SUB requires 2 inputs");
+  if (node.inputs.empty()) {
+    throw std::runtime_error("SUB requires at least 1 input");
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+
+  if (node.inputs.size() == 1) {
+    // Scalar subtraction (tensor - scalar)
+    if (has_param(node, "scalar")) {
+      float scalar = static_cast<float>(get_param<double>(node, "scalar", 0.0));
+      ggml_tensor *s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+      ggml_set_input(s);
+      pending_constants_.push_back({s, scalar});
+      return ggml_sub(ctx, a, s);
+    }
+    throw std::runtime_error("SUB requires 2 inputs (or 1 input with scalar param)");
+  }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
   return ggml_sub(ctx, a, b);
 }
@@ -393,15 +425,33 @@ ggml_tensor *GraphInterpreter::build_mul(ggml_context *ctx,
     throw std::runtime_error("MUL requires 2 inputs (or 1 input with scalar param)");
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+
+  // ggml_mul requires ggml_can_repeat(b, a) - b must broadcast to a's shape.
+  // If a is smaller than b, swap operands (multiplication is commutative).
+  if (ggml_nelements(a) < ggml_nelements(b)) {
+    std::swap(a, b);
+  }
   return ggml_mul(ctx, a, b);
 }
 
 ggml_tensor *GraphInterpreter::build_div(ggml_context *ctx,
                                          const GIRNode &node) {
-  if (node.inputs.size() < 2) {
-    throw std::runtime_error("DIV requires 2 inputs");
+  if (node.inputs.empty()) {
+    throw std::runtime_error("DIV requires at least 1 input");
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+
+  if (node.inputs.size() == 1) {
+    // Scalar division (tensor / scalar) -> scale by 1/scalar
+    if (has_param(node, "scalar")) {
+      float scalar = static_cast<float>(get_param<double>(node, "scalar", 1.0));
+      if (scalar == 0.0f) {
+        throw std::runtime_error("DIV: division by zero scalar");
+      }
+      return ggml_scale(ctx, a, 1.0f / scalar);
+    }
+    throw std::runtime_error("DIV requires 2 inputs (or 1 input with scalar param)");
+  }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
   return ggml_div(ctx, a, b);
 }
@@ -415,6 +465,31 @@ ggml_tensor *GraphInterpreter::build_mul_mat(ggml_context *ctx,
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+
+  // ggml_mul_mat(a, b) requires ne00 == ne10 (inner dim must match).
+  // For PyTorch matmul(A, B) with A=[...,m,k] B=[...,k,n]:
+  //   A_ggml=[k,m,...], B_ggml=[n,k,...]
+  // Fix: ggml_mul_mat(transpose(B), A) → result=[n,m,...] → PyTorch [...,m,n]
+  if (a->ne[0] == b->ne[0]) {
+    // Inner dimensions already match (e.g., from LINEAR ops)
+    return ggml_mul_mat(ctx, a, b);
+  }
+
+  // Try swapping and transposing b to match inner dimensions
+  if (a->ne[0] == b->ne[1]) {
+    // B's ne[1] matches A's ne[0]: transpose B and swap order
+    // ggml_mul_mat requires non-transposed first arg, so use ggml_cont
+    ggml_tensor *bt = ggml_cont(ctx, ggml_transpose(ctx, b));
+    return ggml_mul_mat(ctx, bt, a);
+  }
+
+  // Try the other way: transpose a
+  if (a->ne[1] == b->ne[0]) {
+    ggml_tensor *at = ggml_cont(ctx, ggml_transpose(ctx, a));
+    return ggml_mul_mat(ctx, b, at);
+  }
+
+  // Fallback: try original order (will fail with assertion if shapes don't match)
   return ggml_mul_mat(ctx, a, b);
 }
 
@@ -694,6 +769,12 @@ ggml_tensor *GraphInterpreter::build_transpose(ggml_context *ctx,
   int64_t py_dim1 = dims[1];
   int n_dims = ggml_n_dims(a);
 
+  // Normalize negative dimensions (PyTorch convention: -1 = last dim)
+  if (py_dim0 < 0)
+    py_dim0 += n_dims;
+  if (py_dim1 < 0)
+    py_dim1 += n_dims;
+
   // Convert PyTorch dims to GGML dims (reversed order)
   // PyTorch dim i -> GGML dim (n_dims - 1 - i)
   int ggml_dim0 = n_dims - 1 - static_cast<int>(py_dim0);
@@ -753,6 +834,45 @@ ggml_tensor *GraphInterpreter::build_log(ggml_context *ctx,
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   return ggml_log(ctx, a);
+}
+
+ggml_tensor *GraphInterpreter::build_cos(ggml_context *ctx,
+                                         const GIRNode &node) {
+  if (node.inputs.empty()) {
+    throw std::runtime_error("COS requires at least 1 input");
+  }
+  ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+  return ggml_cos(ctx, a);
+}
+
+ggml_tensor *GraphInterpreter::build_sin(ggml_context *ctx,
+                                         const GIRNode &node) {
+  if (node.inputs.empty()) {
+    throw std::runtime_error("SIN requires at least 1 input");
+  }
+  ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+  return ggml_sin(ctx, a);
+}
+
+ggml_tensor *GraphInterpreter::build_pow(ggml_context *ctx,
+                                         const GIRNode &node) {
+  if (node.inputs.empty()) {
+    throw std::runtime_error("POW requires at least 1 input");
+  }
+  ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+  double exponent = get_param<double>(node, "exponent", 2.0);
+
+  // Optimize common cases
+  if (exponent == 2.0) {
+    return ggml_sqr(ctx, a);
+  } else if (exponent == 0.5) {
+    return ggml_sqrt(ctx, a);
+  }
+
+  // General case: x^n = exp(n * log(x))
+  ggml_tensor *log_a = ggml_log(ctx, a);
+  ggml_tensor *scaled = ggml_scale(ctx, log_a, static_cast<float>(exponent));
+  return ggml_unary(ctx, scaled, GGML_UNARY_OP_EXP);
 }
 
 // ===================== Reduction Operations =====================
@@ -996,10 +1116,40 @@ ggml_tensor *GraphInterpreter::build_layer_norm(ggml_context *ctx,
 
   float eps = static_cast<float>(get_param<double>(node, "eps", 1e-5));
 
-  // Use GGML's norm operation (normalizes over the last dimension)
-  ggml_tensor *normalized = ggml_norm(ctx, input, eps);
+  // Decomposed layer normalization for backward pass support.
+  // ggml_norm doesn't have a backward pass, so we decompose into primitives:
+  //   LayerNorm(x) = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias
+  // All primitives used (SUM_ROWS, SCALE, SUB, SQR, SQRT, DIV, MUL, ADD,
+  // REPEAT) have backward pass support in GGML.
 
-  // Apply affine transformation: output = normalized * weight + bias
+  const int64_t d = input->ne[0]; // Feature dimension
+  const float inv_d = 1.0f / static_cast<float>(d);
+
+  // Step 1: mean = sum_rows(x) / d
+  ggml_tensor *sum_x = ggml_sum_rows(ctx, input);
+  ggml_tensor *mean = ggml_scale(ctx, sum_x, inv_d);
+
+  // Step 2: x_centered = x - mean (broadcast mean to input shape)
+  ggml_tensor *mean_broadcast = ggml_repeat(ctx, mean, input);
+  ggml_tensor *x_centered = ggml_sub(ctx, input, mean_broadcast);
+
+  // Step 3: var = sum_rows(x_centered^2) / d
+  ggml_tensor *x_centered_sq = ggml_sqr(ctx, x_centered);
+  ggml_tensor *sum_sq = ggml_sum_rows(ctx, x_centered_sq);
+  ggml_tensor *var = ggml_scale(ctx, sum_sq, inv_d);
+
+  // Step 4: std = sqrt(var + eps)
+  ggml_tensor *eps_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+  ggml_set_input(eps_tensor);
+  pending_constants_.push_back({eps_tensor, eps});
+  ggml_tensor *var_stabilized = ggml_add(ctx, var, eps_tensor);
+  ggml_tensor *std_val = ggml_sqrt(ctx, var_stabilized);
+
+  // Step 5: normalized = x_centered / std (broadcast std to input shape)
+  ggml_tensor *std_broadcast = ggml_repeat(ctx, std_val, input);
+  ggml_tensor *normalized = ggml_div(ctx, x_centered, std_broadcast);
+
+  // Step 6: Apply affine transform: normalized * weight + bias
   ggml_tensor *scaled = ggml_mul(ctx, normalized, weight);
   return ggml_add(ctx, scaled, bias);
 }

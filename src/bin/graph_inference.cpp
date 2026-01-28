@@ -2,11 +2,14 @@
  * Graph-based inference on XYZ files using auto-exported PET models.
  *
  * Usage:
- *   graph_inference <model> <xyz_file>
+ *   graph_inference <model> <xyz_file> [--forces] [--debug]
  *
  * Where <model> is either:
  *   - A .gguf file (single file with graph + weights + metadata)
  *   - A directory containing pet_full.json, metadata.json, and *.bin weight files
+ *
+ * When --forces is specified, computes forces via backward pass (F = -dE/dr).
+ * Requires the model to be exported with --forces mode.
  */
 
 #include "core/gguf_loader.h"
@@ -53,6 +56,7 @@ template <typename T> std::vector<T> load_binary(const std::string &path) {
 struct ModelData {
   float cutoff = 4.5f;
   float cutoff_width = 0.2f;
+  bool forces_mode = false; // true if model was exported with --forces
   std::map<int, int> species_to_index;
   std::map<int, float> composition_energies;
 };
@@ -72,6 +76,7 @@ void load_from_directory(const std::string &dir_path, GraphInterpreter &interp,
 
   model.cutoff = metadata.value("cutoff", 4.5f);
   model.cutoff_width = metadata.value("cutoff_width", 0.2f);
+  model.forces_mode = metadata.value("forces", false);
 
   if (metadata.contains("species_to_index")) {
     for (auto &[key, val] : metadata["species_to_index"].items()) {
@@ -162,6 +167,9 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
   model.cutoff = loader.get_float32("pet.cutoff", 4.5f);
   model.cutoff_width = loader.get_float32("pet.cutoff_width", 0.2f);
 
+  // Check for forces mode (stored as int32 since GGUF doesn't have bool)
+  model.forces_mode = (loader.get_int32("pet.forces_mode", 0) != 0);
+
   // Species mapping: [Z1, idx1, Z2, idx2, ...]
   auto species_map = loader.get_array_int32("pet.species_map");
   for (size_t i = 0; i + 1 < species_map.size(); i += 2) {
@@ -199,8 +207,6 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
       continue;
 
     // Use weight_shapes metadata to get correct PyTorch shape, then reverse for GGML.
-    // Our Python writer stores shapes in PyTorch order, but the graph interpreter
-    // expects GGML order (reversed).
     ggml_tensor *t = nullptr;
     if (weight_shapes.contains(name)) {
       auto py_shape = weight_shapes[name].get<std::vector<int64_t>>();
@@ -252,27 +258,44 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
 }
 
 void print_usage(const char *prog) {
-  std::cerr << "Usage: " << prog << " <model> <xyz_file> [--debug]\n\n";
+  std::cerr << "Usage: " << prog
+            << " <model> <xyz_file> [--forces] [--debug]\n\n";
   std::cerr << "Arguments:\n";
   std::cerr << "  model     .gguf file or export directory\n";
   std::cerr << "  xyz_file  Input structure in XYZ format\n";
-  std::cerr << "  --debug   Dump inputs and print intermediate tensor values\n\n";
-  std::cerr << "Example:\n";
+  std::cerr << "  --forces  Compute forces via backward pass (F = -dE/dr)\n";
+  std::cerr << "  --debug   Dump inputs and print intermediate tensor values\n";
+  std::cerr << "\nExample:\n";
   std::cerr << "  " << prog << " pet-auto.gguf geometries/water.xyz\n";
-  std::cerr << "  " << prog << " /tmp/pet_export geometries/water.xyz\n";
+  std::cerr << "  " << prog
+            << " /tmp/pet_forces_export geometries/water.xyz --forces\n";
 }
 
 } // namespace
 
 int main(int argc, char *argv[]) {
-  if (argc < 3 || argc > 4) {
+  if (argc < 3) {
     print_usage(argv[0]);
     return 1;
   }
 
   const std::string model_path = argv[1];
   const std::string xyz_path = argv[2];
-  bool debug = (argc == 4 && std::string(argv[3]) == "--debug");
+  bool debug = false;
+  bool compute_forces = false;
+
+  for (int i = 3; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--debug")
+      debug = true;
+    else if (arg == "--forces")
+      compute_forces = true;
+    else {
+      std::cerr << "Unknown option: " << arg << "\n";
+      print_usage(argv[0]);
+      return 1;
+    }
+  }
 
   try {
     // Create backend
@@ -306,8 +329,19 @@ int main(int argc, char *argv[]) {
       load_from_directory(model_path, interp, model, weight_ctx, cpu_backend);
     }
 
+    // Validate force computation request
+    if (compute_forces && !model.forces_mode) {
+      std::cerr << "Error: --forces requested but model was not exported with "
+                   "--forces mode.\n"
+                << "  Re-export with: uv run scripts/export_pytorch/"
+                   "export_pet_full.py --model <name> --forces\n";
+      return 1;
+    }
+
     std::cout << "  Cutoff: " << model.cutoff << " A\n";
     std::cout << "  Species mapped: " << model.species_to_index.size() << "\n";
+    std::cout << "  Forces mode: " << (model.forces_mode ? "yes" : "no")
+              << "\n";
     std::cout << "  Graph: " << interp.graph().nodes.size() << " nodes\n";
 
     // Read XYZ file
@@ -356,10 +390,6 @@ int main(int argc, char *argv[]) {
         ggml_new_tensor_3d(input_ctx, GGML_TYPE_F32, 3, max_neighbors, n_atoms);
     ggml_set_name(edge_vectors, "edge_vectors");
 
-    ggml_tensor *edge_distances =
-        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-    ggml_set_name(edge_distances, "edge_distances");
-
     ggml_tensor *padding_mask =
         ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
     ggml_set_name(padding_mask, "padding_mask");
@@ -368,9 +398,23 @@ int main(int argc, char *argv[]) {
         ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms * max_neighbors);
     ggml_set_name(reverse_neighbor_index, "reverse_neighbor_index");
 
-    ggml_tensor *cutoff_factors =
-        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-    ggml_set_name(cutoff_factors, "cutoff_factors");
+    // These inputs are only used in non-forces mode
+    ggml_tensor *edge_distances = nullptr;
+    ggml_tensor *cutoff_factors = nullptr;
+    if (!model.forces_mode) {
+      edge_distances =
+          ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+      ggml_set_name(edge_distances, "edge_distances");
+
+      cutoff_factors =
+          ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+      ggml_set_name(cutoff_factors, "cutoff_factors");
+    }
+
+    // Mark edge_vectors as parameter for gradient computation
+    if (compute_forces) {
+      ggml_set_param(edge_vectors);
+    }
 
     ggml_backend_buffer_t input_buffer =
         ggml_backend_alloc_ctx_tensors(input_ctx, cpu_backend);
@@ -392,9 +436,10 @@ int main(int argc, char *argv[]) {
     std::vector<float> cf_data(n_atoms * max_neighbors, 0.0f);
     std::vector<int32_t> rni_data(n_atoms * max_neighbors, 0);
 
+    // Track neighbor atom index for each slot (needed for force scatter)
+    std::vector<int> neighbor_atoms(n_atoms * max_neighbors, -1);
+
     // Key: (center, neighbor, shift_a, shift_b, shift_c)
-    // For periodic systems, the same (i,j) pair can have multiple edges
-    // through different cell shifts, so we need the full key.
     using EdgeKey = std::tuple<int, int, int, int, int>;
     std::map<EdgeKey, int> edge_to_flat_idx;
     std::vector<int> slot_indices(n_atoms, 0);
@@ -430,6 +475,9 @@ int main(int argc, char *argv[]) {
       ed_data[flat_idx] = nlist.distances[e];
       pm_data[flat_idx] = 1.0f;
 
+      // Store neighbor atom index for force scatter
+      neighbor_atoms[flat_idx] = j;
+
       // PET cosine cutoff with width parameter
       float r = nlist.distances[e];
       float width = model.cutoff_width;
@@ -444,8 +492,6 @@ int main(int argc, char *argv[]) {
     }
 
     // Build reverse neighbor index
-    // For edge i→j with cell shift (sa, sb, sc), the reverse is
-    // j→i with cell shift (-sa, -sb, -sc).
     for (int e = 0; e < nlist.num_pairs(); e++) {
       int i = nlist.centers[e];
       int j = nlist.neighbors[e];
@@ -471,22 +517,27 @@ int main(int argc, char *argv[]) {
                             ns_data.size() * sizeof(int32_t));
     ggml_backend_tensor_set(edge_vectors, ev_data.data(), 0,
                             ev_data.size() * sizeof(float));
-    ggml_backend_tensor_set(edge_distances, ed_data.data(), 0,
-                            ed_data.size() * sizeof(float));
     ggml_backend_tensor_set(padding_mask, pm_data.data(), 0,
                             pm_data.size() * sizeof(float));
     ggml_backend_tensor_set(reverse_neighbor_index, rni_data.data(), 0,
                             rni_data.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(cutoff_factors, cf_data.data(), 0,
-                            cf_data.size() * sizeof(float));
 
+    // Set inputs common to both modes
     interp.set_input("species", species);
     interp.set_input("neighbor_species", neighbor_species);
     interp.set_input("edge_vectors", edge_vectors);
-    interp.set_input("edge_distances", edge_distances);
     interp.set_input("padding_mask", padding_mask);
     interp.set_input("reverse_neighbor_index", reverse_neighbor_index);
-    interp.set_input("cutoff_factors", cutoff_factors);
+
+    if (!model.forces_mode) {
+      // Non-forces mode: provide edge_distances and cutoff_factors as inputs
+      ggml_backend_tensor_set(edge_distances, ed_data.data(), 0,
+                              ed_data.size() * sizeof(float));
+      ggml_backend_tensor_set(cutoff_factors, cf_data.data(), 0,
+                              cf_data.size() * sizeof(float));
+      interp.set_input("edge_distances", edge_distances);
+      interp.set_input("cutoff_factors", cutoff_factors);
+    }
 
     if (debug) {
       namespace fs = std::filesystem;
@@ -519,7 +570,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Build and compute
-    constexpr size_t COMPUTE_CTX_SIZE = 256 * 1024 * 1024;
+    // Use larger context for backward pass (gradient computation creates many
+    // additional tensors)
+    constexpr size_t COMPUTE_CTX_SIZE =
+        512 * 1024 * 1024; // 512MB for backward support
     ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
 
     ggml_tensor *output = interp.build(compute_ctx);
@@ -529,14 +583,67 @@ int main(int argc, char *argv[]) {
     }
     ggml_set_output(output);
 
-    ggml_cgraph *cgraph = ggml_new_graph(compute_ctx);
-    ggml_build_forward_expand(cgraph, output);
+    ggml_cgraph *cgraph = nullptr;
+    ggml_tensor *total_energy_tensor = nullptr;
+
+    if (compute_forces) {
+      // Forces mode: build forward + backward graph
+      // Sum atomic energies to scalar loss for backward pass
+      total_energy_tensor = ggml_sum(compute_ctx, output);
+      ggml_set_loss(total_energy_tensor);
+      ggml_set_output(total_energy_tensor);
+
+      // Create graph with backward support (grads=true)
+      cgraph = ggml_new_graph_custom(compute_ctx, 32768, true);
+      ggml_build_forward_expand(cgraph, output);
+      ggml_build_forward_expand(cgraph, total_energy_tensor);
+
+      // Build backward graph (computes gradients for all param tensors)
+      ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
+
+      // Mark gradient tensor as output so allocator computes it
+      ggml_tensor *grad_tensor = ggml_graph_get_grad(cgraph, edge_vectors);
+      if (grad_tensor) {
+        ggml_set_output(grad_tensor);
+      } else {
+        std::cerr << "Warning: Could not get gradient tensor for edge_vectors. "
+                     "Forces will not be computed.\n";
+        compute_forces = false;
+      }
+
+      std::cout << "Graph nodes (forward+backward): "
+                << ggml_graph_n_nodes(cgraph) << "\n";
+
+      // Debug: print info about gradient tensor
+      ggml_tensor *dbg_grad = ggml_graph_get_grad(cgraph, edge_vectors);
+      std::cout << "  Gradient tensor: "
+                << (dbg_grad ? "found" : "NOT FOUND") << "\n";
+      if (dbg_grad) {
+        std::cout << "  Gradient shape: [" << dbg_grad->ne[0] << ", "
+                  << dbg_grad->ne[1] << ", " << dbg_grad->ne[2] << ", "
+                  << dbg_grad->ne[3] << "]\n";
+        std::cout << "  Gradient flags: " << dbg_grad->flags
+                  << " (output=" << (dbg_grad->flags & 4) << ")\n";
+      }
+      std::cout << "  edge_vectors flags: " << edge_vectors->flags
+                << " (param=" << (edge_vectors->flags & 2) << ")\n";
+    } else {
+      // Forward-only mode
+      cgraph = ggml_new_graph(compute_ctx);
+      ggml_build_forward_expand(cgraph, output);
+    }
 
     ggml_backend_buffer_t compute_buffer =
         ggml_backend_alloc_ctx_tensors(compute_ctx, cpu_backend);
     interp.init_constants();
 
-    std::cout << "\nComputing energy...\n";
+    // Initialize gradient accumulators: loss gradient = 1.0, all others = 0.0
+    if (compute_forces) {
+      ggml_graph_reset(cgraph);
+    }
+
+    std::cout << "\nComputing "
+              << (compute_forces ? "energy + forces" : "energy") << "...\n";
     ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
     if (status != GGML_STATUS_SUCCESS) {
       std::cerr << "Error: Graph computation failed\n";
@@ -545,15 +652,16 @@ int main(int argc, char *argv[]) {
 
     if (debug) {
       auto tensor_sum = [](ggml_tensor *t) -> float {
-        if (!t || !t->data) return 0.0f;
+        if (!t || !t->data)
+          return 0.0f;
         float sum = 0.0f;
         for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
           for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
               for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
-                float *ptr = (float *)((char *)t->data +
-                    i0 * t->nb[0] + i1 * t->nb[1] +
-                    i2 * t->nb[2] + i3 * t->nb[3]);
+                float *ptr =
+                    (float *)((char *)t->data + i0 * t->nb[0] +
+                              i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3]);
                 sum += *ptr;
               }
             }
@@ -562,18 +670,25 @@ int main(int argc, char *argv[]) {
         return sum;
       };
 
-      auto tensor_min_max = [](ggml_tensor *t, float &min_val, float &max_val) {
-        if (!t || !t->data) { min_val = max_val = 0.0f; return; }
-        min_val = 1e30f; max_val = -1e30f;
+      auto tensor_min_max = [](ggml_tensor *t, float &min_val,
+                               float &max_val) {
+        if (!t || !t->data) {
+          min_val = max_val = 0.0f;
+          return;
+        }
+        min_val = 1e30f;
+        max_val = -1e30f;
         for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
           for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
               for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
-                float *ptr = (float *)((char *)t->data +
-                    i0 * t->nb[0] + i1 * t->nb[1] +
-                    i2 * t->nb[2] + i3 * t->nb[3]);
-                if (*ptr < min_val) min_val = *ptr;
-                if (*ptr > max_val) max_val = *ptr;
+                float *ptr = (float *)((char *)t->data + i0 * t->nb[0] +
+                                       i1 * t->nb[1] + i2 * t->nb[2] +
+                                       i3 * t->nb[3]);
+                if (*ptr < min_val)
+                  min_val = *ptr;
+                if (*ptr > max_val)
+                  max_val = *ptr;
               }
             }
           }
@@ -583,10 +698,8 @@ int main(int argc, char *argv[]) {
       std::cout << "\n=== Debug: Intermediate tensor sums ===\n";
       const auto &graph_ir = interp.graph();
       for (const auto &node : graph_ir.nodes) {
-        // Find tensor by name using GGML graph API
         ggml_tensor *t = ggml_graph_get_tensor(cgraph, node.name.c_str());
         if (!t) {
-          // Also search by iterating over graph nodes
           for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
             ggml_tensor *gn = ggml_graph_node(cgraph, i);
             if (gn->name[0] != '\0' &&
@@ -602,20 +715,17 @@ int main(int argc, char *argv[]) {
           tensor_min_max(t, min_val, max_val);
           std::cout << std::fixed << std::setprecision(6);
           std::cout << "  [" << std::setw(3) << node.id << "] "
-                    << std::setw(20) << std::left << node.op
-                    << std::setw(40) << std::left << node.name
-                    << " sum=" << sum
-                    << " min=" << min_val
-                    << " max=" << max_val
-                    << " shape=[" << t->ne[0] << "," << t->ne[1]
-                    << "," << t->ne[2] << "," << t->ne[3] << "]"
-                    << std::endl;
+                    << std::setw(20) << std::left << node.op << std::setw(40)
+                    << std::left << node.name << " sum=" << sum
+                    << " min=" << min_val << " max=" << max_val << " shape=["
+                    << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << ","
+                    << t->ne[3] << "]" << std::endl;
         }
       }
       std::cout << "=== End debug ===\n\n";
     }
 
-    // Get results
+    // Get energy results
     std::vector<float> atomic_energies(n_atoms);
     ggml_backend_tensor_get(output, atomic_energies.data(), 0,
                             n_atoms * sizeof(float));
@@ -633,7 +743,7 @@ int main(int argc, char *argv[]) {
 
     float total_energy = model_energy + composition_energy;
 
-    // Print results
+    // Print energy results
     std::cout << "\n=== Results ===\n";
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Atomic energies:\n";
@@ -645,6 +755,99 @@ int main(int argc, char *argv[]) {
       std::cout << "Composition energy: " << composition_energy << " eV\n";
     }
     std::cout << "Total energy:       " << total_energy << " eV\n";
+
+    // Extract and print forces
+    if (compute_forces) {
+      ggml_tensor *grad_tensor = ggml_graph_get_grad(cgraph, edge_vectors);
+
+      if (grad_tensor && grad_tensor->data) {
+        // Read gradient tensor: shape [3, max_neighbors, n_atoms] in GGML
+        std::vector<float> grad_data(ggml_nelements(grad_tensor));
+        ggml_backend_tensor_get(grad_tensor, grad_data.data(), 0,
+                                ggml_nbytes(grad_tensor));
+
+        // Print gradient statistics (skip NaN from padding positions)
+        float grad_min = 1e30f, grad_max = -1e30f, grad_sum = 0.0f;
+        int nonzero = 0;
+        for (size_t i = 0; i < grad_data.size(); i++) {
+          if (std::isnan(grad_data[i])) continue;
+          if (grad_data[i] < grad_min) grad_min = grad_data[i];
+          if (grad_data[i] > grad_max) grad_max = grad_data[i];
+          grad_sum += grad_data[i];
+          if (grad_data[i] != 0.0f) nonzero++;
+        }
+        std::cout << "\n  Gradient stats: min=" << grad_min
+                  << " max=" << grad_max << " sum=" << grad_sum
+                  << " nonzero=" << nonzero << "/" << grad_data.size() << "\n";
+
+        // Initialize per-atom forces
+        std::vector<float> forces(n_atoms * 3, 0.0f);
+
+        // Scatter edge gradients to position gradients
+        // Chain rule: edge_vec = pos[neighbor] - pos[center]
+        // Therefore: F[center] += grad, F[neighbor] -= grad
+        const int stride_slot = 3;
+        const int stride_atom = 3 * max_neighbors;
+
+        for (int center_atom = 0; center_atom < n_atoms; center_atom++) {
+          for (int slot = 0; slot < max_neighbors; slot++) {
+            int flat_idx = center_atom * max_neighbors + slot;
+
+            // Skip padding entries
+            if (pm_data[flat_idx] < 0.5f)
+              continue;
+
+            int neighbor_atom = neighbor_atoms[flat_idx];
+            if (neighbor_atom < 0)
+              continue;
+
+            // Get gradient for this edge
+            int base_idx = slot * stride_slot + center_atom * stride_atom;
+            float gx = grad_data[0 + base_idx];
+            float gy = grad_data[1 + base_idx];
+            float gz = grad_data[2 + base_idx];
+
+            // Force = -gradient of energy
+            // edge_vec = pos[neighbor] - pos[center]
+            // d(energy)/d(pos[center]) contributes +grad to force[center]
+            // d(energy)/d(pos[neighbor]) contributes -grad to force[neighbor]
+            forces[center_atom * 3 + 0] += gx;
+            forces[center_atom * 3 + 1] += gy;
+            forces[center_atom * 3 + 2] += gz;
+
+            forces[neighbor_atom * 3 + 0] -= gx;
+            forces[neighbor_atom * 3 + 1] -= gy;
+            forces[neighbor_atom * 3 + 2] -= gz;
+          }
+        }
+
+        // Print forces
+        std::cout << "\nForces (eV/A):\n";
+        float force_sum[3] = {0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < n_atoms; i++) {
+          std::cout << "  Atom " << i << ": [" << std::setw(12)
+                    << forces[i * 3 + 0] << ", " << std::setw(12)
+                    << forces[i * 3 + 1] << ", " << std::setw(12)
+                    << forces[i * 3 + 2] << "]\n";
+          force_sum[0] += forces[i * 3 + 0];
+          force_sum[1] += forces[i * 3 + 1];
+          force_sum[2] += forces[i * 3 + 2];
+        }
+        float sum_mag = std::sqrt(force_sum[0] * force_sum[0] +
+                                  force_sum[1] * force_sum[1] +
+                                  force_sum[2] * force_sum[2]);
+        std::cout << "\n  Force sum:  [" << std::setw(12) << force_sum[0]
+                  << ", " << std::setw(12) << force_sum[1] << ", "
+                  << std::setw(12) << force_sum[2] << "]"
+                  << "  |F_sum| = " << sum_mag << "\n";
+        if (sum_mag > 0.1f) {
+          std::cout << "  Warning: |F_sum| > 0.1, Newton's third law "
+                       "violation may indicate an issue.\n";
+        }
+      } else {
+        std::cerr << "Warning: Gradient tensor not available after compute.\n";
+      }
+    }
 
     // Cleanup
     ggml_backend_buffer_free(compute_buffer);

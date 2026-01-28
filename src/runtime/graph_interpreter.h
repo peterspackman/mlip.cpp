@@ -114,6 +114,8 @@ private:
   ggml_tensor *build_sqr(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_sqrt(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_log(ggml_context *ctx, const GIRNode &node);
+  ggml_tensor *build_cos(ggml_context *ctx, const GIRNode &node);
+  ggml_tensor *build_sin(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_sum_rows(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_repeat(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_clamp(ggml_context *ctx, const GIRNode &node);
@@ -134,6 +136,7 @@ private:
   ggml_tensor *build_index(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_index_put(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_where(ggml_context *ctx, const GIRNode &node);
+  ggml_tensor *build_pow(ggml_context *ctx, const GIRNode &node);
 };
 
 } // namespace mlipcpp::runtime

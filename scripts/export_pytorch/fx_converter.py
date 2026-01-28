@@ -53,6 +53,8 @@ FX_TO_GGML = {
     "torch.relu": "UNARY_RELU",
     "torch.gelu": "UNARY_GELU",
     "torch.neg": "UNARY_NEG",
+    "torch.cos": "COS",
+    "torch.sin": "SIN",
     "torch.sum": "SUM_ROWS",
     "torch.mean": "MEAN",
 
@@ -136,6 +138,10 @@ ATEN_TO_GGML = {
     "aten.sum.dim_IntList": "SUM_ROWS",
     "aten.sum.default": "SUM_ROWS",
     "aten.sum": "SUM_ROWS",
+    "aten.cos.default": "COS",
+    "aten.cos": "COS",
+    "aten.sin.default": "SIN",
+    "aten.sin": "SIN",
     "aten.clamp.default": "CLAMP",
     "aten.clamp": "CLAMP",
 
@@ -1053,6 +1059,11 @@ def convert_exported_to_gir(
                     params["min"] = float(node.kwargs["min"])
                 if "max" in node.kwargs and node.kwargs["max"] is not None:
                     params["max"] = float(node.kwargs["max"])
+
+            elif ggml_op == "POW":
+                # POW: input ** exponent (scalar)
+                if len(node.args) >= 2 and isinstance(node.args[1], (int, float)):
+                    params["exponent"] = float(node.args[1])
 
             elif ggml_op in ("MUL", "ADD", "SUB", "DIV"):
                 # Binary ops: handle scalar second arg

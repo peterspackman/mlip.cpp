@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""Export complete PET-MAD model with neighbor list inputs to GIR format.
+"""Export PET models (pet-mad, upet) with neighbor list inputs to GIR format.
 
-This creates a traceable wrapper that uses the actual GNN layers:
-1. Input: species, neighbor_species, edge_features (neighbor list format)
-2. Embedding lookups for nodes and neighbors
-3. GNN layers with proper message passing
-4. Energy head MLP
-5. Output: atomic energies [n_atoms]
+Supports:
+- Legacy pet-mad-1.0.2 via pet_mad package
+- Any upet model (pet-mad-s, pet-omat-l, pet-spice-s, etc.) via metatrain
+
+Usage:
+  # Legacy pet-mad
+  uv run scripts/export_pytorch/export_pet_full.py --model pet-mad-1.0.2 -o /tmp/pet_export
+
+  # upet models
+  uv run scripts/export_pytorch/export_pet_full.py --model pet-mad-s -o /tmp/pet_mad_s_export
+
+  # With forces (manual attention, in-graph distance/cutoff)
+  uv run scripts/export_pytorch/export_pet_full.py --model pet-mad-s --forces -o /tmp/pet_forces
 """
 
 import json
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
+import warnings
 from pathlib import Path
 import sys
 
@@ -21,35 +30,158 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from export_pytorch.fx_converter import export_torch_model, symbolize_dimensions
 
 
-def get_pet_model():
-    """Get the PET model."""
-    from pet_mad._models import get_pet_mad
-    model = get_pet_mad(version="1.0.2")
-    return model.module.model
+# --- Model Loading ---
 
+def load_pet_model(model_name: str):
+    """Load a raw PET model by name.
+
+    Args:
+        model_name: One of:
+            - "pet-mad-1.0.2": Legacy pet-mad package
+            - "pet-xxx-{size}": upet model (e.g., "pet-mad-s", "pet-omat-l")
+
+    Returns:
+        The raw PET model (with gnn_layers, node_embedders, etc.)
+    """
+    if model_name == "pet-mad-1.0.2":
+        from pet_mad._models import get_pet_mad
+        atomistic = get_pet_mad(version="1.0.2")
+        return atomistic.module.model
+
+    # Parse upet model name: "pet-xxx-{size}" -> model="pet-xxx", size="{size}"
+    valid_sizes = {"xs", "s", "m", "l", "xl"}
+    parts = model_name.rsplit("-", 1)
+    if len(parts) != 2 or parts[1] not in valid_sizes:
+        raise ValueError(
+            f"Invalid model name '{model_name}'. Expected format: "
+            f"'pet-xxx-size' where size is one of {valid_sizes}, "
+            f"or 'pet-mad-1.0.2' for legacy."
+        )
+    model_base, size = parts[0], parts[1]
+
+    from huggingface_hub import hf_hub_download
+    from metatrain.utils.io import load_model as load_metatrain_model
+    from upet._models import upet_get_version_to_load
+
+    version = upet_get_version_to_load(model_base, size)
+    model_string = f"{model_base}-{size}-v{version}.ckpt"
+    print(f"Downloading {model_string} from HuggingFace...")
+    path = hf_hub_download(
+        repo_id="lab-cosmo/upet",
+        filename=model_string,
+        subfolder="models",
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        pet_model = load_metatrain_model(path)
+
+    return pet_model
+
+
+def get_model_params(pet_model):
+    """Extract model parameters from a PET model (handles both old and new formats).
+
+    Returns:
+        dict with keys: d_pet, cutoff, cutoff_width
+    """
+    # Metatrain PET caches these as direct attributes
+    if hasattr(pet_model, 'd_pet'):
+        return {
+            'd_pet': pet_model.d_pet,
+            'cutoff': getattr(pet_model, 'cutoff', 4.5),
+            'cutoff_width': getattr(pet_model, 'cutoff_width', 0.2),
+        }
+
+    # Legacy pet-mad format
+    hypers = pet_model.hypers
+    if isinstance(hypers, dict):
+        return {
+            'd_pet': hypers.get('d_pet', 256),
+            'cutoff': hypers.get('cutoff', 4.5),
+            'cutoff_width': hypers.get('cutoff_width', 0.2),
+        }
+
+    return {
+        'd_pet': getattr(hypers, 'D_PET', 256),
+        'cutoff': getattr(hypers, 'cutoff', 4.5),
+        'cutoff_width': getattr(hypers, 'cutoff_width', 0.2),
+    }
+
+
+def get_species_mapping(pet_model):
+    """Get species-to-index mapping from a PET model."""
+    # Metatrain PET stores atomic_types
+    if hasattr(pet_model, 'atomic_types'):
+        species_to_index = {}
+        for idx, Z in enumerate(pet_model.atomic_types):
+            species_to_index[int(Z)] = idx
+        return species_to_index
+
+    # Default: atomic numbers 1-85 map to indices 0-84
+    return {Z: Z - 1 for Z in range(1, 86)}
+
+
+def get_composition_energies(pet_model):
+    """Extract composition energies from a PET model (if available)."""
+    composition_energies = {}
+
+    # Legacy pet-mad format with additive_models
+    if hasattr(pet_model, 'additive_models') and len(pet_model.additive_models) > 0:
+        try:
+            comp_model = pet_model.additive_models[0]
+            if hasattr(comp_model, 'model'):
+                inner = comp_model.model
+                if hasattr(inner, 'weights') and 'energy' in inner.weights:
+                    energy_weights = inner.weights['energy']
+                    block = energy_weights.block(0)
+                    t2i = inner.type_to_index
+                    for Z in range(1, 86):
+                        idx = t2i[Z].item()
+                        if idx >= 0 and idx < block.values.shape[0]:
+                            composition_energies[Z] = float(block.values[idx, 0].item())
+        except Exception as e:
+            print(f"Warning: could not extract composition energies: {e}")
+
+    # Metatrain PET: composition energies are part of the training wrapper
+    # and may not be accessible from the raw model. The exported AtomisticModel
+    # includes them, but for our graph export we just skip them.
+    # Forces are unaffected by composition energies (they're constant per type).
+
+    return composition_energies
+
+
+# --- Model Wrapper ---
 
 class PETFullModel(torch.nn.Module):
     """Full PET energy computation using actual GNN layers.
 
-    Inputs:
-        species: [n_atoms] - atomic species indices
-        neighbor_species: [n_atoms, max_neighbors] - neighbor species indices
-        edge_vectors: [n_atoms, max_neighbors, 3] - edge vectors (dx, dy, dz)
-        edge_distances: [n_atoms, max_neighbors] - edge distances
-        padding_mask: [n_atoms, max_neighbors] - True for valid neighbors
-        reverse_neighbor_index: [n_atoms * max_neighbors] - index for reverse edges
+    When forces=False (default):
+        Inputs: species, neighbor_species, edge_vectors, edge_distances,
+                padding_mask, reverse_neighbor_index, cutoff_factors
+        Uses flash attention (fast, no backward).
+
+    When forces=True:
+        Inputs: species, neighbor_species, edge_vectors,
+                padding_mask, reverse_neighbor_index
+        Computes edge_distances and cutoff_factors in-graph (from edge_vectors).
+        Uses manual attention (supports backward pass for force computation).
 
     Output:
         atomic_energies: [n_atoms] - per-atom energy predictions
     """
 
-    def __init__(self, pet_model, n_atoms: int, max_neighbors: int, d_pet: int):
+    def __init__(self, pet_model, n_atoms: int, max_neighbors: int, d_pet: int,
+                 forces: bool = False, cutoff: float = 4.5, cutoff_width: float = 0.2):
         super().__init__()
 
         # Store dimensions for tracing
         self.n_atoms = n_atoms
         self.max_neighbors = max_neighbors
         self.d_pet = d_pet
+        self.forces = forces
+        self.cutoff = cutoff
+        self.cutoff_width = cutoff_width
 
         # Node embeddings - one per GNN layer
         self.node_embedders = pet_model.node_embedders
@@ -74,21 +206,44 @@ class PETFullModel(torch.nn.Module):
             for i in range(len(pet_model.gnn_layers))
         ])
 
-    def forward(self, species, neighbor_species, edge_vectors, edge_distances,
-                padding_mask, reverse_neighbor_index, cutoff_factors):
-        """
-        Args:
-            species: [n_atoms] - species indices (int64)
-            neighbor_species: [n_atoms, max_neighbors] - neighbor species (int64)
-            edge_vectors: [n_atoms, max_neighbors, 3] - edge vectors
-            edge_distances: [n_atoms, max_neighbors] - edge distances
-            padding_mask: [n_atoms, max_neighbors] - True for valid neighbors
-            reverse_neighbor_index: [n_atoms * max_neighbors] - reverse edge indices
-            cutoff_factors: [n_atoms, max_neighbors] - cutoff weights
+    def _compute_cutoff_factors(self, edge_distances):
+        """Cosine cutoff function computed in-graph for gradient flow.
 
-        Returns:
-            atomic_energies: [n_atoms]
+        cutoff_factor(r) = 0.5 + 0.5 * cos(pi * clamp((r - (cutoff - width)) / width, 0, 1))
+
+        This maps:
+            r <= cutoff - width: 1.0
+            cutoff - width < r < cutoff: smooth transition from 1 to 0
+            r >= cutoff: 0.0
         """
+        scaled = torch.clamp(
+            (edge_distances - (self.cutoff - self.cutoff_width)) / self.cutoff_width,
+            0.0, 1.0
+        )
+        return 0.5 * (1.0 + torch.cos(torch.tensor(math.pi) * scaled))
+
+    def forward(self, species, neighbor_species, edge_vectors,
+                *args):
+        """Forward pass with variable signature based on forces mode.
+
+        When forces=False: args = (edge_distances, padding_mask, reverse_neighbor_index, cutoff_factors)
+        When forces=True:  args = (padding_mask, reverse_neighbor_index)
+        """
+        if self.forces:
+            padding_mask = args[0]
+            reverse_neighbor_index = args[1]
+
+            # Compute distances from edge vectors (in-graph for gradient flow)
+            # Use explicit multiply instead of ** 2 to avoid POW op
+            edge_distances = torch.sqrt((edge_vectors * edge_vectors).sum(dim=-1))
+            # Compute cutoff factors from distances (in-graph for gradient flow)
+            cutoff_factors = self._compute_cutoff_factors(edge_distances)
+        else:
+            edge_distances = args[0]
+            padding_mask = args[1]
+            reverse_neighbor_index = args[2]
+            cutoff_factors = args[3]
+
         # Initial neighbor species embeddings
         neighbor_embeds_flat = self.neighbor_embedder(neighbor_species.flatten())
         input_messages = neighbor_embeds_flat.view(self.n_atoms, self.max_neighbors, self.d_pet)
@@ -104,6 +259,8 @@ class PETFullModel(torch.nn.Module):
             input_node_embeddings = node_embedder(species)
 
             # Run GNN layer
+            # When forces=True, use manual attention (supports backward pass)
+            # When forces=False, use flash attention (faster, no backward)
             output_node, output_edge = gnn_layer(
                 input_node_embeddings,
                 input_messages,
@@ -112,38 +269,35 @@ class PETFullModel(torch.nn.Module):
                 padding_mask,
                 edge_distances,
                 cutoff_factors,
-                use_manual_attention=False
+                use_manual_attention=self.forces
             )
 
             # Node energy readout
-            node_feat = self.node_energy_heads[gnn_idx](output_node)  # [n_atoms, 128]
-            node_e = self.node_final_layers[gnn_idx](node_feat)  # [n_atoms, 1]
+            node_feat = self.node_energy_heads[gnn_idx](output_node)
+            node_e = self.node_final_layers[gnn_idx](node_feat)
 
             # Edge energy readout
-            edge_feat = self.edge_energy_heads[gnn_idx](output_edge)  # [n_atoms, max_neighbors, 128]
-            edge_e = self.edge_final_layers[gnn_idx](edge_feat)  # [n_atoms, max_neighbors, 1]
+            edge_feat = self.edge_energy_heads[gnn_idx](output_edge)
+            edge_e = self.edge_final_layers[gnn_idx](edge_feat)
             # Mask out padded edges and apply cutoff
-            # padding_mask is True for valid neighbors
             edge_e_masked = torch.where(
                 padding_mask.unsqueeze(-1),
                 edge_e,
                 torch.zeros_like(edge_e)
             )
             # Apply cutoff factors and sum over neighbors
-            edge_e_sum = (edge_e_masked.squeeze(-1) * cutoff_factors).sum(dim=1)  # [n_atoms]
+            edge_e_sum = (edge_e_masked.squeeze(-1) * cutoff_factors).sum(dim=1)
 
             # Accumulate both node and edge contributions
             atomic_energies = atomic_energies + node_e.squeeze(-1) + edge_e_sum
 
             # Message passing: prepare input for next layer
-            # Reverse the messages using reverse_neighbor_index
             flat_output = output_edge.reshape(
                 self.n_atoms * self.max_neighbors, self.d_pet
             )
             reversed_messages = flat_output[reverse_neighbor_index].reshape(
                 self.n_atoms, self.max_neighbors, self.d_pet
             )
-            # Average forward and reverse messages
             input_messages = 0.5 * (input_messages + reversed_messages)
 
         return atomic_energies
@@ -185,79 +339,99 @@ def compute_reverse_neighbor_index(n_atoms: int, max_neighbors: int,
     return reverse_idx
 
 
+# --- Export ---
+
 def export_pet_full(
     output_dir: Path = Path("/tmp/pet_full_export"),
     n_atoms: int = 7,
-    max_neighbors: int = 11
+    max_neighbors: int = 11,
+    model_name: str = "pet-mad-1.0.2",
+    forces: bool = False,
 ):
-    """Export full PET computation path with neighbor list inputs."""
+    """Export full PET computation path with neighbor list inputs.
+
+    Args:
+        output_dir: Directory for output files
+        n_atoms: Number of atoms for export dimensions (use primes)
+        max_neighbors: Max neighbors per atom for export dimensions (use primes)
+        model_name: Model identifier (see load_pet_model docstring)
+        forces: If True, export with manual attention and in-graph distance/cutoff
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading PET model...")
-    pet = get_pet_model()
+    print(f"Loading PET model: {model_name}...")
+    pet = load_pet_model(model_name)
     pet.eval()
 
-    hypers = pet.hypers
-    d_pet = hypers['d_pet'] if isinstance(hypers, dict) else hypers.D_PET
+    params = get_model_params(pet)
+    d_pet = params['d_pet']
+    cutoff = params['cutoff']
+    cutoff_width = params['cutoff_width']
 
-    print(f"d_pet: {d_pet}")
+    print(f"d_pet: {d_pet}, cutoff: {cutoff}, cutoff_width: {cutoff_width}")
     print(f"n_atoms: {n_atoms}, max_neighbors: {max_neighbors}")
+    print(f"forces: {forces}")
 
     # Create wrapper using actual GNN layers
-    wrapper = PETFullModel(pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet)
+    wrapper = PETFullModel(
+        pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
+        forces=forces, cutoff=cutoff, cutoff_width=cutoff_width
+    )
     wrapper.eval()
 
     # Create test inputs
     torch.manual_seed(42)
-    species = torch.zeros(n_atoms, dtype=torch.long)  # All species 0
+    species = torch.zeros(n_atoms, dtype=torch.long)
     neighbor_species = torch.zeros(n_atoms, max_neighbors, dtype=torch.long)
     edge_vectors = torch.randn(n_atoms, max_neighbors, 3)
-    edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
     padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
-    cutoff_factors = torch.ones(n_atoms, max_neighbors)
-
-    # Simple reverse index for test (identity for now)
     reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
+
+    if forces:
+        # Forces mode: edge_distances and cutoff_factors computed in-graph
+        example_inputs = (species, neighbor_species, edge_vectors,
+                         padding_mask, reverse_neighbor_index)
+        input_names = ["species", "neighbor_species", "edge_vectors",
+                       "padding_mask", "reverse_neighbor_index"]
+    else:
+        # Forward-only mode: all inputs provided externally
+        edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
+        cutoff_factors = torch.ones(n_atoms, max_neighbors)
+        example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
+                         padding_mask, reverse_neighbor_index, cutoff_factors)
+        input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
+                       "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
 
     # Run forward pass
     print("\nRunning forward pass...")
     with torch.no_grad():
-        expected_output = wrapper(
-            species, neighbor_species, edge_vectors, edge_distances,
-            padding_mask, reverse_neighbor_index, cutoff_factors
-        )
+        expected_output = wrapper(*example_inputs)
 
     print(f"Output shape: {expected_output.shape}")
     print(f"Atomic energies: {expected_output}")
     print(f"Total energy: {expected_output.sum().item():.6f}")
 
-    # Export via torch.export (handles dynamic operations like torch.empty)
+    # Export via torch.export
     print("\nExporting via torch.export...")
     try:
+        input_dtypes = {
+            "species": "i32",
+            "neighbor_species": "i32",
+            "reverse_neighbor_index": "i32",
+        }
+
         graph, weights = export_torch_model(
             wrapper,
-            (species, neighbor_species, edge_vectors, edge_distances,
-             padding_mask, reverse_neighbor_index, cutoff_factors),
+            example_inputs,
             output_dir / "pet_full.json",
-            input_names=["species", "neighbor_species", "edge_vectors", "edge_distances",
-                        "padding_mask", "reverse_neighbor_index", "cutoff_factors"],
-            input_dtypes={
-                "species": "i32",
-                "neighbor_species": "i32",
-                "reverse_neighbor_index": "i32",
-            },
-            strict=False,  # Allow dynamic operations
+            input_names=input_names,
+            input_dtypes=input_dtypes,
+            strict=False,
         )
 
-        # Symbolize dynamic dimensions so the graph can be used with any system size
+        # Symbolize dynamic dimensions
         print("\nSymbolizing dimensions...")
-        # Protect known model constants from being symbolized even if they
-        # happen to match n_atoms or max_neighbors.
-        # NOTE: Export dimensions (n_atoms, max_neighbors) should be chosen to
-        # avoid collisions with model constants. Use --n-atoms=7 --max-neighbors=11
-        # (primes that don't appear as model dimensions).
         model_constants = {1, 3, 4, 8, 32, 128, 256, 512, 768, d_pet}
-        # Don't protect values that are our actual export dimensions
         protected = model_constants - {n_atoms, max_neighbors,
                                        n_atoms * max_neighbors,
                                        max_neighbors + 1,
@@ -280,42 +454,20 @@ def export_pet_full(
             data.astype(np.float32).tofile(filepath)
 
         # Save inputs
-        species.numpy().astype(np.int32).tofile(output_dir / "input_species.bin")
-        neighbor_species.numpy().astype(np.int32).tofile(output_dir / "input_neighbor_species.bin")
-        edge_vectors.numpy().astype(np.float32).tofile(output_dir / "input_edge_vectors.bin")
-        edge_distances.numpy().astype(np.float32).tofile(output_dir / "input_edge_distances.bin")
-        padding_mask.numpy().astype(np.bool_).tofile(output_dir / "input_padding_mask.bin")
-        reverse_neighbor_index.numpy().astype(np.int32).tofile(output_dir / "input_reverse_neighbor_index.bin")
-        cutoff_factors.numpy().astype(np.float32).tofile(output_dir / "input_cutoff_factors.bin")
+        for i, (name, tensor) in enumerate(zip(input_names, example_inputs)):
+            if tensor.dtype in (torch.long, torch.int32, torch.int64):
+                tensor.numpy().astype(np.int32).tofile(output_dir / f"input_{name}.bin")
+            elif tensor.dtype == torch.bool:
+                tensor.numpy().astype(np.bool_).tofile(output_dir / f"input_{name}.bin")
+            else:
+                tensor.numpy().astype(np.float32).tofile(output_dir / f"input_{name}.bin")
 
         # Save expected output
         expected_output.numpy().astype(np.float32).tofile(output_dir / "expected_output.bin")
 
         # Get species mapping and composition energies
-        species_to_index = {}
-        composition_energies = {}
-
-        # Default: atomic numbers 1-85 map to indices 0-84
-        for Z in range(1, 86):
-            species_to_index[Z] = Z - 1
-
-        # Get composition energies from additive models
-        if hasattr(pet, 'additive_models') and len(pet.additive_models) > 0:
-            comp_model = pet.additive_models[0]
-            if hasattr(comp_model, 'model'):
-                inner = comp_model.model
-                if hasattr(inner, 'weights') and 'energy' in inner.weights:
-                    energy_weights = inner.weights['energy']
-                    block = energy_weights.block(0)
-                    t2i = inner.type_to_index
-                    for Z in range(1, 86):
-                        idx = t2i[Z].item()
-                        if idx >= 0 and idx < block.values.shape[0]:
-                            composition_energies[Z] = float(block.values[idx, 0].item())
-
-        # Get cutoff from hyperparameters
-        cutoff = hypers.get('cutoff', 4.5) if isinstance(hypers, dict) else 4.5
-        cutoff_width = hypers.get('cutoff_width', 0.2) if isinstance(hypers, dict) else 0.2
+        species_to_index = get_species_mapping(pet)
+        composition_energies = get_composition_energies(pet)
 
         # Save metadata
         metadata = {
@@ -327,6 +479,8 @@ def export_pet_full(
             "expected_total_energy": expected_output.sum().item(),
             "cutoff": float(cutoff),
             "cutoff_width": float(cutoff_width),
+            "forces": forces,
+            "model_name": model_name,
             "species_to_index": species_to_index,
             "composition_energies": composition_energies,
             "weights": {name: list(t.shape) for name, t in weights.items()}
@@ -351,14 +505,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export PET model to GIR format")
     parser.add_argument("--output", "-o", type=str, default="/tmp/pet_full_export",
                         help="Output directory")
+    parser.add_argument("--model", type=str, default="pet-mad-1.0.2",
+                        help="Model name: 'pet-mad-1.0.2' (legacy) or upet name like 'pet-mad-s'")
+    parser.add_argument("--forces", action="store_true",
+                        help="Export with forces support (manual attention, in-graph distance/cutoff)")
     parser.add_argument("--n-atoms", type=int, default=7,
-                        help="Number of atoms (use primes like 7 to avoid collision with model constants)")
+                        help="Number of atoms for export (use primes to avoid model constant collisions)")
     parser.add_argument("--max-neighbors", type=int, default=11,
-                        help="Maximum neighbors per atom (use primes like 11 to avoid collision with model constants)")
+                        help="Max neighbors for export (use primes)")
     args = parser.parse_args()
 
     export_pet_full(
         output_dir=Path(args.output),
         n_atoms=args.n_atoms,
-        max_neighbors=args.max_neighbors
+        max_neighbors=args.max_neighbors,
+        model_name=args.model,
+        forces=args.forces,
     )
