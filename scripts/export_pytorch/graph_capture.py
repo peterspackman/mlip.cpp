@@ -18,6 +18,7 @@ from torch.export import export, ExportedProgram
 from .dimension_mapper import pytorch_to_ggml_shape, pytorch_to_ggml_dim
 from .graph_ir import GGMLGraph, GGMLNode, GGMLDtype
 from .op_registry import get_registry, GGMLOp
+from .decompositions import get_decomposition, decompose_layer_norm, decompose_dropout
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class GraphConverter:
         self.registry = get_registry()
         self._node_outputs: dict[str, str] = {}  # FX node name -> GIR reference
         self._weight_names: dict[str, str] = {}  # Parameter name -> weight reference
+        self._chunk_info: dict[str, Any] | None = None  # For tracking chunk ops
 
     def convert(
         self,
@@ -199,30 +201,22 @@ class GraphConverter:
 
         # Handle decomposition
         if mapping.ggml_op == GGMLOp.DECOMPOSE:
-            # Check if we have a decomposition function
-            decompose_fn = self.registry.get_decomposition(op_name)
-            if decompose_fn:
-                # Decomposition would add multiple nodes
-                logger.info(f"Decomposing {op_name}")
-                # For now, just add a placeholder
-                gir_node = gir.add_node(
-                    op=f"DECOMPOSED_{op_name.split('.')[-1].upper()}",
-                    name=node.name,
-                    inputs=inputs,
-                    output_shape=ggml_shape,
-                    output_dtype=dtype,
-                    params={"original_op": op_name},
-                )
-            else:
-                logger.warning(f"No decomposition for {op_name}, using placeholder")
-                gir_node = gir.add_node(
-                    op=f"UNSUPPORTED_{op_name.split('.')[-1].upper()}",
-                    name=node.name,
-                    inputs=inputs,
-                    output_shape=ggml_shape,
-                    output_dtype=dtype,
-                    params={"original_op": op_name},
-                )
+            output_ref = self._handle_decomposition(
+                node, gir, op_name, inputs, ggml_shape, dtype
+            )
+            if output_ref:
+                self._node_outputs[node.name] = output_ref
+                return
+            # If decomposition failed, fall through to placeholder
+            logger.warning(f"No decomposition for {op_name}, using placeholder")
+            gir_node = gir.add_node(
+                op=f"UNSUPPORTED_{op_name.split('.')[-1].upper()}",
+                name=node.name,
+                inputs=inputs,
+                output_shape=ggml_shape,
+                output_dtype=dtype,
+                params={"original_op": op_name},
+            )
         else:
             # Build operation parameters
             params = self._build_op_params(node, mapping, pt_shape)
@@ -319,6 +313,483 @@ class GraphConverter:
         else:
             return None
 
+    def _handle_decomposition(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        op_name: str,
+        inputs: list[str],
+        output_shape: list[int],
+        output_dtype: GGMLDtype,
+    ) -> str | None:
+        """
+        Handle decomposition of complex operations into primitives.
+
+        Returns the reference to the output node, or None if decomposition failed.
+        """
+        # Layer normalization
+        if "layer_norm" in op_name:
+            return self._decompose_layer_norm(node, gir, inputs, output_shape)
+
+        # Dropout (identity in inference)
+        if "dropout" in op_name:
+            return self._decompose_dropout(node, gir, inputs, output_shape)
+
+        # rsqrt
+        if "rsqrt" in op_name:
+            return self._decompose_rsqrt(node, gir, inputs, output_shape)
+
+        # addmm (bias + matmul)
+        if "addmm" in op_name:
+            return self._decompose_addmm(node, gir, output_shape)
+
+        # mean.dim - sum + scale
+        if "mean.dim" in op_name:
+            return self._decompose_mean_dim(node, gir, inputs, output_shape)
+
+        # cat/stack - needs special handling based on downstream ops
+        if "cat" in op_name or "stack" in op_name:
+            # For now, emit as CONCAT and handle at runtime
+            gir_node = gir.add_node(
+                op="CONCAT",
+                name=node.name,
+                inputs=inputs,
+                output_shape=output_shape,
+                output_dtype=output_dtype,
+                params=self._get_concat_params(node),
+            )
+            return gir.node_ref(gir_node)
+
+        # chunk/split - decompose to views
+        if "chunk" in op_name or "split" in op_name:
+            return self._decompose_chunk(node, gir, inputs, output_shape, output_dtype)
+
+        # getitem - access tuple/list elements
+        if "getitem" in op_name:
+            return self._decompose_getitem(node, gir, inputs)
+
+        return None
+
+    def _decompose_layer_norm(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+        output_shape: list[int],
+    ) -> str | None:
+        """Decompose LayerNorm into primitives."""
+        # Args: input, normalized_shape, weight, bias, eps
+        if len(node.args) < 1:
+            return None
+
+        input_ref = inputs[0] if inputs else None
+        if not input_ref:
+            return None
+
+        # Get weight and bias references
+        weight_ref = None
+        bias_ref = None
+
+        if len(node.args) >= 3:
+            # weight is arg[2]
+            if isinstance(node.args[2], torch.fx.Node):
+                weight_ref = self._node_outputs.get(node.args[2].name)
+        if len(node.args) >= 4:
+            # bias is arg[3]
+            if isinstance(node.args[3], torch.fx.Node):
+                bias_ref = self._node_outputs.get(node.args[3].name)
+
+        # Get eps (usually arg[4] or in kwargs)
+        eps = 1e-5
+        if len(node.args) >= 5:
+            eps = node.args[4]
+        elif "eps" in node.kwargs:
+            eps = node.kwargs["eps"]
+
+        # If no weight/bias, we can't use the full affine decomposition
+        # Fall back to a simplified version
+        if weight_ref is None or bias_ref is None:
+            logger.info(f"LayerNorm without affine params: {node.name}")
+            # Just emit normalized output without affine transform
+            return self._decompose_layer_norm_no_affine(
+                gir, input_ref, output_shape, eps
+            )
+
+        return decompose_layer_norm(
+            gir, input_ref, weight_ref, bias_ref, output_shape, eps
+        )
+
+    def _decompose_layer_norm_no_affine(
+        self,
+        gir: GGMLGraph,
+        input_ref: str,
+        input_shape: list[int],
+        eps: float,
+    ) -> str:
+        """Decompose LayerNorm without affine parameters."""
+        d_feat = input_shape[0]
+        inv_d = 1.0 / float(d_feat)
+        reduced_shape = [1] + input_shape[1:]
+
+        # mean
+        sum_node = gir.add_node(
+            op="SUM_ROWS", name="ln_sum", inputs=[input_ref],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+        )
+        mean_node = gir.add_node(
+            op="SCALE", name="ln_mean", inputs=[gir.node_ref(sum_node)],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+            params={"scale": inv_d},
+        )
+
+        # centered
+        mean_broadcast = gir.add_node(
+            op="REPEAT", name="ln_mean_bc", inputs=[gir.node_ref(mean_node)],
+            output_shape=input_shape, output_dtype=GGMLDtype.F32,
+        )
+        centered = gir.add_node(
+            op="SUB", name="ln_centered",
+            inputs=[input_ref, gir.node_ref(mean_broadcast)],
+            output_shape=input_shape, output_dtype=GGMLDtype.F32,
+        )
+
+        # variance
+        centered_sq = gir.add_node(
+            op="SQR", name="ln_sq", inputs=[gir.node_ref(centered)],
+            output_shape=input_shape, output_dtype=GGMLDtype.F32,
+        )
+        sum_sq = gir.add_node(
+            op="SUM_ROWS", name="ln_sum_sq", inputs=[gir.node_ref(centered_sq)],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+        )
+        var_node = gir.add_node(
+            op="SCALE", name="ln_var", inputs=[gir.node_ref(sum_sq)],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+            params={"scale": inv_d},
+        )
+
+        # std
+        var_stab = gir.add_node(
+            op="SCALE", name="ln_var_stab", inputs=[gir.node_ref(var_node)],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+            params={"scale": 1.0 + eps},
+        )
+        std_node = gir.add_node(
+            op="SQRT", name="ln_std", inputs=[gir.node_ref(var_stab)],
+            output_shape=reduced_shape, output_dtype=GGMLDtype.F32,
+        )
+
+        # normalize
+        std_broadcast = gir.add_node(
+            op="REPEAT", name="ln_std_bc", inputs=[gir.node_ref(std_node)],
+            output_shape=input_shape, output_dtype=GGMLDtype.F32,
+        )
+        normalized = gir.add_node(
+            op="DIV", name="ln_out",
+            inputs=[gir.node_ref(centered), gir.node_ref(std_broadcast)],
+            output_shape=input_shape, output_dtype=GGMLDtype.F32,
+        )
+
+        return gir.node_ref(normalized)
+
+    def _decompose_dropout(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+        output_shape: list[int],
+    ) -> str:
+        """Decompose dropout (identity in inference)."""
+        input_ref = inputs[0] if inputs else None
+        if not input_ref:
+            return None
+
+        # In inference, dropout is identity
+        # Emit a CONT node as identity
+        output = gir.add_node(
+            op="CONT",
+            name=node.name,
+            inputs=[input_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+        )
+        return gir.node_ref(output)
+
+    def _decompose_rsqrt(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+        output_shape: list[int],
+    ) -> str:
+        """Decompose rsqrt (1/sqrt(x))."""
+        input_ref = inputs[0] if inputs else None
+        if not input_ref:
+            return None
+
+        # sqrt(x)
+        sqrt_node = gir.add_node(
+            op="SQRT",
+            name=f"{node.name}_sqrt",
+            inputs=[input_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+        )
+
+        # 1/sqrt(x) - emit as custom RSQRT op for runtime to handle
+        # This is because GGML doesn't have a direct reciprocal op
+        output = gir.add_node(
+            op="RSQRT",
+            name=node.name,
+            inputs=[input_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+        )
+        return gir.node_ref(output)
+
+    def _decompose_addmm(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        output_shape: list[int],
+    ) -> str | None:
+        """Decompose addmm (bias + input @ weight)."""
+        # Args: bias, input, weight, [alpha], [beta]
+        if len(node.args) < 3:
+            return None
+
+        bias_arg, input_arg, weight_arg = node.args[:3]
+
+        bias_ref = self._node_outputs.get(bias_arg.name) if isinstance(bias_arg, torch.fx.Node) else None
+        input_ref = self._node_outputs.get(input_arg.name) if isinstance(input_arg, torch.fx.Node) else None
+        weight_ref = self._node_outputs.get(weight_arg.name) if isinstance(weight_arg, torch.fx.Node) else None
+
+        if not all([bias_ref, input_ref, weight_ref]):
+            return None
+
+        # matmul: input @ weight.T
+        mm_node = gir.add_node(
+            op="MUL_MAT",
+            name=f"{node.name}_mm",
+            inputs=[weight_ref, input_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+        )
+
+        # add bias
+        output = gir.add_node(
+            op="ADD",
+            name=node.name,
+            inputs=[gir.node_ref(mm_node), bias_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+        )
+        return gir.node_ref(output)
+
+    def _decompose_mean_dim(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+        output_shape: list[int],
+    ) -> str | None:
+        """Decompose mean along dimension to sum + scale."""
+        input_ref = inputs[0] if inputs else None
+        if not input_ref:
+            return None
+
+        # Get dimension(s) from args
+        dims = []
+        if len(node.args) > 1:
+            dim_arg = node.args[1]
+            if isinstance(dim_arg, int):
+                dims = [dim_arg]
+            elif isinstance(dim_arg, (list, tuple)):
+                dims = list(dim_arg)
+
+        # Get input shape from metadata
+        input_meta = None
+        if isinstance(node.args[0], torch.fx.Node):
+            input_meta = node.args[0].meta.get("val")
+
+        if input_meta is None or not isinstance(input_meta, torch.Tensor):
+            return None
+
+        input_shape = list(input_meta.shape)
+
+        # Compute the size of dimensions being reduced
+        dim_size = 1
+        for d in dims:
+            dim_size *= input_shape[d]
+
+        # For GGML, we need to emit sum followed by scale
+        # This is a simplification - full implementation would handle keepdim properly
+        sum_node = gir.add_node(
+            op="SUM",
+            name=f"{node.name}_sum",
+            inputs=[input_ref],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+            params={"dims": dims},
+        )
+
+        output = gir.add_node(
+            op="SCALE",
+            name=node.name,
+            inputs=[gir.node_ref(sum_node)],
+            output_shape=output_shape,
+            output_dtype=GGMLDtype.F32,
+            params={"scale": 1.0 / float(dim_size)},
+        )
+
+        return gir.node_ref(output)
+
+    def _decompose_chunk(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+        output_shape: list[int],
+        output_dtype: GGMLDtype,
+    ) -> str:
+        """
+        Decompose chunk into multiple view operations.
+
+        chunk(input, chunks, dim) returns a tuple of tensors.
+        We emit a special CHUNK node and track outputs for getitem access.
+        """
+        input_ref = inputs[0] if inputs else None
+        if not input_ref:
+            return None
+
+        # Get chunk parameters
+        chunks = 2  # Default
+        dim = -1
+
+        if len(node.args) > 1:
+            chunks = node.args[1]
+        if len(node.args) > 2:
+            dim = node.args[2]
+        if "chunks" in node.kwargs:
+            chunks = node.kwargs["chunks"]
+        if "dim" in node.kwargs:
+            dim = node.kwargs["dim"]
+
+        # Get input shape from metadata
+        input_meta = None
+        if isinstance(node.args[0], torch.fx.Node):
+            input_meta = node.args[0].meta.get("val")
+
+        if input_meta is None or not isinstance(input_meta, torch.Tensor):
+            return None
+
+        input_shape = list(input_meta.shape)
+
+        # Convert negative dim
+        if dim < 0:
+            dim = len(input_shape) + dim
+
+        # Calculate chunk size
+        dim_size = input_shape[dim]
+        chunk_size = dim_size // chunks
+
+        # Store chunk info for getitem access
+        # The meta for this node is a tuple of tensors
+        self._chunk_info = {
+            "input_ref": input_ref,
+            "input_shape": input_shape,
+            "chunks": chunks,
+            "dim": dim,
+            "chunk_size": chunk_size,
+        }
+
+        # Emit a CHUNK placeholder that runtime will handle
+        gir_node = gir.add_node(
+            op="CHUNK",
+            name=node.name,
+            inputs=[input_ref],
+            output_shape=output_shape,  # Shape of first chunk
+            output_dtype=output_dtype,
+            params={
+                "chunks": chunks,
+                "dim": dim,
+                "chunk_size": chunk_size,
+            },
+        )
+
+        return gir.node_ref(gir_node)
+
+    def _decompose_getitem(
+        self,
+        node: torch.fx.Node,
+        gir: GGMLGraph,
+        inputs: list[str],
+    ) -> str | None:
+        """
+        Decompose getitem (tuple access) into view operations.
+
+        getitem(tuple, index) gets the element at index from a tuple.
+        For chunk outputs, this creates a VIEW into the appropriate slice.
+        """
+        if len(node.args) < 2:
+            return None
+
+        source_node = node.args[0]
+        index = node.args[1]
+
+        if not isinstance(source_node, torch.fx.Node):
+            return None
+
+        # Check if source is a chunk operation
+        source_ref = self._node_outputs.get(source_node.name)
+        if not source_ref:
+            return None
+
+        # Get the output shape/dtype from metadata
+        meta = node.meta.get("val")
+        if meta is None or not isinstance(meta, torch.Tensor):
+            return None
+
+        pt_shape = list(meta.shape)
+        ggml_shape = pytorch_to_ggml_shape(pt_shape)
+        dtype = GGMLDtype.from_torch_dtype(meta.dtype)
+
+        # Check if this is accessing a chunk result
+        if hasattr(self, "_chunk_info") and self._chunk_info:
+            info = self._chunk_info
+            dim = info["dim"]
+            chunk_size = info["chunk_size"]
+            input_ref = info["input_ref"]
+
+            # Create VIEW for this chunk
+            # Offset calculation depends on dimension ordering
+            gir_node = gir.add_node(
+                op="VIEW",
+                name=node.name,
+                inputs=[input_ref],
+                output_shape=ggml_shape,
+                output_dtype=dtype,
+                params={
+                    "chunk_index": index,
+                    "dim": dim,
+                    "chunk_size": chunk_size,
+                },
+            )
+            return gir.node_ref(gir_node)
+
+        # Generic getitem - just reference the source
+        return source_ref
+
+    def _get_concat_params(self, node: torch.fx.Node) -> dict[str, Any]:
+        """Extract concat parameters."""
+        params = {}
+        if len(node.args) > 1:
+            if isinstance(node.args[1], int):
+                params["dim"] = node.args[1]
+        if "dim" in node.kwargs:
+            params["dim"] = node.kwargs["dim"]
+        return params
+
     def _build_op_params(
         self,
         node: torch.fx.Node,
@@ -403,9 +874,15 @@ def capture_model(
         from torch.export import Dim
         dynamic_shapes = {}
         for name, dims in config.dynamic_shapes.items():
-            dynamic_shapes[name] = {}
-            for dim_idx, dim_name in dims.items():
-                dynamic_shapes[name][dim_idx] = Dim(dim_name)
+            if dims is None:
+                # Static or non-tensor input
+                dynamic_shapes[name] = None
+            elif isinstance(dims, dict):
+                dynamic_shapes[name] = {}
+                for dim_idx, dim_name in dims.items():
+                    dynamic_shapes[name][dim_idx] = Dim(dim_name)
+            else:
+                dynamic_shapes[name] = dims
 
     # Export the model
     logger.info("Exporting model with torch.export...")

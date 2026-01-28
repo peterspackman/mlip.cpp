@@ -355,6 +355,49 @@ class OpRegistry:
             notes="Create filled tensor of same shape",
         ))
 
+        # ===== Dropout (identity in inference) =====
+        self.register("aten.dropout.default", OpMapping(
+            GGMLOp.DECOMPOSE,
+            notes="Identity in inference mode",
+        ))
+
+        # ===== Tensor Splitting =====
+        self.register("aten.chunk.default", OpMapping(
+            GGMLOp.DECOMPOSE,
+            notes="Split tensor into chunks - decompose to views",
+        ))
+        self.register("aten.split.Tensor", OpMapping(
+            GGMLOp.DECOMPOSE,
+            notes="Split tensor - decompose to views",
+        ))
+        self.register("aten.unbind.int", OpMapping(
+            GGMLOp.DECOMPOSE,
+            notes="Unbind tensor - decompose to views",
+        ))
+
+        # ===== Python Operator Fallbacks =====
+        # These appear when tracing Python operators on symbolic values
+        self.register("_operator.mul", OpMapping(
+            GGMLOp.MUL,
+            notes="Python multiplication operator",
+        ))
+        self.register("_operator.add", OpMapping(
+            GGMLOp.ADD,
+            notes="Python addition operator",
+        ))
+        self.register("_operator.sub", OpMapping(
+            GGMLOp.SUB,
+            notes="Python subtraction operator",
+        ))
+        self.register("_operator.truediv", OpMapping(
+            GGMLOp.DIV,
+            notes="Python division operator",
+        ))
+        self.register("_operator.getitem", OpMapping(
+            GGMLOp.DECOMPOSE,
+            notes="Python getitem - tuple/list access",
+        ))
+
 
 # Global registry instance
 _default_registry: OpRegistry | None = None

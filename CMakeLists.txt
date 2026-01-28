@@ -168,6 +168,16 @@ elseif(NOT EMSCRIPTEN)
     )
 endif()
 
+# nlohmann_json (for graph inference metadata)
+CPMAddPackage(
+    NAME nlohmann_json
+    GITHUB_REPOSITORY nlohmann/json
+    VERSION 3.11.3
+    OPTIONS
+        "JSON_BuildTests OFF"
+    EXCLUDE_FROM_ALL YES
+)
+
 # =============================================================================
 # Library
 # =============================================================================

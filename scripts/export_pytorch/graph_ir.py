@@ -42,15 +42,36 @@ class GGMLDtype(Enum):
             raise ValueError(f"Unsupported dtype: {dtype}")
         return mapping[dtype]
 
+    @classmethod
+    def from_string(cls, s: str) -> "GGMLDtype":
+        """Convert string to GGML dtype."""
+        mapping = {
+            "f32": cls.F32,
+            "f16": cls.F16,
+            "i32": cls.I32,
+            "i16": cls.I16,
+            "i8": cls.I8,
+            "bool": cls.BOOL,
+        }
+        if s not in mapping:
+            raise ValueError(f"Unknown dtype string: {s}")
+        return mapping[s]
 
-def _sanitize_shape(shape: list) -> list[int]:
-    """Convert shape to plain integers, replacing symbolic dims with -1."""
+
+def _sanitize_shape(shape: list) -> list[int | str]:
+    """Convert shape to plain integers or symbolic dimension names.
+
+    Symbolic dimensions are preserved as strings (e.g., "n_atoms", "max_neighbors").
+    """
     result = []
     for dim in shape:
         if isinstance(dim, int):
             result.append(dim)
+        elif isinstance(dim, str):
+            # Symbolic dimension name - preserve it
+            result.append(dim)
         else:
-            # SymInt or other symbolic type - use -1 for dynamic
+            # SymInt or other symbolic type - try to convert to int
             try:
                 result.append(int(dim))
             except (TypeError, ValueError):

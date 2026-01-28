@@ -11,6 +11,11 @@ add_executable(backend_benchmark backend_benchmark.cpp)
 target_link_libraries(backend_benchmark PRIVATE mlipcpp ggml fmt::fmt)
 target_include_directories(backend_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Graph-based inference using auto-exported models
+add_executable(graph_inference ${PROJECT_SOURCE_DIR}/src/bin/graph_inference.cpp)
+target_link_libraries(graph_inference PRIVATE mlipcpp ggml fmt::fmt nlohmann_json::nlohmann_json)
+target_include_directories(graph_inference PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # Public API examples (only use public headers)
 add_executable(c_api_test c_api_test.c)
 target_link_libraries(c_api_test PRIVATE mlipcpp)
