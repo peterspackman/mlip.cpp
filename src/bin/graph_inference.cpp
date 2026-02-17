@@ -23,6 +23,8 @@
 #include <ggml.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -31,6 +33,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -56,10 +59,150 @@ template <typename T> std::vector<T> load_binary(const std::string &path) {
 struct ModelData {
   float cutoff = 4.5f;
   float cutoff_width = 0.2f;
-  bool forces_mode = false; // true if model was exported with --forces
+  float energy_scale = 1.0f;          // scale factor applied to raw model output
+  bool forces_mode = false;            // true if model was exported with --forces
+  std::string cutoff_function = "cosine"; // "cosine" or "bump"
+  float num_neighbors_adaptive = 0.0f;   // 0 = disabled, >0 = target neighbor count
   std::map<int, int> species_to_index;
   std::map<int, float> composition_energies;
 };
+
+// Bump cutoff function: smooth switching function
+// f(x) = 1 for x <= 0, 0.5*(1+tanh(1/tan(pi*x))) for 0 < x < 1, 0 for x >= 1
+// where x = (distance - (cutoff - width)) / width
+float cutoff_func_bump(float distance, float cutoff, float width) {
+  float x = (distance - (cutoff - width)) / width;
+  if (x <= 0.0f) return 1.0f;
+  if (x >= 1.0f) return 0.0f;
+  float tan_val = std::tan(M_PI * x);
+  return 0.5f * (1.0f + std::tanh(1.0f / tan_val));
+}
+
+// Cosine cutoff function
+float cutoff_func_cosine(float distance, float cutoff, float width) {
+  float x = (distance - (cutoff - width)) / width;
+  if (x <= 0.0f) return 1.0f;
+  if (x >= 1.0f) return 0.0f;
+  return 0.5f * (1.0f + std::cos(M_PI * x));
+}
+
+// Bump cutoff in double precision (for adaptive cutoff computation)
+double cutoff_func_bump_d(double distance, double cutoff, double width) {
+  double x = (distance - (cutoff - width)) / width;
+  if (x <= 0.0) return 1.0;
+  if (x >= 1.0) return 0.0;
+  double tan_val = std::tan(M_PI * x);
+  return 0.5 * (1.0 + std::tanh(1.0 / tan_val));
+}
+
+// Compute adaptive per-atom cutoffs following metatrain's algorithm.
+// Uses double precision throughout to match metatrain's float64 computation.
+// Takes double-precision distances for accuracy.
+// Returns per-atom cutoff distances.
+std::vector<float> compute_adaptive_cutoffs(
+    const std::vector<int32_t> &centers,
+    const std::vector<double> &distances,
+    float num_neighbors_adaptive,
+    int num_nodes,
+    float max_cutoff,
+    float cutoff_width) {
+
+  constexpr double MIN_PROBE_CUTOFF = 0.5;
+  double probe_spacing = static_cast<double>(cutoff_width) / 4.0;
+  double target = static_cast<double>(num_neighbors_adaptive);
+  double max_cut = static_cast<double>(max_cutoff);
+
+  // Generate probe cutoffs (match torch.arange: start + i*step to avoid accumulation error)
+  int n_probes_est = static_cast<int>(std::ceil((max_cut - MIN_PROBE_CUTOFF) / probe_spacing));
+  std::vector<double> probe_cutoffs;
+  probe_cutoffs.reserve(n_probes_est);
+  for (int i = 0; ; i++) {
+    double c = MIN_PROBE_CUTOFF + i * probe_spacing;
+    if (c >= max_cut) break;
+    probe_cutoffs.push_back(c);
+  }
+  int n_probes = static_cast<int>(probe_cutoffs.size());
+  if (n_probes == 0) {
+    return std::vector<float>(num_nodes, max_cutoff);
+  }
+
+  int n_edges = static_cast<int>(distances.size());
+
+  // Step 1: Compute effective neighbor counts per (atom, probe)
+  // metatrain passes the model's cutoff_width (not the default 1.0) to
+  // get_effective_num_neighbors
+  double eff_width = static_cast<double>(cutoff_width);
+  std::vector<std::vector<double>> eff_neighbors(num_nodes, std::vector<double>(n_probes, 0.0));
+
+  for (int e = 0; e < n_edges; e++) {
+    int center = centers[e];
+    double dist = distances[e];
+    for (int p = 0; p < n_probes; p++) {
+      double w = cutoff_func_bump_d(dist, probe_cutoffs[p], eff_width);
+      eff_neighbors[center][p] += w;
+    }
+  }
+
+  // Step 2: Compute Gaussian cutoff selection weights
+  // baseline = num_neighbors_adaptive * x^3 where x = linspace(0, 1, n_probes)
+  std::vector<double> baseline(n_probes);
+  for (int p = 0; p < n_probes; p++) {
+    double x = (n_probes > 1) ? static_cast<double>(p) / (n_probes - 1) : 0.0;
+    baseline[p] = target * x * x * x;
+  }
+
+  std::vector<float> adapted_cutoffs(num_nodes, max_cutoff);
+
+  for (int a = 0; a < num_nodes; a++) {
+    // diff[p] = eff_neighbors[a][p] - target + baseline[p]
+    std::vector<double> diff(n_probes);
+    for (int p = 0; p < n_probes; p++) {
+      diff[p] = eff_neighbors[a][p] - target + baseline[p];
+    }
+
+    // Compute adaptive width via numerical gradient of diff
+    std::vector<double> width_t(n_probes);
+    constexpr double eps = 1e-12;
+    if (n_probes == 1) {
+      width_t[0] = std::abs(diff[0]) * 0.5 + eps;
+    } else {
+      for (int p = 1; p < n_probes - 1; p++) {
+        width_t[p] = std::max(std::abs((diff[p + 1] - diff[p - 1]) / 2.0), eps);
+      }
+      width_t[0] = std::max(std::abs(diff[1] - diff[0]), eps);
+      width_t[n_probes - 1] = std::max(std::abs(diff[n_probes - 1] - diff[n_probes - 2]), eps);
+    }
+
+    // Gaussian weights: logw = -0.5 * (diff / width_t)^2
+    std::vector<double> logw(n_probes);
+    double max_logw = -1e30;
+    for (int p = 0; p < n_probes; p++) {
+      double ratio = diff[p] / width_t[p];
+      logw[p] = -0.5 * ratio * ratio;
+      if (logw[p] > max_logw) max_logw = logw[p];
+    }
+
+    // weights = exp(logw - max_logw), then normalize
+    std::vector<double> weights(n_probes);
+    double weight_sum = 0.0;
+    for (int p = 0; p < n_probes; p++) {
+      weights[p] = std::exp(logw[p] - max_logw);
+      weight_sum += weights[p];
+    }
+    for (int p = 0; p < n_probes; p++) {
+      weights[p] /= weight_sum;
+    }
+
+    // Weighted average of probe cutoffs
+    double cutoff_val = 0.0;
+    for (int p = 0; p < n_probes; p++) {
+      cutoff_val += probe_cutoffs[p] * weights[p];
+    }
+    adapted_cutoffs[a] = static_cast<float>(cutoff_val);
+  }
+
+  return adapted_cutoffs;
+}
 
 // Load model from a directory of loose files
 void load_from_directory(const std::string &dir_path, GraphInterpreter &interp,
@@ -76,7 +219,12 @@ void load_from_directory(const std::string &dir_path, GraphInterpreter &interp,
 
   model.cutoff = metadata.value("cutoff", 4.5f);
   model.cutoff_width = metadata.value("cutoff_width", 0.2f);
+  model.energy_scale = metadata.value("energy_scale", 1.0f);
   model.forces_mode = metadata.value("forces", false);
+  model.cutoff_function = metadata.value("cutoff_function", "cosine");
+  if (metadata.contains("num_neighbors_adaptive") && !metadata["num_neighbors_adaptive"].is_null()) {
+    model.num_neighbors_adaptive = metadata["num_neighbors_adaptive"].get<float>();
+  }
 
   if (metadata.contains("species_to_index")) {
     for (auto &[key, val] : metadata["species_to_index"].items()) {
@@ -166,6 +314,7 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
   // Read metadata
   model.cutoff = loader.get_float32("pet.cutoff", 4.5f);
   model.cutoff_width = loader.get_float32("pet.cutoff_width", 0.2f);
+  model.energy_scale = loader.get_float32("pet.energy_scale", 1.0f);
 
   // Check for forces mode (stored as int32 since GGUF doesn't have bool)
   model.forces_mode = (loader.get_int32("pet.forces_mode", 0) != 0);
@@ -179,7 +328,13 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
   // Composition energies
   auto comp_keys = loader.get_array_int32("pet.composition_keys");
   auto comp_vals = loader.get_array_float32("pet.composition_values");
-  for (size_t i = 0; i < comp_keys.size() && i < comp_vals.size(); i++) {
+  if (comp_keys.size() != comp_vals.size()) {
+    throw std::runtime_error(
+        "GGUF: composition_keys (" + std::to_string(comp_keys.size()) +
+        ") and composition_values (" + std::to_string(comp_vals.size()) +
+        ") arrays have different lengths");
+  }
+  for (size_t i = 0; i < comp_keys.size(); i++) {
     model.composition_energies[comp_keys[i]] = comp_vals[i];
   }
 
@@ -339,7 +494,13 @@ int main(int argc, char *argv[]) {
     }
 
     std::cout << "  Cutoff: " << model.cutoff << " A\n";
+    std::cout << "  Cutoff function: " << model.cutoff_function << "\n";
+    if (model.num_neighbors_adaptive > 0.0f) {
+      std::cout << "  Adaptive cutoff: " << model.num_neighbors_adaptive
+                << " neighbors\n";
+    }
     std::cout << "  Species mapped: " << model.species_to_index.size() << "\n";
+    std::cout << "  Energy scale: " << model.energy_scale << "\n";
     std::cout << "  Forces mode: " << (model.forces_mode ? "yes" : "no")
               << "\n";
     std::cout << "  Graph: " << interp.graph().nodes.size() << " nodes\n";
@@ -356,7 +517,109 @@ int main(int argc, char *argv[]) {
         NeighborListOptions{model.cutoff, true, false});
     NeighborList nlist = nlist_builder.build(system);
 
-    // Count max neighbors
+    std::cout << "  Raw edges: " << nlist.num_pairs() << "\n";
+
+    // Apply adaptive cutoff filtering if enabled
+    // Per-pair cutoff distances (used for bump cutoff computation)
+    std::vector<float> pair_cutoffs(nlist.num_pairs(), model.cutoff);
+
+    if (model.num_neighbors_adaptive > 0.0f) {
+      // Recompute distances in double precision for accurate adaptive cutoff.
+      // metatrain uses float64 positions/distances throughout. Our neighbor list
+      // stores float32 edge vectors, so we recompute distances from the original
+      // double-precision positions and cell to match metatrain's precision.
+      int n_pairs = nlist.num_pairs();
+      std::vector<double> distances_d(n_pairs);
+
+      // Read positions as double from the AtomicSystem
+      // (positions were read as double from XYZ, converted to float for storage)
+      const float *pos_f = system.positions();
+      std::vector<double> pos_d(n_atoms * 3);
+      for (int i = 0; i < n_atoms * 3; i++) {
+        pos_d[i] = static_cast<double>(pos_f[i]);
+      }
+
+      // Read cell as double (if periodic)
+      double cell_d[3][3] = {{0}};
+      if (system.is_periodic()) {
+        const Cell *cell = system.cell();
+        for (int i = 0; i < 3; i++) {
+          for (int j = 0; j < 3; j++) {
+            cell_d[i][j] = static_cast<double>(cell->matrix[i][j]);
+          }
+        }
+      }
+
+      bool has_shifts = !nlist.cell_shifts.empty();
+      for (int e = 0; e < n_pairs; e++) {
+        int ci = nlist.centers[e];
+        int ni = nlist.neighbors[e];
+        double dx = pos_d[ni * 3 + 0] - pos_d[ci * 3 + 0];
+        double dy = pos_d[ni * 3 + 1] - pos_d[ci * 3 + 1];
+        double dz = pos_d[ni * 3 + 2] - pos_d[ci * 3 + 2];
+        if (has_shifts) {
+          const auto &s = nlist.cell_shifts[e];
+          dx += s[0] * cell_d[0][0] + s[1] * cell_d[1][0] + s[2] * cell_d[2][0];
+          dy += s[0] * cell_d[0][1] + s[1] * cell_d[1][1] + s[2] * cell_d[2][1];
+          dz += s[0] * cell_d[0][2] + s[1] * cell_d[1][2] + s[2] * cell_d[2][2];
+        }
+        distances_d[e] = std::sqrt(dx * dx + dy * dy + dz * dz) + 1e-15;
+      }
+
+      // Compute per-atom adaptive cutoffs
+      std::vector<float> atomic_cutoffs = compute_adaptive_cutoffs(
+          nlist.centers, distances_d,
+          model.num_neighbors_adaptive, n_atoms,
+          model.cutoff, model.cutoff_width);
+
+      // Symmetrize: pair_cutoff = (cutoff[center] + cutoff[neighbor]) / 2
+      // and filter: keep edges where distance <= pair_cutoff
+      std::vector<bool> keep(n_pairs, false);
+      int kept = 0;
+      for (int e = 0; e < n_pairs; e++) {
+        double pc = (static_cast<double>(atomic_cutoffs[nlist.centers[e]]) +
+                     static_cast<double>(atomic_cutoffs[nlist.neighbors[e]])) / 2.0;
+        if (distances_d[e] <= pc) {
+          keep[e] = true;
+          kept++;
+        }
+      }
+
+      // Build filtered neighbor list
+      NeighborList filtered;
+      filtered.centers.reserve(kept);
+      filtered.neighbors.reserve(kept);
+      filtered.edge_vectors.reserve(kept);
+      filtered.distances.reserve(kept);
+      if (!nlist.cell_shifts.empty()) {
+        filtered.cell_shifts.reserve(kept);
+      }
+
+      std::vector<float> filtered_pair_cutoffs;
+      filtered_pair_cutoffs.reserve(kept);
+
+      for (int e = 0; e < n_pairs; e++) {
+        if (!keep[e]) continue;
+        filtered.centers.push_back(nlist.centers[e]);
+        filtered.neighbors.push_back(nlist.neighbors[e]);
+        filtered.edge_vectors.push_back(nlist.edge_vectors[e]);
+        filtered.distances.push_back(nlist.distances[e]);
+        if (!nlist.cell_shifts.empty()) {
+          filtered.cell_shifts.push_back(nlist.cell_shifts[e]);
+        }
+        double pc = (static_cast<double>(atomic_cutoffs[nlist.centers[e]]) +
+                     static_cast<double>(atomic_cutoffs[nlist.neighbors[e]])) / 2.0;
+        filtered_pair_cutoffs.push_back(static_cast<float>(pc));
+      }
+
+      nlist = std::move(filtered);
+      pair_cutoffs = std::move(filtered_pair_cutoffs);
+
+      std::cout << "  Adaptive cutoff filtered: " << nlist.num_pairs()
+                << " edges kept\n";
+    }
+
+    // Count max neighbors (after filtering)
     std::vector<int> neighbor_counts(n_atoms, 0);
     for (int e = 0; e < nlist.num_pairs(); e++) {
       neighbor_counts[nlist.centers[e]]++;
@@ -372,6 +635,8 @@ int main(int argc, char *argv[]) {
     // Set symbolic dimensions
     interp.set_dimension("n_atoms", n_atoms);
     interp.set_dimension("max_neighbors", max_neighbors);
+    interp.set_dimension("n_edges", n_atoms * max_neighbors);
+    interp.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
 
     // Create input context
     constexpr size_t INPUT_CTX_SIZE = 16 * 1024 * 1024;
@@ -411,6 +676,14 @@ int main(int argc, char *argv[]) {
       ggml_set_name(cutoff_factors, "cutoff_factors");
     }
 
+    // Per-pair cutoff values (forces mode only)
+    ggml_tensor *cutoff_values = nullptr;
+    if (model.forces_mode) {
+      cutoff_values =
+          ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+      ggml_set_name(cutoff_values, "cutoff_values");
+    }
+
     // Mark edge_vectors as parameter for gradient computation
     if (compute_forces) {
       ggml_set_param(edge_vectors);
@@ -424,7 +697,13 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_atoms; i++) {
       int Z = atomic_numbers[i];
       auto it = model.species_to_index.find(Z);
-      species_data[i] = (it != model.species_to_index.end()) ? it->second : 0;
+      if (it == model.species_to_index.end()) {
+        std::cerr << "Error: atomic number " << Z << " (atom " << i
+                  << ") is not in the model's species map.\n"
+                  << "The model does not support this element.\n";
+        return 1;
+      }
+      species_data[i] = it->second;
     }
     ggml_backend_tensor_set(species, species_data.data(), 0,
                             species_data.size() * sizeof(int32_t));
@@ -432,9 +711,10 @@ int main(int argc, char *argv[]) {
     std::vector<int32_t> ns_data(n_atoms * max_neighbors, 0);
     std::vector<float> ev_data(n_atoms * max_neighbors * 3, 0.0f);
     std::vector<float> ed_data(n_atoms * max_neighbors, 0.0f);
-    std::vector<float> pm_data(n_atoms * max_neighbors, 0.0f);
+    std::vector<float> pm_data(n_atoms * max_neighbors, 1.0f);  // 1.0 = padded (PyTorch True), 0.0 = valid
     std::vector<float> cf_data(n_atoms * max_neighbors, 0.0f);
-    std::vector<int32_t> rni_data(n_atoms * max_neighbors, 0);
+    std::vector<float> cv_data(n_atoms * max_neighbors, model.cutoff);  // per-pair cutoff values (default: global)
+    std::vector<int32_t> rni_data(n_atoms * max_neighbors, 0);  // 0 for padded edges (masked out later)
 
     // Track neighbor atom index for each slot (needed for force scatter)
     std::vector<int> neighbor_atoms(n_atoms * max_neighbors, -1);
@@ -464,7 +744,13 @@ int main(int argc, char *argv[]) {
 
       int Z_j = atomic_numbers[j];
       auto it = model.species_to_index.find(Z_j);
-      ns_data[flat_idx] = (it != model.species_to_index.end()) ? it->second : 0;
+      if (it == model.species_to_index.end()) {
+        std::cerr << "Error: atomic number " << Z_j << " (neighbor atom " << j
+                  << ") is not in the model's species map.\n"
+                  << "The model does not support this element.\n";
+        return 1;
+      }
+      ns_data[flat_idx] = it->second;
 
       const auto &ev = nlist.edge_vectors[e];
       int ev_idx = i * (max_neighbors * 3) + slot * 3;
@@ -473,21 +759,19 @@ int main(int argc, char *argv[]) {
       ev_data[ev_idx + 2] = ev[2];
 
       ed_data[flat_idx] = nlist.distances[e];
-      pm_data[flat_idx] = 1.0f;
+      pm_data[flat_idx] = 0.0f;  // 0.0 = valid edge (PyTorch False)
 
       // Store neighbor atom index for force scatter
       neighbor_atoms[flat_idx] = j;
 
-      // PET cosine cutoff with width parameter
+      // Per-pair cutoff value and cutoff factor
       float r = nlist.distances[e];
-      float width = model.cutoff_width;
-      if (r <= model.cutoff - width) {
-        cf_data[flat_idx] = 1.0f;
-      } else if (r < model.cutoff) {
-        float scaled = (r - (model.cutoff - width)) / width;
-        cf_data[flat_idx] = 0.5f * (1.0f + std::cos(scaled * 3.14159265f));
+      float pc = pair_cutoffs[e];
+      cv_data[flat_idx] = pc;  // Store per-pair cutoff for forces-mode graph
+      if (model.cutoff_function == "bump") {
+        cf_data[flat_idx] = cutoff_func_bump(r, pc, model.cutoff_width);
       } else {
-        cf_data[flat_idx] = 0.0f;
+        cf_data[flat_idx] = cutoff_func_cosine(r, pc, model.cutoff_width);
       }
     }
 
@@ -508,9 +792,8 @@ int main(int argc, char *argv[]) {
       auto it_ji = edge_to_flat_idx.find({j, i, -sa, -sb, -sc});
       if (it_ji != edge_to_flat_idx.end()) {
         rni_data[it_ij->second] = it_ji->second;
-      } else {
-        rni_data[it_ij->second] = it_ij->second;
       }
+      // If reverse edge not found, leave as -1 (set during initialization)
     }
 
     ggml_backend_tensor_set(neighbor_species, ns_data.data(), 0,
@@ -537,6 +820,11 @@ int main(int argc, char *argv[]) {
                               cf_data.size() * sizeof(float));
       interp.set_input("edge_distances", edge_distances);
       interp.set_input("cutoff_factors", cutoff_factors);
+    } else {
+      // Forces mode: provide per-pair cutoff values for in-graph cutoff computation
+      ggml_backend_tensor_set(cutoff_values, cv_data.data(), 0,
+                              cv_data.size() * sizeof(float));
+      interp.set_input("cutoff_values", cutoff_values);
     }
 
     if (debug) {
@@ -644,11 +932,17 @@ int main(int argc, char *argv[]) {
 
     std::cout << "\nComputing "
               << (compute_forces ? "energy + forces" : "energy") << "...\n";
+
+    auto t_compute_start = std::chrono::high_resolution_clock::now();
     ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
+    auto t_compute_end = std::chrono::high_resolution_clock::now();
     if (status != GGML_STATUS_SUCCESS) {
       std::cerr << "Error: Graph computation failed\n";
       return 1;
     }
+    double compute_ms = std::chrono::duration<double, std::milli>(
+                            t_compute_end - t_compute_start)
+                            .count();
 
     if (debug) {
       auto tensor_sum = [](ggml_tensor *t) -> float {
@@ -734,6 +1028,9 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_atoms; i++)
       model_energy += atomic_energies[i];
 
+    // Apply energy scale factor (raw model output → scaled output)
+    float scaled_model_energy = model_energy * model.energy_scale;
+
     float composition_energy = 0.0f;
     for (int i = 0; i < n_atoms; i++) {
       auto it = model.composition_energies.find(atomic_numbers[i]);
@@ -741,7 +1038,7 @@ int main(int argc, char *argv[]) {
         composition_energy += it->second;
     }
 
-    float total_energy = model_energy + composition_energy;
+    float total_energy = scaled_model_energy + composition_energy;
 
     // Print energy results
     std::cout << "\n=== Results ===\n";
@@ -750,7 +1047,11 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_atoms; i++) {
       std::cout << "  Atom " << i << ": " << atomic_energies[i] << " eV\n";
     }
-    std::cout << "\nModel energy:       " << model_energy << " eV\n";
+    std::cout << "\nModel energy (raw): " << model_energy << " eV\n";
+    if (model.energy_scale != 1.0f) {
+      std::cout << "Energy scale:       " << model.energy_scale << "\n";
+      std::cout << "Model energy:       " << scaled_model_energy << " eV\n";
+    }
     if (composition_energy != 0.0f) {
       std::cout << "Composition energy: " << composition_energy << " eV\n";
     }
@@ -793,8 +1094,8 @@ int main(int argc, char *argv[]) {
           for (int slot = 0; slot < max_neighbors; slot++) {
             int flat_idx = center_atom * max_neighbors + slot;
 
-            // Skip padding entries
-            if (pm_data[flat_idx] < 0.5f)
+            // Skip padding entries (pm_data: 0.0 = valid, 1.0 = padded)
+            if (pm_data[flat_idx] > 0.5f)
               continue;
 
             int neighbor_atom = neighbor_atoms[flat_idx];
@@ -819,6 +1120,13 @@ int main(int argc, char *argv[]) {
             forces[neighbor_atom * 3 + 1] -= gy;
             forces[neighbor_atom * 3 + 2] -= gz;
           }
+        }
+
+        // Apply energy scale to forces
+        // Forces = -dE/dr = -energy_scale * d(sum(ae))/dr
+        // The backward pass gives d(sum(ae))/dr, so multiply by energy_scale
+        for (int i = 0; i < n_atoms * 3; i++) {
+          forces[i] *= model.energy_scale;
         }
 
         // Print forces
@@ -848,6 +1156,9 @@ int main(int argc, char *argv[]) {
         std::cerr << "Warning: Gradient tensor not available after compute.\n";
       }
     }
+
+    std::cout << "\nCompute time: " << std::fixed << std::setprecision(1)
+              << compute_ms << " ms\n";
 
     // Cleanup
     ggml_backend_buffer_free(compute_buffer);

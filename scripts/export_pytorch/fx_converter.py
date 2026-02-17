@@ -38,9 +38,9 @@ FX_TO_GGML = {
     "torch.sub": "SUB",
     "torch.mul": "MUL",
     "torch.div": "DIV",
-    "torch.matmul": "MUL_MAT",
-    "torch.mm": "MUL_MAT",
-    "torch.bmm": "MUL_MAT",
+    "torch.matmul": "MATMUL",
+    "torch.mm": "MATMUL",
+    "torch.bmm": "MATMUL",
     "torch.clamp": "CLAMP",
     "torch.log": "LOG",
     "torch.exp": "UNARY_EXP",
@@ -97,12 +97,12 @@ ATEN_TO_GGML = {
     "aten.neg": "UNARY_NEG",
 
     # Matrix ops
-    "aten.mm.default": "MUL_MAT",
-    "aten.mm": "MUL_MAT",
-    "aten.bmm.default": "MUL_MAT",
-    "aten.bmm": "MUL_MAT",
-    "aten.matmul.default": "MUL_MAT",
-    "aten.matmul": "MUL_MAT",
+    "aten.mm.default": "MATMUL",
+    "aten.mm": "MATMUL",
+    "aten.bmm.default": "MATMUL",
+    "aten.bmm": "MATMUL",
+    "aten.matmul.default": "MATMUL",
+    "aten.matmul": "MATMUL",
     "aten.linear.default": "LINEAR",
     "aten.linear": "LINEAR",
     "aten.t.default": "TRANSPOSE",
@@ -204,6 +204,8 @@ ATEN_TO_GGML = {
     "aten.layer_norm": "LAYER_NORM",
     "aten.native_layer_norm.default": "LAYER_NORM",
     "aten.native_layer_norm": "LAYER_NORM",
+    "aten.rms_norm.default": "RMS_NORM",
+    "aten.rms_norm": "RMS_NORM",
 
     # Attention
     "aten.scaled_dot_product_attention.default": "FLASH_ATTN_EXT",
@@ -269,6 +271,7 @@ def convert_fx_to_gir(
     traced_module: fx.GraphModule,
     input_shapes: Dict[str, List[int]],
     input_names: List[str] = None,
+    strict_mode: bool = False,
 ) -> Tuple[GGMLGraph, Dict[str, torch.Tensor]]:
     """Convert a traced FX graph module to GIR.
 
@@ -276,6 +279,7 @@ def convert_fx_to_gir(
         traced_module: FX traced and shape-propagated module
         input_shapes: Dict mapping input names to shapes
         input_names: Optional list of input names
+        strict_mode: If True, raise errors on unhandled ops instead of passing through
 
     Returns:
         Tuple of (GGMLGraph, weights dict)
@@ -442,12 +446,16 @@ def convert_fx_to_gir(
 
             elif hasattr(module, "weight") or hasattr(module, "bias"):
                 # Generic module with parameters - try to handle
+                if strict_mode:
+                    raise ValueError(f"Unhandled module type {module_type} at {node.target}")
                 print(f"Warning: Unhandled module type {module_type} at {node.target}")
                 input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
                 name_map[node.name] = input_ref
 
             else:
                 # Pass-through for unknown modules
+                if strict_mode:
+                    raise ValueError(f"Unhandled module type {module_type} at {node.target}")
                 if node.args:
                     input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
                     name_map[node.name] = input_ref
@@ -547,6 +555,24 @@ def convert_fx_to_gir(
                 continue
             elif node.target == torch.clamp:
                 ggml_op = "CLAMP"
+            elif node.target == torch.chunk or "chunk" in target_name:
+                # torch.chunk(input, chunks, dim=0) -> split into chunks pieces along dim
+                input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
+                num_chunks = node.args[1] if len(node.args) > 1 else 2
+                dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+
+                gir_nodes.append(GGMLNode(
+                    id=node_id,
+                    op="CHUNK",
+                    name=node.name,
+                    inputs=[input_ref],
+                    output_shape=shape or [],
+                    output_dtype=GGMLDtype.F32,
+                    params={"num_chunks": num_chunks, "dim": dim},
+                ))
+                name_map[node.name] = f"node:{node_id}"
+                node_id += 1
+                continue
             elif node.target == torch.log:
                 ggml_op = "LOG"
             elif node.target == torch.exp:
@@ -603,6 +629,8 @@ def convert_fx_to_gir(
                 # Attribute access (like .shape) - skip
                 pass
             else:
+                if strict_mode:
+                    raise ValueError(f"Unhandled function {target_name}")
                 print(f"Warning: Unhandled function {target_name}")
 
         elif node.op == "call_method":
@@ -697,6 +725,8 @@ def convert_fx_to_gir(
                 name_map[node.name] = f"node:{node_id}"
                 node_id += 1
             else:
+                if strict_mode:
+                    raise ValueError(f"Unhandled method {method_name}")
                 print(f"Warning: Unhandled method {method_name}")
                 if node.args:
                     input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
@@ -811,6 +841,7 @@ def convert_exported_to_gir(
     input_names: List[str] = None,
     input_dtypes: Dict[str, GGMLDtype] = None,
     pre_extracted_weights: Dict[str, torch.Tensor] = None,
+    strict_mode: bool = False,
 ) -> Tuple[GGMLGraph, Dict[str, torch.Tensor]]:
     """Convert a torch.export exported graph to GIR.
 
@@ -823,6 +854,7 @@ def convert_exported_to_gir(
         input_names: Optional list of input names
         input_dtypes: Optional dict mapping input names to dtypes
         pre_extracted_weights: Weights already extracted from ExportedProgram.state_dict
+        strict_mode: If True, raise errors on unhandled ops instead of passing through
 
     Returns:
         Tuple of (GGMLGraph, weights dict)
@@ -910,16 +942,40 @@ def convert_exported_to_gir(
 
             # Handle special cases
             if node.target == operator.getitem:
-                # getitem is used for tuple unpacking (e.g., after split)
+                # getitem is used for tuple unpacking (e.g., after split/chunk)
                 input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
                 idx = node.args[1]
                 if isinstance(idx, int):
+                    # Check if input is from a CHUNK node - need to compute proper shape
+                    chunk_output_shape = shape or []
+                    input_node = node.args[0]
+                    if isinstance(input_node, fx.Node) and hasattr(input_node, 'target'):
+                        # Use str() to get target name - works for both OpOverload and regular targets
+                        input_target_name = str(input_node.target)
+                        if "chunk" in input_target_name.lower():
+                            # This is getitem after chunk - compute output shape
+                            # Get chunk params from the input node
+                            chunk_num = input_node.args[1] if len(input_node.args) > 1 else 2
+                            chunk_dim = input_node.args[2] if len(input_node.args) > 2 else -1
+                            # Get input tensor shape from chunk's input
+                            if len(input_node.args) > 0 and isinstance(input_node.args[0], fx.Node):
+                                chunk_input = input_node.args[0]
+                                if "val" in chunk_input.meta and hasattr(chunk_input.meta["val"], "shape"):
+                                    input_shape = list(chunk_input.meta["val"].shape)
+                                    # Compute chunk output shape
+                                    if chunk_dim < 0:
+                                        chunk_dim = len(input_shape) + chunk_dim
+                                    if 0 <= chunk_dim < len(input_shape):
+                                        chunk_size = input_shape[chunk_dim] // chunk_num
+                                        chunk_output_shape = input_shape.copy()
+                                        chunk_output_shape[chunk_dim] = chunk_size
+
                     gir_nodes.append(GGMLNode(
                         id=node_id,
                         op="VIEW",
                         name=node.name,
                         inputs=[input_ref],
-                        output_shape=shape or [],
+                        output_shape=chunk_output_shape,
                         output_dtype=dtype,
                         params={"index": idx},
                     ))
@@ -935,6 +991,8 @@ def convert_exported_to_gir(
                 ggml_op = FX_TO_GGML.get(short_name)
 
             if not ggml_op:
+                if strict_mode:
+                    raise ValueError(f"Unhandled ATen op: {target_name}")
                 print(f"Warning: Unhandled ATen op {target_name}")
                 # Try to pass through
                 if node.args and isinstance(node.args[0], fx.Node):
@@ -1017,6 +1075,25 @@ def convert_exported_to_gir(
                     input_refs = [r for r in [inp_ref, weight_ref, bias_ref] if r]
                     params["eps"] = eps
 
+            elif ggml_op == "RMS_NORM":
+                # rms_norm: input, normalized_shape, weight, eps
+                # Args: (input, normalized_shape, weight, eps) or similar
+                # Reorder to: input, weight
+                if len(node.args) >= 3:
+                    inp_ref = name_map.get(node.args[0].name) if isinstance(node.args[0], fx.Node) else None
+                    # normalized_shape is args[1], weight is args[2]
+                    weight_ref = name_map.get(node.args[2].name) if isinstance(node.args[2], fx.Node) else None
+                    # When PyTorch RMSNorm has eps=None, torch.export only produces 3 args
+                    # (input, normalized_shape, weight) - no eps arg at all
+                    # eps=None in PyTorch means effectively 0, but we use a tiny value
+                    # for numerical stability in GGML's rsqrt computation
+                    if len(node.args) > 3 and node.args[3] is not None:
+                        eps = float(node.args[3])
+                    else:
+                        eps = 1e-8  # eps=None in PyTorch, use tiny value for GGML stability
+                    input_refs = [r for r in [inp_ref, weight_ref] if r]
+                    params["eps"] = eps
+
             elif ggml_op == "GET_ROWS":
                 # embedding: weight, indices
                 if len(node.args) >= 2:
@@ -1070,6 +1147,18 @@ def convert_exported_to_gir(
                 if len(node.args) >= 2:
                     if isinstance(node.args[1], (int, float)):
                         params["scalar"] = float(node.args[1])
+
+            elif ggml_op == "CHUNK":
+                # chunk: input, num_chunks, dim
+                # aten.chunk.default(tensor, num_chunks, dim)
+                if len(node.args) >= 2:
+                    params["num_chunks"] = node.args[1]
+                if len(node.args) >= 3:
+                    params["dim"] = node.args[2]
+                elif "dim" in node.kwargs:
+                    params["dim"] = node.kwargs["dim"]
+                else:
+                    params["dim"] = 0  # default dim
 
             gir_nodes.append(GGMLNode(
                 id=node_id,

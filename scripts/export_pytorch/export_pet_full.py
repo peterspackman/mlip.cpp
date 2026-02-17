@@ -83,7 +83,7 @@ def get_model_params(pet_model):
     """Extract model parameters from a PET model (handles both old and new formats).
 
     Returns:
-        dict with keys: d_pet, cutoff, cutoff_width
+        dict with keys: d_pet, cutoff, cutoff_width, cutoff_function, num_neighbors_adaptive
     """
     # Metatrain PET caches these as direct attributes
     if hasattr(pet_model, 'd_pet'):
@@ -91,6 +91,8 @@ def get_model_params(pet_model):
             'd_pet': pet_model.d_pet,
             'cutoff': getattr(pet_model, 'cutoff', 4.5),
             'cutoff_width': getattr(pet_model, 'cutoff_width', 0.2),
+            'cutoff_function': getattr(pet_model, 'cutoff_function', 'Cosine').lower(),
+            'num_neighbors_adaptive': getattr(pet_model, 'num_neighbors_adaptive', None),
         }
 
     # Legacy pet-mad format
@@ -100,12 +102,16 @@ def get_model_params(pet_model):
             'd_pet': hypers.get('d_pet', 256),
             'cutoff': hypers.get('cutoff', 4.5),
             'cutoff_width': hypers.get('cutoff_width', 0.2),
+            'cutoff_function': 'cosine',
+            'num_neighbors_adaptive': None,
         }
 
     return {
         'd_pet': getattr(hypers, 'D_PET', 256),
         'cutoff': getattr(hypers, 'cutoff', 4.5),
         'cutoff_width': getattr(hypers, 'cutoff_width', 0.2),
+        'cutoff_function': 'cosine',
+        'num_neighbors_adaptive': None,
     }
 
 
@@ -151,10 +157,29 @@ def get_composition_energies(pet_model):
     return composition_energies
 
 
+def get_energy_scale(pet_model) -> float:
+    """Extract energy scale factor from a PET model's scaler (if available).
+
+    The scaler multiplies raw model output to produce the final energy.
+    For models without a scaler, returns 1.0.
+    """
+    if hasattr(pet_model, 'scaler'):
+        scaler = pet_model.scaler
+        if hasattr(scaler, 'model') and hasattr(scaler.model, 'scales'):
+            if 'energy' in scaler.model.scales:
+                scale_block = scaler.model.scales['energy'].block(0)
+                return float(scale_block.values.item())
+    return 1.0
+
+
 # --- Model Wrapper ---
 
 class PETFullModel(torch.nn.Module):
     """Full PET energy computation using actual GNN layers.
+
+    Supports two featurization types:
+    - "residual" (pet-mad-s): Per-layer energy accumulation, multiple node embedders
+    - "feedforward" (pet-omad-s): combination_mlps between layers, final-only energy
 
     When forces=False (default):
         Inputs: species, neighbor_species, edge_vectors, edge_distances,
@@ -172,7 +197,8 @@ class PETFullModel(torch.nn.Module):
     """
 
     def __init__(self, pet_model, n_atoms: int, max_neighbors: int, d_pet: int,
-                 forces: bool = False, cutoff: float = 4.5, cutoff_width: float = 0.2):
+                 forces: bool = False, cutoff: float = 4.5, cutoff_width: float = 0.2,
+                 cutoff_function: str = "cosine"):
         super().__init__()
 
         # Store dimensions for tracing
@@ -182,8 +208,13 @@ class PETFullModel(torch.nn.Module):
         self.forces = forces
         self.cutoff = cutoff
         self.cutoff_width = cutoff_width
+        self.cutoff_function = cutoff_function
 
-        # Node embeddings - one per GNN layer
+        # Detect featurization type
+        self.featurizer_type = getattr(pet_model, 'featurizer_type', 'residual')
+        self.num_readout_layers = getattr(pet_model, 'num_readout_layers', len(pet_model.gnn_layers))
+
+        # Node embeddings
         self.node_embedders = pet_model.node_embedders
 
         # Neighbor species embedding (top-level)
@@ -192,52 +223,73 @@ class PETFullModel(torch.nn.Module):
         # GNN layers (CartesianTransformer)
         self.gnn_layers = pet_model.gnn_layers
 
-        # Node energy heads and final layers (one per GNN layer)
+        # Feedforward-specific: combination MLPs and norms
+        if self.featurizer_type == 'feedforward':
+            self.combination_mlps = pet_model.combination_mlps
+            self.combination_norms = pet_model.combination_norms
+
+        # Energy heads and final layers
+        # For residual: one per GNN layer
+        # For feedforward: one for final layer only (num_readout_layers=1)
         self.node_energy_heads = pet_model.node_heads['energy']
         self.node_final_layers = torch.nn.ModuleList([
             pet_model.node_last_layers['energy'][i]['energy___0']
-            for i in range(len(pet_model.gnn_layers))
+            for i in range(self.num_readout_layers)
         ])
 
-        # Edge energy heads and final layers (one per GNN layer)
         self.edge_energy_heads = pet_model.edge_heads['energy']
         self.edge_final_layers = torch.nn.ModuleList([
             pet_model.edge_last_layers['energy'][i]['energy___0']
-            for i in range(len(pet_model.gnn_layers))
+            for i in range(self.num_readout_layers)
         ])
 
-    def _compute_cutoff_factors(self, edge_distances):
-        """Cosine cutoff function computed in-graph for gradient flow.
+    def _compute_cutoff_factors(self, edge_distances, cutoff_values=None):
+        """Cutoff function computed in-graph for gradient flow.
 
-        cutoff_factor(r) = 0.5 + 0.5 * cos(pi * clamp((r - (cutoff - width)) / width, 0, 1))
+        When cutoff_values is provided, uses per-pair cutoffs (for adaptive cutoff models).
+        Otherwise uses self.cutoff (global cutoff).
 
-        This maps:
-            r <= cutoff - width: 1.0
-            cutoff - width < r < cutoff: smooth transition from 1 to 0
-            r >= cutoff: 0.0
+        Supports both cosine and bump cutoff functions.
         """
+        if cutoff_values is not None:
+            cutoff = cutoff_values
+        else:
+            cutoff = self.cutoff
+
         scaled = torch.clamp(
-            (edge_distances - (self.cutoff - self.cutoff_width)) / self.cutoff_width,
+            (edge_distances - (cutoff - self.cutoff_width)) / self.cutoff_width,
             0.0, 1.0
         )
-        return 0.5 * (1.0 + torch.cos(torch.tensor(math.pi) * scaled))
+
+        if self.cutoff_function == "bump":
+            # Bump cutoff: 0.5 * (1 + tanh(1 / tan(pi * x)))
+            # Rewrite as: 0.5 * (1 + tanh(cos(pi*x) / sin(pi*x)))
+            # This avoids torch.tan which has no GGML equivalent.
+            # Clamp away from 0 and 1 to avoid singularities
+            scaled_safe = torch.clamp(scaled, min=1e-6, max=1.0 - 1e-6)
+            angle = torch.tensor(math.pi) * scaled_safe
+            return 0.5 * (1.0 + torch.tanh(torch.cos(angle) / torch.sin(angle)))
+        else:
+            # Cosine cutoff: 0.5 * (1 + cos(pi * x))
+            return 0.5 * (1.0 + torch.cos(torch.tensor(math.pi) * scaled))
 
     def forward(self, species, neighbor_species, edge_vectors,
                 *args):
         """Forward pass with variable signature based on forces mode.
 
         When forces=False: args = (edge_distances, padding_mask, reverse_neighbor_index, cutoff_factors)
-        When forces=True:  args = (padding_mask, reverse_neighbor_index)
+        When forces=True:  args = (padding_mask, reverse_neighbor_index, cutoff_values)
         """
         if self.forces:
             padding_mask = args[0]
             reverse_neighbor_index = args[1]
+            cutoff_values = args[2]  # per-pair cutoff radii [n_atoms, max_neighbors]
 
             # Compute distances from edge vectors (in-graph for gradient flow)
             # Use explicit multiply instead of ** 2 to avoid POW op
             edge_distances = torch.sqrt((edge_vectors * edge_vectors).sum(dim=-1))
-            # Compute cutoff factors from distances (in-graph for gradient flow)
-            cutoff_factors = self._compute_cutoff_factors(edge_distances)
+            # Compute cutoff factors from distances and per-pair cutoffs
+            cutoff_factors = self._compute_cutoff_factors(edge_distances, cutoff_values)
         else:
             edge_distances = args[0]
             padding_mask = args[1]
@@ -248,10 +300,24 @@ class PETFullModel(torch.nn.Module):
         neighbor_embeds_flat = self.neighbor_embedder(neighbor_species.flatten())
         input_messages = neighbor_embeds_flat.view(self.n_atoms, self.max_neighbors, self.d_pet)
 
+        if self.featurizer_type == 'feedforward':
+            return self._forward_feedforward(
+                species, neighbor_species, edge_vectors, edge_distances,
+                padding_mask, reverse_neighbor_index, cutoff_factors, input_messages
+            )
+        else:
+            return self._forward_residual(
+                species, neighbor_species, edge_vectors, edge_distances,
+                padding_mask, reverse_neighbor_index, cutoff_factors, input_messages
+            )
+
+    def _forward_residual(self, species, neighbor_species, edge_vectors, edge_distances,
+                          padding_mask, reverse_neighbor_index, cutoff_factors, input_messages):
+        """Residual featurization: per-layer energy accumulation (pet-mad-s style)."""
         # Initialize atomic energies accumulator
         atomic_energies = species.new_zeros(self.n_atoms, dtype=torch.float32)
 
-        # Process through GNN layers
+        # Process through GNN layers with per-layer energy readout
         for gnn_idx, (node_embedder, gnn_layer) in enumerate(
             zip(self.node_embedders, self.gnn_layers)
         ):
@@ -259,17 +325,23 @@ class PETFullModel(torch.nn.Module):
             input_node_embeddings = node_embedder(species)
 
             # Run GNN layer
-            # When forces=True, use manual attention (supports backward pass)
-            # When forces=False, use flash attention (faster, no backward)
+            # Note: metatrain uses True=valid, False=padded convention
+            # Our wrapper uses True=padded, False=valid, so we invert here
             output_node, output_edge = gnn_layer(
                 input_node_embeddings,
                 input_messages,
                 neighbor_species,
                 edge_vectors,
-                padding_mask,
+                ~padding_mask,  # Invert for metatrain convention
                 edge_distances,
                 cutoff_factors,
                 use_manual_attention=self.forces
+            )
+            # Zero out padded edge positions (GNN may produce non-zero values)
+            output_edge = torch.where(
+                padding_mask.unsqueeze(-1),
+                torch.zeros_like(output_edge),
+                output_edge,
             )
 
             # Node energy readout
@@ -280,10 +352,11 @@ class PETFullModel(torch.nn.Module):
             edge_feat = self.edge_energy_heads[gnn_idx](output_edge)
             edge_e = self.edge_final_layers[gnn_idx](edge_feat)
             # Mask out padded edges and apply cutoff
+            # padding_mask: True=padded (invalid), False=valid
             edge_e_masked = torch.where(
                 padding_mask.unsqueeze(-1),
-                edge_e,
-                torch.zeros_like(edge_e)
+                torch.zeros_like(edge_e),  # Zero out padded edges
+                edge_e,                     # Keep valid edges
             )
             # Apply cutoff factors and sum over neighbors
             edge_e_sum = (edge_e_masked.squeeze(-1) * cutoff_factors).sum(dim=1)
@@ -291,15 +364,108 @@ class PETFullModel(torch.nn.Module):
             # Accumulate both node and edge contributions
             atomic_energies = atomic_energies + node_e.squeeze(-1) + edge_e_sum
 
-            # Message passing: prepare input for next layer
+            # Message passing: prepare input for next layer (simple average)
             flat_output = output_edge.reshape(
                 self.n_atoms * self.max_neighbors, self.d_pet
             )
             reversed_messages = flat_output[reverse_neighbor_index].reshape(
                 self.n_atoms, self.max_neighbors, self.d_pet
             )
+            # Zero out padded positions (reverse_idx for padded slots may point to valid edges)
+            reversed_messages = torch.where(
+                padding_mask.unsqueeze(-1),
+                torch.zeros_like(reversed_messages),
+                reversed_messages,
+            )
             input_messages = 0.5 * (input_messages + reversed_messages)
 
+        return atomic_energies
+
+    def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
+                             padding_mask, reverse_neighbor_index, cutoff_factors, input_messages):
+        """Feedforward featurization: combination_mlps between layers, final-only energy (pet-omad-s style)."""
+        # Single node embedder used for all layers
+        input_node_embeddings = self.node_embedders[0](species)
+
+        # Zero out padded positions in initial edge embeddings
+        input_messages = torch.where(
+            padding_mask.unsqueeze(-1),
+            torch.zeros_like(input_messages),
+            input_messages,
+        )
+
+        # Process through GNN layers with combination MLPs
+        for combination_norm, combination_mlp, gnn_layer in zip(
+            self.combination_norms, self.combination_mlps, self.gnn_layers
+        ):
+            # Note: metatrain uses True=valid, False=padded convention
+            output_node, output_edge = gnn_layer(
+                input_node_embeddings,
+                input_messages,
+                neighbor_species,
+                edge_vectors,
+                ~padding_mask,  # Invert for metatrain convention
+                edge_distances,
+                cutoff_factors,
+                use_manual_attention=self.forces
+            )
+            # Zero out padded edge positions (GNN may produce non-zero values)
+            output_edge = torch.where(
+                padding_mask.unsqueeze(-1),
+                torch.zeros_like(output_edge),
+                output_edge,
+            )
+
+            # Update node embeddings for next layer
+            input_node_embeddings = output_node
+
+            # Message passing with combination MLPs
+            # Reverse the edge messages
+            flat_output = output_edge.reshape(
+                self.n_atoms * self.max_neighbors, self.d_pet
+            )
+            new_input_messages = flat_output[reverse_neighbor_index].reshape(
+                self.n_atoms, self.max_neighbors, self.d_pet
+            )
+            # Zero out padded positions (reverse_idx for padded slots may point to valid edges)
+            new_input_messages = torch.where(
+                padding_mask.unsqueeze(-1),
+                torch.zeros_like(new_input_messages),
+                new_input_messages,
+            )
+
+            # Concatenate forward and reversed, apply norm + MLP
+            concatenated = torch.cat([output_edge, new_input_messages], dim=-1)
+            # Residual connection: input + output + combination_mlp(norm(concat))
+            # Zero out the update for padded positions (mlp(norm(zeros)) is non-zero due to bias)
+            update = output_edge + combination_mlp(combination_norm(concatenated))
+            update = torch.where(
+                padding_mask.unsqueeze(-1),
+                torch.zeros_like(update),
+                update,
+            )
+            input_messages = input_messages + update
+
+        # Energy readout from final features only (num_readout_layers=1)
+        # Node energy
+        node_feat = self.node_energy_heads[0](input_node_embeddings)
+        node_e = self.node_final_layers[0](node_feat)
+
+        # Edge energy
+        edge_feat = self.edge_energy_heads[0](input_messages)
+        edge_e = self.edge_final_layers[0](edge_feat)
+
+        # Mask out padded edges and apply cutoff
+        # padding_mask: True=padded (invalid), False=valid
+        edge_e_masked = torch.where(
+            padding_mask.unsqueeze(-1),
+            torch.zeros_like(edge_e),  # Zero out padded edges
+            edge_e,                     # Keep valid edges
+        )
+        edge_e_sum = (edge_e_masked.squeeze(-1) * cutoff_factors).sum(dim=1)
+
+        # Total atomic energies
+        atomic_energies = node_e.squeeze(-1) + edge_e_sum
         return atomic_energies
 
 
@@ -367,15 +533,24 @@ def export_pet_full(
     d_pet = params['d_pet']
     cutoff = params['cutoff']
     cutoff_width = params['cutoff_width']
+    cutoff_function = params['cutoff_function']
+    num_neighbors_adaptive = params['num_neighbors_adaptive']
+
+    featurizer_type = getattr(pet, 'featurizer_type', 'residual')
+    num_gnn_layers = len(pet.gnn_layers)
+    num_readout_layers = getattr(pet, 'num_readout_layers', num_gnn_layers)
 
     print(f"d_pet: {d_pet}, cutoff: {cutoff}, cutoff_width: {cutoff_width}")
+    print(f"cutoff_function: {cutoff_function}, num_neighbors_adaptive: {num_neighbors_adaptive}")
+    print(f"featurizer_type: {featurizer_type}, gnn_layers: {num_gnn_layers}, readout_layers: {num_readout_layers}")
     print(f"n_atoms: {n_atoms}, max_neighbors: {max_neighbors}")
     print(f"forces: {forces}")
 
     # Create wrapper using actual GNN layers
     wrapper = PETFullModel(
         pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
-        forces=forces, cutoff=cutoff, cutoff_width=cutoff_width
+        forces=forces, cutoff=cutoff, cutoff_width=cutoff_width,
+        cutoff_function=cutoff_function
     )
     wrapper.eval()
 
@@ -389,10 +564,12 @@ def export_pet_full(
 
     if forces:
         # Forces mode: edge_distances and cutoff_factors computed in-graph
+        # cutoff_values: per-pair cutoff radii (from adaptive cutoff or global)
+        cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
         example_inputs = (species, neighbor_species, edge_vectors,
-                         padding_mask, reverse_neighbor_index)
+                         padding_mask, reverse_neighbor_index, cutoff_values_input)
         input_names = ["species", "neighbor_species", "edge_vectors",
-                       "padding_mask", "reverse_neighbor_index"]
+                       "padding_mask", "reverse_neighbor_index", "cutoff_values"]
     else:
         # Forward-only mode: all inputs provided externally
         edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
@@ -465,9 +642,11 @@ def export_pet_full(
         # Save expected output
         expected_output.numpy().astype(np.float32).tofile(output_dir / "expected_output.bin")
 
-        # Get species mapping and composition energies
+        # Get species mapping, composition energies, and scale factor
         species_to_index = get_species_mapping(pet)
         composition_energies = get_composition_energies(pet)
+        energy_scale = get_energy_scale(pet)
+        print(f"Energy scale factor: {energy_scale}")
 
         # Save metadata
         metadata = {
@@ -479,10 +658,16 @@ def export_pet_full(
             "expected_total_energy": expected_output.sum().item(),
             "cutoff": float(cutoff),
             "cutoff_width": float(cutoff_width),
+            "cutoff_function": cutoff_function,
+            "num_neighbors_adaptive": float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else None,
             "forces": forces,
             "model_name": model_name,
+            "featurizer_type": featurizer_type,
+            "num_gnn_layers": num_gnn_layers,
+            "num_readout_layers": num_readout_layers,
             "species_to_index": species_to_index,
             "composition_energies": composition_energies,
+            "energy_scale": energy_scale,
             "weights": {name: list(t.shape) for name, t in weights.items()}
         }
         with open(output_dir / "metadata.json", "w") as f:

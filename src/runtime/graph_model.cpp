@@ -46,6 +46,17 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   GGUFLoader temp_loader(path, temp_ctx);
   int n_tensors = static_cast<int>(temp_loader.get_tensor_names().size());
 
+  // Validate format version
+  std::string version = temp_loader.get_string("general.version", "");
+  if (!version.empty()) {
+    // Check major version compatibility (we support 1.x.x)
+    if (version.size() >= 1 && version[0] != '1') {
+      throw std::runtime_error(
+          "GraphModel: unsupported GGUF format version '" + version +
+          "'. This build supports version 1.x.x.");
+    }
+  }
+
   // Get model hyperparameters
   cutoff_ = temp_loader.get_float32("pet.cutoff", 4.5f);
   cutoff_width_ = temp_loader.get_float32("pet.cutoff_width", 0.5f);
@@ -75,7 +86,13 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   // Load composition energies
   auto comp_keys = temp_loader.get_array_int32("pet.composition_keys");
   auto comp_vals = temp_loader.get_array_float32("pet.composition_values");
-  for (size_t i = 0; i < comp_keys.size() && i < comp_vals.size(); i++) {
+  if (comp_keys.size() != comp_vals.size()) {
+    throw std::runtime_error(
+        "GraphModel: composition_keys (" + std::to_string(comp_keys.size()) +
+        ") and composition_values (" + std::to_string(comp_vals.size()) +
+        ") arrays have different lengths");
+  }
+  for (size_t i = 0; i < comp_keys.size(); i++) {
     composition_energies_[comp_keys[i]] = comp_vals[i];
   }
 
@@ -252,9 +269,19 @@ void GraphModel::register_batch_inputs(ggml_context * /*ctx*/,
       tensor = batch.system_indices;
     }
 
-    if (tensor) {
-      interp_.set_input(mapping.graph_name, tensor);
+    if (!tensor) {
+      // Check if this is a required graph input (has a shape spec)
+      const auto *input_spec = interp_.graph().get_input(mapping.graph_name);
+      if (input_spec && !input_spec->shape.empty()) {
+        throw std::runtime_error(
+            "GraphModel: required graph input '" + mapping.graph_name +
+            "' (batch field '" + mapping.batch_field +
+            "') has no corresponding tensor in batch");
+      }
+      continue;
     }
+
+    interp_.set_input(mapping.graph_name, tensor);
   }
 }
 
@@ -306,7 +333,14 @@ void GraphModel::prepare_direct_inputs(ggml_context *ctx,
   for (int i = 0; i < n_atoms; i++) {
     int Z = atomic_numbers[i];
     auto it = species_to_index_.find(Z);
-    species_data[i] = (it != species_to_index_.end()) ? it->second : 0;
+    if (it == species_to_index_.end()) {
+      throw std::runtime_error(
+          "GraphModel: atomic number " + std::to_string(Z) +
+          " (atom " + std::to_string(i) +
+          ") is not in the model's species map. "
+          "The model does not support this element.");
+    }
+    species_data[i] = it->second;
   }
 
   // Neighbor species: [n_atoms, max_neighbors] int32
@@ -344,7 +378,14 @@ void GraphModel::prepare_direct_inputs(ggml_context *ctx,
     // Get neighbor species index
     int Z_j = atomic_numbers[j];
     auto it = species_to_index_.find(Z_j);
-    int species_idx = (it != species_to_index_.end()) ? it->second : 0;
+    if (it == species_to_index_.end()) {
+      throw std::runtime_error(
+          "GraphModel: atomic number " + std::to_string(Z_j) +
+          " (neighbor atom " + std::to_string(j) +
+          ") is not in the model's species map. "
+          "The model does not support this element.");
+    }
+    int species_idx = it->second;
 
     // Store neighbor species
     // Memory layout: [n_atoms, max_neighbors] in row-major = data[i * max_neighbors + slot]
