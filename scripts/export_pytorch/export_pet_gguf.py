@@ -24,7 +24,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from export_pytorch.fx_converter import export_torch_model, symbolize_dimensions
-from export_pytorch.export_pet_full import PETFullModel, get_pet_model
+from export_pytorch.export_pet_full import (
+    PETFullModel, load_pet_model, get_model_params,
+    get_species_mapping, get_composition_energies, get_energy_scale,
+)
 
 # GGUF format constants
 GGUF_MAGIC = 0x46554747  # "GGUF"
@@ -229,11 +232,19 @@ class GGUFWriter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export PET-MAD model to GGUF with computation graph"
+        description="Export PET model to GGUF with computation graph"
     )
     parser.add_argument(
         "--output", "-o", type=str, default="pet-auto.gguf",
         help="Output GGUF file path",
+    )
+    parser.add_argument(
+        "--model", type=str, default="pet-mad-1.0.2",
+        help="Model name: 'pet-mad-1.0.2' (legacy) or upet name like 'pet-mad-s'",
+    )
+    parser.add_argument(
+        "--forces", action="store_true",
+        help="Export with forces support (manual attention, in-graph distance/cutoff)",
     )
     parser.add_argument(
         "--n-atoms", type=int, default=7,
@@ -248,20 +259,28 @@ def main():
     n_atoms = args.n_atoms
     max_neighbors = args.max_neighbors
 
-    print("Loading PET-MAD model...")
-    pet = get_pet_model()
+    print(f"Loading PET model: {args.model}...")
+    pet = load_pet_model(args.model)
     pet.eval()
 
-    hypers = pet.hypers
-    d_pet = hypers['d_pet'] if isinstance(hypers, dict) else hypers.D_PET
-    cutoff = hypers.get('cutoff', 4.5) if isinstance(hypers, dict) else 4.5
-    cutoff_width = hypers.get('cutoff_width', 0.2) if isinstance(hypers, dict) else 0.2
+    params = get_model_params(pet)
+    d_pet = params['d_pet']
+    cutoff = params['cutoff']
+    cutoff_width = params['cutoff_width']
+    cutoff_function = params['cutoff_function']
+    num_neighbors_adaptive = params['num_neighbors_adaptive']
 
     print(f"  d_pet={d_pet}, cutoff={cutoff}, cutoff_width={cutoff_width}")
+    print(f"  cutoff_function={cutoff_function}, num_neighbors_adaptive={num_neighbors_adaptive}")
     print(f"  Export dimensions: n_atoms={n_atoms}, max_neighbors={max_neighbors}")
+    print(f"  Forces mode: {args.forces}")
 
     # Create wrapper with full computation path
-    wrapper = PETFullModel(pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet)
+    wrapper = PETFullModel(
+        pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
+        forces=args.forces, cutoff=cutoff, cutoff_width=cutoff_width,
+        cutoff_function=cutoff_function,
+    )
     wrapper.eval()
 
     # Create test inputs for tracing
@@ -269,21 +288,29 @@ def main():
     species = torch.zeros(n_atoms, dtype=torch.long)
     neighbor_species = torch.zeros(n_atoms, max_neighbors, dtype=torch.long)
     edge_vectors = torch.randn(n_atoms, max_neighbors, 3)
-    edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
     padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
-    cutoff_factors = torch.ones(n_atoms, max_neighbors)
     reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
 
-    example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
-                      padding_mask, reverse_neighbor_index, cutoff_factors)
+    if args.forces:
+        cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
+        example_inputs = (species, neighbor_species, edge_vectors,
+                         padding_mask, reverse_neighbor_index, cutoff_values_input)
+        input_names = ["species", "neighbor_species", "edge_vectors",
+                       "padding_mask", "reverse_neighbor_index", "cutoff_values"]
+    else:
+        edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
+        cutoff_factors = torch.ones(n_atoms, max_neighbors)
+        example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
+                         padding_mask, reverse_neighbor_index, cutoff_factors)
+        input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
+                       "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
 
     # Export via torch.export
     print("\nExporting graph via torch.export...")
     graph, weights = export_torch_model(
         wrapper, example_inputs,
-        output_path=None,  # Don't save JSON yet
-        input_names=["species", "neighbor_species", "edge_vectors", "edge_distances",
-                      "padding_mask", "reverse_neighbor_index", "cutoff_factors"],
+        output_path=None,
+        input_names=input_names,
         input_dtypes={
             "species": "i32",
             "neighbor_species": "i32",
@@ -308,45 +335,46 @@ def main():
     graph_json = json.dumps(graph.to_dict())
     print(f"  Symbolized graph: {len(graph_json)} bytes")
 
-    # Get species mapping and composition energies
-    species_keys = []
-    species_indices = []
-    for Z in range(1, 86):
-        species_keys.append(Z)
-        species_indices.append(Z - 1)
+    # Get species mapping, composition energies, and energy scale
+    species_to_index = get_species_mapping(pet)
+    composition_energies = get_composition_energies(pet)
+    energy_scale = get_energy_scale(pet)
 
-    composition_keys = []
-    composition_values = []
-    if hasattr(pet, 'additive_models') and len(pet.additive_models) > 0:
-        comp_model = pet.additive_models[0]
-        if hasattr(comp_model, 'model'):
-            inner = comp_model.model
-            if hasattr(inner, 'weights') and 'energy' in inner.weights:
-                energy_weights = inner.weights['energy']
-                block = energy_weights.block(0)
-                t2i = inner.type_to_index
-                for Z in range(1, 86):
-                    idx = t2i[Z].item()
-                    if idx >= 0 and idx < block.values.shape[0]:
-                        composition_keys.append(Z)
-                        composition_values.append(float(block.values[idx, 0].item()))
+    print(f"  Species mapped: {len(species_to_index)}")
+    print(f"  Composition energies: {len(composition_energies)}")
+    print(f"  Energy scale: {energy_scale}")
+    if energy_scale == 1.0:
+        print("  Warning: energy_scale is 1.0 - verify this is correct for your model")
+
+    # Validate composition energies
+    composition_keys = list(composition_energies.keys())
+    composition_values = list(composition_energies.values())
+    assert len(composition_keys) == len(composition_values), \
+        f"Composition keys ({len(composition_keys)}) and values ({len(composition_values)}) mismatch"
 
     # Write GGUF
     print(f"\nWriting GGUF to {args.output}...")
     writer = GGUFWriter()
 
-    # Metadata
+    # General metadata
     writer.add_string("general.architecture", "pet-graph")
-    writer.add_string("general.name", "PET-MAD")
+    writer.add_string("general.name", args.model)
     writer.add_string("general.version", "1.0.2")
+
+    # Model hyperparameters
     writer.add_float32("pet.cutoff", cutoff)
     writer.add_float32("pet.cutoff_width", cutoff_width)
     writer.add_int32("pet.d_pet", d_pet)
+    writer.add_float32("pet.energy_scale", energy_scale)
+    writer.add_string("pet.cutoff_function", cutoff_function)
+    writer.add_int32("pet.forces_mode", 1 if args.forces else 0)
+    writer.add_float32("pet.num_neighbors_adaptive",
+                       float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else 0.0)
 
     # Species mapping: pairs of [Z, index, Z, index, ...]
     species_map = []
-    for k, v in zip(species_keys, species_indices):
-        species_map.extend([k, v])
+    for Z, idx in sorted(species_to_index.items()):
+        species_map.extend([Z, idx])
     writer.add_array_int32("pet.species_map", species_map)
 
     # Composition energies

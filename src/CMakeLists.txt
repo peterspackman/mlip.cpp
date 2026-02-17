@@ -71,6 +71,7 @@ target_include_directories(mlipcpp
 target_link_libraries(mlipcpp
     PRIVATE
         ggml
+        nlohmann_json::nlohmann_json
         $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:fmt::fmt>
 )
 

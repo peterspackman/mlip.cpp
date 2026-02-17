@@ -1,25 +1,48 @@
 #include "graph_model.h"
-#include "core/ggml_utils.h"
 #include "core/gguf_loader.h"
-#include "models/pet/pet_batch.h"
-#include "models/pet/pet_types.h"
+
+#include <nlohmann/json.hpp>
 
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
 #include <ggml.h>
-#include <gguf.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
-#include <fstream>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
+#include <vector>
+
+using json = nlohmann::json;
 
 namespace mlipcpp::runtime {
 
-// Context sizes for batch preparation and graph computation
-static constexpr size_t BATCH_CONTEXT_SIZE = 128 * 1024 * 1024;  // 128 MB
-static constexpr size_t COMPUTE_CONTEXT_SIZE = 512 * 1024 * 1024; // 512 MB
+namespace {
+
+// Bump cutoff function
+float cutoff_func_bump(float distance, float cutoff, float width) {
+  float x = (distance - (cutoff - width)) / width;
+  if (x <= 0.0f) return 1.0f;
+  if (x >= 1.0f) return 0.0f;
+  float tan_val = std::tan(static_cast<float>(M_PI) * x);
+  return 0.5f * (1.0f + std::tanh(1.0f / tan_val));
+}
+
+// Cosine cutoff function
+float cutoff_func_cosine(float distance, float cutoff, float width) {
+  float x = (distance - (cutoff - width)) / width;
+  if (x <= 0.0f) return 1.0f;
+  if (x >= 1.0f) return 0.0f;
+  return 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * x));
+}
+
+} // namespace
+
+// Context sizes
+static constexpr size_t INPUT_CTX_SIZE = 16 * 1024 * 1024;   // 16 MB
+static constexpr size_t COMPUTE_CTX_SIZE = 512 * 1024 * 1024; // 512 MB
 
 GraphModel::GraphModel()
     : neighbor_builder_(NeighborListOptions{cutoff_, true, false}) {}
@@ -31,66 +54,55 @@ GraphModel::~GraphModel() {
   if (ctx_weights_) {
     ggml_free(ctx_weights_);
   }
+  if (cpu_backend_) {
+    ggml_backend_free(cpu_backend_);
+  }
 }
 
 bool GraphModel::load_from_gguf(const std::string &path) {
-  constexpr size_t TEMP_CONTEXT_SIZE = 512 * 1024 * 1024;  // 512 MB for temp loading
+  constexpr size_t TEMP_CTX_SIZE = 512 * 1024 * 1024;
 
-  // Step 1: Create temporary context with no_alloc=false to load data
-  ggml_context *temp_ctx = ggml_init({TEMP_CONTEXT_SIZE, nullptr, false});
+  // Create temporary context with data allocation
+  ggml_context *temp_ctx = ggml_init({TEMP_CTX_SIZE, nullptr, false});
   if (!temp_ctx) {
     throw std::runtime_error("Failed to create temporary context for loading");
   }
 
-  // Load GGUF file into temp context
-  GGUFLoader temp_loader(path, temp_ctx);
-  int n_tensors = static_cast<int>(temp_loader.get_tensor_names().size());
+  GGUFLoader loader(path, temp_ctx);
+  int n_tensors = static_cast<int>(loader.get_tensor_names().size());
 
-  // Validate format version
-  std::string version = temp_loader.get_string("general.version", "");
-  if (!version.empty()) {
-    // Check major version compatibility (we support 1.x.x)
-    if (version.size() >= 1 && version[0] != '1') {
-      throw std::runtime_error(
-          "GraphModel: unsupported GGUF format version '" + version +
-          "'. This build supports version 1.x.x.");
-    }
-  }
+  // Read model hyperparameters
+  cutoff_ = loader.get_float32("pet.cutoff", 4.5f);
+  cutoff_width_ = loader.get_float32("pet.cutoff_width", 0.2f);
+  energy_scale_ = loader.get_float32("pet.energy_scale", 1.0f);
+  cutoff_function_ = loader.get_string("pet.cutoff_function", "cosine");
+  forces_mode_ = (loader.get_int32("pet.forces_mode", 0) != 0);
+  num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
 
-  // Get model hyperparameters
-  cutoff_ = temp_loader.get_float32("pet.cutoff", 4.5f);
-  cutoff_width_ = temp_loader.get_float32("pet.cutoff_width", 0.5f);
-
-  // Update neighbor list builder
+  // Update neighbor list builder with loaded cutoff
   neighbor_builder_ = NeighborListBuilder(NeighborListOptions{cutoff_, true, false});
 
-  // Load graph JSON from metadata
-  std::string graph_json = temp_loader.get_string("graph.json", "");
-
+  // Load graph JSON
+  std::string graph_json = loader.get_string("graph.json", "");
   if (graph_json.empty()) {
     ggml_free(temp_ctx);
     throw std::runtime_error("No graph.json found in GGUF file");
   }
-
-  // Parse the graph
   interp_.load_graph(graph_json);
 
   // Load species mapping
-  auto species_map = temp_loader.get_array_int32("pet.species_map");
-  for (size_t i = 0; i < species_map.size(); i += 2) {
-    if (i + 1 < species_map.size()) {
-      species_to_index_[species_map[i]] = species_map[i + 1];
-    }
+  auto species_map = loader.get_array_int32("pet.species_map");
+  for (size_t i = 0; i + 1 < species_map.size(); i += 2) {
+    species_to_index_[species_map[i]] = species_map[i + 1];
   }
 
   // Load composition energies
-  auto comp_keys = temp_loader.get_array_int32("pet.composition_keys");
-  auto comp_vals = temp_loader.get_array_float32("pet.composition_values");
+  auto comp_keys = loader.get_array_int32("pet.composition_keys");
+  auto comp_vals = loader.get_array_float32("pet.composition_values");
   if (comp_keys.size() != comp_vals.size()) {
+    ggml_free(temp_ctx);
     throw std::runtime_error(
-        "GraphModel: composition_keys (" + std::to_string(comp_keys.size()) +
-        ") and composition_values (" + std::to_string(comp_vals.size()) +
-        ") arrays have different lengths");
+        "GraphModel: composition_keys and composition_values mismatch");
   }
   for (size_t i = 0; i < comp_keys.size(); i++) {
     composition_energies_[comp_keys[i]] = comp_vals[i];
@@ -99,454 +111,467 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   // Create backend
   backend_provider_ = BackendProvider::create(backend_preference_);
 
-  // Step 2: Create weight context with no_alloc=true (metadata only)
+  // Load weight shapes from metadata (PyTorch shapes, need reversal for GGML)
+  std::string shapes_json = loader.get_string("graph.weight_shapes", "");
+  json weight_shapes;
+  if (!shapes_json.empty()) {
+    weight_shapes = json::parse(shapes_json);
+  }
+
+  // Create weight context (metadata only, no data allocation)
   size_t ctx_size = ggml_tensor_overhead() * static_cast<size_t>(n_tensors);
-  ctx_weights_ = ggml_init({ctx_size, nullptr, true});  // no_alloc=true
+  ctx_weights_ = ggml_init({ctx_size, nullptr, true});
   if (!ctx_weights_) {
     ggml_free(temp_ctx);
-    throw std::runtime_error("Failed to create GGML weight context");
+    throw std::runtime_error("Failed to create weight context");
   }
 
-  // Step 3: Create tensors (metadata only, tensor->data will be NULL)
-  for (const auto &tensor_name : temp_loader.get_tensor_names()) {
-    ggml_tensor *temp_tensor = temp_loader.get_tensor(tensor_name);
-    if (!temp_tensor) continue;
+  // Create weight tensors with correct GGML shapes (reversed PyTorch dims)
+  for (const auto &name : loader.get_tensor_names()) {
+    ggml_tensor *temp = loader.get_tensor(name);
+    if (!temp) continue;
 
-    // Create metadata-only tensor in weight context
-    ggml_tensor *tensor = ggml_new_tensor(
-        ctx_weights_, temp_tensor->type,
-        ggml_n_dims(temp_tensor), temp_tensor->ne);
-    ggml_set_name(tensor, tensor_name.c_str());
+    ggml_tensor *t = nullptr;
+    if (weight_shapes.contains(name)) {
+      // Use PyTorch shape from metadata, reversed for GGML convention
+      auto py_shape = weight_shapes[name].get<std::vector<int64_t>>();
+      std::vector<int64_t> ggml_shape(py_shape.rbegin(), py_shape.rend());
+      switch (ggml_shape.size()) {
+      case 0:
+        t = ggml_new_tensor_1d(ctx_weights_, GGML_TYPE_F32, 1);
+        break;
+      case 1:
+        t = ggml_new_tensor_1d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0]);
+        break;
+      case 2:
+        t = ggml_new_tensor_2d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0],
+                               ggml_shape[1]);
+        break;
+      case 3:
+        t = ggml_new_tensor_3d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0],
+                               ggml_shape[1], ggml_shape[2]);
+        break;
+      default:
+        continue;
+      }
+    } else {
+      // Fallback: use GGUF stored shape directly
+      t = ggml_new_tensor(
+          ctx_weights_, temp->type, ggml_n_dims(temp), temp->ne);
+    }
+
+    ggml_set_name(t, name.c_str());
   }
 
-  // Step 4: Allocate backend buffer for all weight tensors
+  // Allocate backend buffer for weights
   ggml_backend_buffer_type_t buft = backend_provider_->buffer_type();
   weight_buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights_, buft);
   if (!weight_buffer_) {
     ggml_free(temp_ctx);
-    throw std::runtime_error("Failed to allocate backend buffer for weights");
+    throw std::runtime_error("Failed to allocate weight buffer");
   }
-
-  // Mark as weights buffer for scheduler
   ggml_backend_buffer_set_usage(weight_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-  // Step 5: Copy weight data from temporary context to backend buffer
-  for (const auto &tensor_name : temp_loader.get_tensor_names()) {
-    ggml_tensor *temp_tensor = temp_loader.get_tensor(tensor_name);
-    ggml_tensor *weight_tensor = ggml_get_tensor(ctx_weights_, tensor_name.c_str());
-
-    if (temp_tensor && weight_tensor) {
-      // Copy data from temp context to backend buffer
-      ggml_backend_tensor_set(weight_tensor, temp_tensor->data, 0,
-                              ggml_nbytes(weight_tensor));
-      // Register weight with interpreter
-      interp_.set_weight(tensor_name, weight_tensor);
+  // Copy weight data and register with interpreter
+  for (const auto &name : loader.get_tensor_names()) {
+    ggml_tensor *temp = loader.get_tensor(name);
+    ggml_tensor *weight = ggml_get_tensor(ctx_weights_, name.c_str());
+    if (temp && weight) {
+      ggml_backend_tensor_set(weight, temp->data, 0, ggml_nbytes(weight));
+      interp_.set_weight(name, weight);
     }
   }
 
-  // Free temporary context
   ggml_free(temp_ctx);
 
-  // Build input mappings
-  build_input_mappings();
+  // Initialize CPU backend (cached for lifetime of model)
+  cpu_backend_ = ggml_backend_cpu_init();
+  if (!cpu_backend_) {
+    throw std::runtime_error("Failed to create CPU backend");
+  }
 
   return true;
 }
 
 void GraphModel::load_graph_file(const std::string &path) {
   interp_.load_graph_file(path);
-  build_input_mappings();
 }
 
 void GraphModel::set_weight(const std::string &name, ggml_tensor *tensor) {
   interp_.set_weight(name, tensor);
 }
 
-void GraphModel::build_input_mappings() {
-  // Map graph input names to BatchedInput tensor field names
-  // This is based on the expected export format from export_pet_gguf.py
-  input_mappings_.clear();
-
-  const auto &graph = interp_.graph();
-
-  // Check if this is a direct-format graph (has species, neighbor_species, edge_vectors, edge_distances)
-  bool has_neighbor_species = false;
-  bool has_edge_vectors = false;
-  for (const auto &input : graph.inputs) {
-    if (input.name == "neighbor_species") has_neighbor_species = true;
-    if (input.name == "edge_vectors") has_edge_vectors = true;
-  }
-  uses_direct_inputs_ = has_neighbor_species && has_edge_vectors;
-
-  for (const auto &input : graph.inputs) {
-    InputMapping mapping;
-    mapping.graph_name = input.name;
-
-    if (uses_direct_inputs_) {
-      // Direct format: inputs match graph input names exactly
-      mapping.batch_field = input.name;
-    } else {
-      // NEF format: map to BatchedInput field names
-      if (input.name == "tokens" || input.name == "input_messages") {
-        mapping.batch_field = "tokens";
-      } else if (input.name == "positions") {
-        mapping.batch_field = "positions";
-      } else if (input.name == "species") {
-        mapping.batch_field = "species";
-      } else if (input.name == "edge_vectors_nef") {
-        mapping.batch_field = "edge_vectors_nef";
-      } else if (input.name == "edge_distances_nef") {
-        mapping.batch_field = "edge_distances_nef";
-      } else if (input.name == "cutoff_factors" ||
-                 input.name == "cutoff_factors_nef") {
-        mapping.batch_field = "cutoff_factors_nef";
-      } else if (input.name == "neighbor_species_nef") {
-        mapping.batch_field = "neighbor_species_nef";
-      } else if (input.name == "padding_mask_nef") {
-        mapping.batch_field = "padding_mask_nef";
-      } else if (input.name == "attn_mask" || input.name == "attention_mask") {
-        mapping.batch_field = "attn_mask_layer0";
-      } else {
-        mapping.batch_field = input.name;
-      }
-    }
-
-    input_mappings_.push_back(mapping);
-  }
-
-  // Detect dimensions from graph
-  detect_dimensions_from_graph();
+ModelResult GraphModel::predict(const AtomicSystem &system) {
+  return predict_single(system, false);
 }
 
-void GraphModel::detect_dimensions_from_graph() {
-  // Extract expected dimensions from graph input shapes
-  const auto &graph = interp_.graph();
-
-  for (const auto &input : graph.inputs) {
-    if (input.name == "species" && !input.shape.empty()) {
-      // species shape is [n_atoms]
-      expected_n_atoms_ = static_cast<int>(input.shape[0]);
-    } else if (input.name == "neighbor_species" && input.shape.size() >= 2) {
-      // neighbor_species shape is [n_atoms, max_neighbors]
-      expected_n_atoms_ = static_cast<int>(input.shape[0]);
-      expected_max_neighbors_ = static_cast<int>(input.shape[1]);
-    } else if (input.name == "edge_vectors" && input.shape.size() >= 2) {
-      // edge_vectors shape is [n_atoms, max_neighbors, 3]
-      expected_n_atoms_ = static_cast<int>(input.shape[0]);
-      expected_max_neighbors_ = static_cast<int>(input.shape[1]);
-    }
-  }
+ModelResult GraphModel::predict(const AtomicSystem &system,
+                                bool compute_forces) {
+  return predict_single(system, compute_forces);
 }
 
-void GraphModel::register_batch_inputs(ggml_context * /*ctx*/,
-                                       const pet::BatchedInput &batch) {
-  // Register each graph input with the corresponding batch tensor
-  for (const auto &mapping : input_mappings_) {
-    ggml_tensor *tensor = nullptr;
-
-    // Get the tensor from BatchedInput based on field name
-    if (mapping.batch_field == "positions") {
-      tensor = batch.positions;
-    } else if (mapping.batch_field == "species") {
-      tensor = batch.species;
-    } else if (mapping.batch_field == "edge_vectors_nef") {
-      tensor = batch.edge_vectors_nef;
-    } else if (mapping.batch_field == "edge_distances_nef") {
-      tensor = batch.edge_distances_nef;
-    } else if (mapping.batch_field == "cutoff_factors_nef") {
-      tensor = batch.cutoff_factors_nef;
-    } else if (mapping.batch_field == "neighbor_species_nef") {
-      tensor = batch.neighbor_species_nef;
-    } else if (mapping.batch_field == "padding_mask_nef") {
-      tensor = batch.padding_mask_nef;
-    } else if (mapping.batch_field == "attn_mask_layer0") {
-      tensor = batch.attn_mask_layer0;
-    } else if (mapping.batch_field == "attn_mask_layer1") {
-      tensor = batch.attn_mask_layer1;
-    } else if (mapping.batch_field == "neighbor_indices_nef") {
-      tensor = batch.neighbor_indices_nef;
-    } else if (mapping.batch_field == "system_indices") {
-      tensor = batch.system_indices;
-    }
-
-    if (!tensor) {
-      // Check if this is a required graph input (has a shape spec)
-      const auto *input_spec = interp_.graph().get_input(mapping.graph_name);
-      if (input_spec && !input_spec->shape.empty()) {
-        throw std::runtime_error(
-            "GraphModel: required graph input '" + mapping.graph_name +
-            "' (batch field '" + mapping.batch_field +
-            "') has no corresponding tensor in batch");
-      }
-      continue;
-    }
-
-    interp_.set_input(mapping.graph_name, tensor);
+ModelResult GraphModel::predict_single(const AtomicSystem &system,
+                                       bool compute_forces) {
+  if (compute_forces && !forces_mode_) {
+    throw std::runtime_error(
+        "GraphModel: forces requested but model was not exported with "
+        "--forces mode. Re-export with --forces.");
   }
-}
-
-void GraphModel::prepare_direct_inputs(ggml_context *ctx,
-                                       const AtomicSystem &system,
-                                       const NeighborList &nlist) {
-  // Prepare inputs in PyTorch format for direct-format exported graphs
-  // Format: species[n_atoms], neighbor_species[n_atoms, max_neighbors],
-  //         edge_vectors[n_atoms, max_neighbors, 3], edge_distances[n_atoms, max_neighbors]
 
   const int n_atoms = static_cast<int>(system.num_atoms());
-  const int max_neighbors = expected_max_neighbors_;
+  const int32_t *atomic_numbers = system.atomic_numbers();
 
-  if (n_atoms != expected_n_atoms_) {
-    std::ostringstream msg;
-    msg << "GraphModel: system has " << n_atoms << " atoms but graph expects "
-        << expected_n_atoms_ << " atoms. Re-export graph with matching dimensions.";
-    throw std::runtime_error(msg.str());
-  }
+  // Build neighbor list
+  NeighborList nlist = neighbor_builder_.build(system);
 
-  // Count neighbors per atom from flat neighbor list
+  // Count max neighbors
   std::vector<int> neighbor_counts(n_atoms, 0);
   for (int e = 0; e < nlist.num_pairs(); e++) {
-    int i = nlist.centers[e];
-    neighbor_counts[i]++;
+    neighbor_counts[nlist.centers[e]]++;
   }
-
-  // Check max neighbors
-  int actual_max_neighbors = 0;
+  int max_neighbors = 0;
   for (int i = 0; i < n_atoms; i++) {
-    actual_max_neighbors = std::max(actual_max_neighbors, neighbor_counts[i]);
-  }
-  if (actual_max_neighbors > max_neighbors) {
-    std::ostringstream msg;
-    msg << "GraphModel: system has " << actual_max_neighbors
-        << " max neighbors but graph expects " << max_neighbors
-        << ". Re-export graph with larger max_neighbors.";
-    throw std::runtime_error(msg.str());
+    max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
   }
 
-  // Create tensors in PyTorch format (will be converted by interpreter)
-  // Note: We create with no_alloc=false context, so data is allocated inline
+  // Per-pair cutoff distances (for bump cutoff computation)
+  std::vector<float> pair_cutoffs(nlist.num_pairs(), cutoff_);
 
-  // Species: [n_atoms] int32
-  ggml_tensor *species = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_atoms);
-  ggml_set_name(species, "species");
-  auto *species_data = static_cast<int32_t *>(species->data);
-  const int32_t *atomic_numbers = system.atomic_numbers();
+  // Set symbolic dimensions for this system
+  interp_.set_dimension("n_atoms", n_atoms);
+  interp_.set_dimension("max_neighbors", max_neighbors);
+  interp_.set_dimension("n_edges", n_atoms * max_neighbors);
+  interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+
+  const int total_slots = n_atoms * max_neighbors;
+
+  // --- Create input context ---
+  ggml_context *input_ctx = ggml_init({INPUT_CTX_SIZE, nullptr, true});
+  if (!input_ctx) {
+    throw std::runtime_error("Failed to create input context");
+  }
+
+  // Create input tensors
+  ggml_tensor *species_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+  ggml_set_name(species_t, "species");
+
+  ggml_tensor *neighbor_species_t =
+      ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, max_neighbors, n_atoms);
+  ggml_set_name(neighbor_species_t, "neighbor_species");
+
+  ggml_tensor *edge_vectors_t =
+      ggml_new_tensor_3d(input_ctx, GGML_TYPE_F32, 3, max_neighbors, n_atoms);
+  ggml_set_name(edge_vectors_t, "edge_vectors");
+
+  ggml_tensor *padding_mask_t =
+      ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+  ggml_set_name(padding_mask_t, "padding_mask");
+
+  ggml_tensor *reverse_neighbor_index_t =
+      ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, total_slots);
+  ggml_set_name(reverse_neighbor_index_t, "reverse_neighbor_index");
+
+  // Mode-specific inputs
+  ggml_tensor *edge_distances_t = nullptr;
+  ggml_tensor *cutoff_factors_t = nullptr;
+  ggml_tensor *cutoff_values_t = nullptr;
+
+  if (!forces_mode_) {
+    edge_distances_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(edge_distances_t, "edge_distances");
+
+    cutoff_factors_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(cutoff_factors_t, "cutoff_factors");
+  } else {
+    cutoff_values_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(cutoff_values_t, "cutoff_values");
+  }
+
+  // Mark edge_vectors as parameter for gradient computation
+  if (compute_forces) {
+    ggml_set_param(edge_vectors_t);
+  }
+
+  // Allocate input buffer
+  ggml_backend_buffer_t input_buffer =
+      ggml_backend_alloc_ctx_tensors(input_ctx, cpu_backend_);
+  if (!input_buffer) {
+    ggml_free(input_ctx);
+    throw std::runtime_error("Failed to allocate input buffer");
+  }
+
+  // --- Pack neighbor list data ---
+  std::vector<int32_t> species_data(n_atoms);
   for (int i = 0; i < n_atoms; i++) {
-    int Z = atomic_numbers[i];
-    auto it = species_to_index_.find(Z);
+    auto it = species_to_index_.find(atomic_numbers[i]);
     if (it == species_to_index_.end()) {
+      ggml_backend_buffer_free(input_buffer);
+      ggml_free(input_ctx);
       throw std::runtime_error(
-          "GraphModel: atomic number " + std::to_string(Z) +
-          " (atom " + std::to_string(i) +
-          ") is not in the model's species map. "
-          "The model does not support this element.");
+          "Atomic number " + std::to_string(atomic_numbers[i]) +
+          " not in species map");
     }
     species_data[i] = it->second;
   }
 
-  // Neighbor species: [n_atoms, max_neighbors] int32
-  ggml_tensor *neighbor_species =
-      ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_neighbors, n_atoms);
-  ggml_set_name(neighbor_species, "neighbor_species");
-  auto *ns_data = static_cast<int32_t *>(neighbor_species->data);
-  std::fill(ns_data, ns_data + n_atoms * max_neighbors, 0);
+  std::vector<int32_t> ns_data(total_slots, 0);
+  std::vector<float> ev_data(total_slots * 3, 0.0f);
+  std::vector<float> ed_data(total_slots, 0.0f);
+  std::vector<float> pm_data(total_slots, 1.0f);  // 1.0 = padded
+  std::vector<float> cf_data(total_slots, 0.0f);
+  std::vector<float> cv_data(total_slots, cutoff_);
+  std::vector<int32_t> rni_data(total_slots, 0);
+  std::vector<int> neighbor_atoms_vec(total_slots, -1);
 
-  // Edge vectors: [n_atoms, max_neighbors, 3] float32
-  ggml_tensor *edge_vectors =
-      ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, max_neighbors, n_atoms);
-  ggml_set_name(edge_vectors, "edge_vectors");
-  auto *ev_data = static_cast<float *>(edge_vectors->data);
-  std::fill(ev_data, ev_data + n_atoms * max_neighbors * 3, 0.0f);
-
-  // Edge distances: [n_atoms, max_neighbors] float32
-  ggml_tensor *edge_distances =
-      ggml_new_tensor_2d(ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-  ggml_set_name(edge_distances, "edge_distances");
-  auto *ed_data = static_cast<float *>(edge_distances->data);
-  std::fill(ed_data, ed_data + n_atoms * max_neighbors, 0.0f);
-
-  // Track slot indices for each atom
+  // Build edge mapping
+  using EdgeKey = std::tuple<int, int, int, int, int>;
+  std::map<EdgeKey, int> edge_to_flat_idx;
   std::vector<int> slot_indices(n_atoms, 0);
+  bool has_cell_shifts = !nlist.cell_shifts.empty();
 
-  // Fill neighbor data from flat neighbor list
   for (int e = 0; e < nlist.num_pairs(); e++) {
-    int i = nlist.centers[e];      // center atom
-    int j = nlist.neighbors[e];    // neighbor atom
-    int slot = slot_indices[i]++;  // current slot for this center atom
+    int i = nlist.centers[e];
+    int j = nlist.neighbors[e];
+    int slot = slot_indices[i]++;
+    if (slot >= max_neighbors) continue;
 
-    if (slot >= max_neighbors) continue;  // shouldn't happen if check above passed
+    int flat_idx = i * max_neighbors + slot;
 
-    // Get neighbor species index
-    int Z_j = atomic_numbers[j];
-    auto it = species_to_index_.find(Z_j);
-    if (it == species_to_index_.end()) {
-      throw std::runtime_error(
-          "GraphModel: atomic number " + std::to_string(Z_j) +
-          " (neighbor atom " + std::to_string(j) +
-          ") is not in the model's species map. "
-          "The model does not support this element.");
+    int sa = 0, sb = 0, sc = 0;
+    if (has_cell_shifts) {
+      sa = nlist.cell_shifts[e][0];
+      sb = nlist.cell_shifts[e][1];
+      sc = nlist.cell_shifts[e][2];
     }
-    int species_idx = it->second;
+    edge_to_flat_idx[{i, j, sa, sb, sc}] = flat_idx;
 
-    // Store neighbor species
-    // Memory layout: [n_atoms, max_neighbors] in row-major = data[i * max_neighbors + slot]
-    ns_data[i * max_neighbors + slot] = species_idx;
+    auto it = species_to_index_.find(atomic_numbers[j]);
+    if (it == species_to_index_.end()) {
+      ggml_backend_buffer_free(input_buffer);
+      ggml_free(input_ctx);
+      throw std::runtime_error(
+          "Atomic number " + std::to_string(atomic_numbers[j]) +
+          " not in species map");
+    }
+    ns_data[flat_idx] = it->second;
 
-    // Get edge vector (already computed in neighbor list)
     const auto &ev = nlist.edge_vectors[e];
-
-    // Store edge vector
-    // Memory layout: [n_atoms, max_neighbors, 3] in row-major
     int ev_idx = i * (max_neighbors * 3) + slot * 3;
     ev_data[ev_idx + 0] = ev[0];
     ev_data[ev_idx + 1] = ev[1];
     ev_data[ev_idx + 2] = ev[2];
 
-    // Store edge distance
-    ed_data[i * max_neighbors + slot] = nlist.distances[e];
+    ed_data[flat_idx] = nlist.distances[e];
+    pm_data[flat_idx] = 0.0f;  // valid edge
+    neighbor_atoms_vec[flat_idx] = j;
+
+    float r = nlist.distances[e];
+    float pc = pair_cutoffs[e];
+    cv_data[flat_idx] = pc;
+    if (cutoff_function_ == "bump") {
+      cf_data[flat_idx] = cutoff_func_bump(r, pc, cutoff_width_);
+    } else {
+      cf_data[flat_idx] = cutoff_func_cosine(r, pc, cutoff_width_);
+    }
   }
 
-  // Register inputs with interpreter
-  interp_.set_input("species", species);
-  interp_.set_input("neighbor_species", neighbor_species);
-  interp_.set_input("edge_vectors", edge_vectors);
-  interp_.set_input("edge_distances", edge_distances);
-}
-
-ModelResult GraphModel::predict(const AtomicSystem &system) {
-  return predict(system, false);
-}
-
-ModelResult GraphModel::predict(const AtomicSystem &system,
-                                bool compute_forces) {
-  auto results = predict_batch({system}, compute_forces);
-  return results.empty() ? ModelResult{} : results[0];
-}
-
-std::vector<ModelResult>
-GraphModel::predict_batch(const std::vector<AtomicSystem> &systems,
-                          bool compute_forces) {
-  if (systems.empty()) {
-    return {};
+  // Build reverse neighbor index
+  for (int e = 0; e < nlist.num_pairs(); e++) {
+    int i = nlist.centers[e];
+    int j = nlist.neighbors[e];
+    int sa = 0, sb = 0, sc = 0;
+    if (has_cell_shifts) {
+      sa = nlist.cell_shifts[e][0];
+      sb = nlist.cell_shifts[e][1];
+      sc = nlist.cell_shifts[e][2];
+    }
+    auto it_ij = edge_to_flat_idx.find({i, j, sa, sb, sc});
+    if (it_ij == edge_to_flat_idx.end()) continue;
+    auto it_ji = edge_to_flat_idx.find({j, i, -sa, -sb, -sc});
+    if (it_ji != edge_to_flat_idx.end()) {
+      rni_data[it_ij->second] = it_ji->second;
+    }
   }
 
-  // Currently force computation not supported via graph interpreter
-  if (compute_forces) {
-    throw std::runtime_error(
-        "Force computation not yet supported in GraphModel");
-  }
+  // Copy data to tensors
+  ggml_backend_tensor_set(species_t, species_data.data(), 0,
+                          species_data.size() * sizeof(int32_t));
+  ggml_backend_tensor_set(neighbor_species_t, ns_data.data(), 0,
+                          ns_data.size() * sizeof(int32_t));
+  ggml_backend_tensor_set(edge_vectors_t, ev_data.data(), 0,
+                          ev_data.size() * sizeof(float));
+  ggml_backend_tensor_set(padding_mask_t, pm_data.data(), 0,
+                          pm_data.size() * sizeof(float));
+  ggml_backend_tensor_set(reverse_neighbor_index_t, rni_data.data(), 0,
+                          rni_data.size() * sizeof(int32_t));
 
-  // For direct-input graphs, only single systems are supported for now
-  if (uses_direct_inputs_ && systems.size() > 1) {
-    throw std::runtime_error(
-        "GraphModel with direct inputs only supports single systems. "
-        "Use NEF-format graphs for batched prediction.");
-  }
+  // Register common inputs
+  interp_.set_input("species", species_t);
+  interp_.set_input("neighbor_species", neighbor_species_t);
+  interp_.set_input("edge_vectors", edge_vectors_t);
+  interp_.set_input("padding_mask", padding_mask_t);
+  interp_.set_input("reverse_neighbor_index", reverse_neighbor_index_t);
 
-  // Create input context (allocating)
-  ggml::Context input_ctx(BATCH_CONTEXT_SIZE, false);
-
-  int total_atoms = 0;
-  std::vector<int> atoms_per_system;
-  std::vector<int> system_atom_offsets;
-
-  if (uses_direct_inputs_) {
-    // Direct input format: prepare inputs from AtomicSystem directly
-    const auto &system = systems[0];
-    total_atoms = static_cast<int>(system.num_atoms());
-    atoms_per_system.push_back(total_atoms);
-    system_atom_offsets.push_back(0);
-
-    // Build neighbor list
-    NeighborList nlist = neighbor_builder_.build(system);
-
-    // Prepare direct inputs
-    prepare_direct_inputs(input_ctx.get(), system, nlist);
+  // Register mode-specific inputs
+  if (!forces_mode_) {
+    ggml_backend_tensor_set(edge_distances_t, ed_data.data(), 0,
+                            ed_data.size() * sizeof(float));
+    ggml_backend_tensor_set(cutoff_factors_t, cf_data.data(), 0,
+                            cf_data.size() * sizeof(float));
+    interp_.set_input("edge_distances", edge_distances_t);
+    interp_.set_input("cutoff_factors", cutoff_factors_t);
   } else {
-    // NEF format: use PET's batch preparation
-    pet::BatchedInput batch =
-        pet::prepare_batch(input_ctx.get(), systems, neighbor_builder_, cutoff_,
-                           cutoff_width_, species_to_index_);
-    total_atoms = batch.total_atoms;
-    atoms_per_system = batch.atoms_per_system;
-    system_atom_offsets = batch.system_atom_offsets;
-
-    // Register batch inputs
-    register_batch_inputs(input_ctx.get(), batch);
+    ggml_backend_tensor_set(cutoff_values_t, cv_data.data(), 0,
+                            cv_data.size() * sizeof(float));
+    interp_.set_input("cutoff_values", cutoff_values_t);
   }
 
-  // Create compute context (no_alloc for backend allocation)
-  ggml::Context compute_ctx(COMPUTE_CONTEXT_SIZE, true);
+  // --- Build and compute ---
+  ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
+  if (!compute_ctx) {
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+    throw std::runtime_error("Failed to create compute context");
+  }
 
-  // Build the computation graph
-  ggml_tensor *output = interp_.build(compute_ctx.get());
+  ggml_tensor *output = interp_.build(compute_ctx);
   if (!output) {
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
     throw std::runtime_error("Failed to build computation graph");
   }
   ggml_set_output(output);
 
-  // Create GGML compute graph
-  ggml_cgraph *cgraph = ggml_new_graph(compute_ctx.get());
-  ggml_build_forward_expand(cgraph, output);
+  ggml_cgraph *cgraph = nullptr;
 
-  // Allocate tensors on CPU backend
-  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-  if (!cpu_backend) {
-    throw std::runtime_error("Failed to create CPU backend");
+  if (compute_forces) {
+    // Build forward + backward graph
+    ggml_tensor *total_energy = ggml_sum(compute_ctx, output);
+    ggml_set_loss(total_energy);
+    ggml_set_output(total_energy);
+
+    cgraph = ggml_new_graph_custom(compute_ctx, 32768, true);
+    ggml_build_forward_expand(cgraph, output);
+    ggml_build_forward_expand(cgraph, total_energy);
+    ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
+
+    ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
+    if (grad) {
+      ggml_set_output(grad);
+    } else {
+      compute_forces = false;
+    }
+  } else {
+    cgraph = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(cgraph, output);
   }
 
   ggml_backend_buffer_t compute_buffer =
-      ggml_backend_alloc_ctx_tensors(compute_ctx.get(), cpu_backend);
+      ggml_backend_alloc_ctx_tensors(compute_ctx, cpu_backend_);
   if (!compute_buffer) {
-    ggml_backend_free(cpu_backend);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
     throw std::runtime_error("Failed to allocate compute buffer");
   }
 
-  // Initialize any pending constants
   interp_.init_constants();
 
-  // Compute the graph
-  ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
+  if (compute_forces) {
+    ggml_graph_reset(cgraph);
+  }
+
+  ggml_status status = ggml_backend_graph_compute(cpu_backend_, cgraph);
   if (status != GGML_STATUS_SUCCESS) {
     ggml_backend_buffer_free(compute_buffer);
-    ggml_backend_free(cpu_backend);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
     throw std::runtime_error("Graph computation failed");
   }
 
-  // Extract results
-  std::vector<ModelResult> results(systems.size());
+  // --- Extract results ---
+  ModelResult result;
 
-  // Get output data (atomic energies)
-  std::vector<float> atomic_energies(total_atoms);
+  // Get atomic energies
+  std::vector<float> atomic_energies(n_atoms);
   ggml_backend_tensor_get(output, atomic_energies.data(), 0,
-                          total_atoms * sizeof(float));
+                          n_atoms * sizeof(float));
 
-  // Sum atomic energies per system and add composition energies
-  for (size_t sys_idx = 0; sys_idx < systems.size(); sys_idx++) {
-    float energy = 0.0f;
-    int atom_start = system_atom_offsets[sys_idx];
-    int n_atoms = atoms_per_system[sys_idx];
+  // Sum and scale
+  float model_energy = 0.0f;
+  for (int i = 0; i < n_atoms; i++) {
+    model_energy += atomic_energies[i];
+  }
+  float scaled_energy = model_energy * energy_scale_;
 
-    for (int i = 0; i < n_atoms; i++) {
-      energy += atomic_energies[atom_start + i];
+  // Add composition energies
+  float composition_energy = 0.0f;
+  for (int i = 0; i < n_atoms; i++) {
+    auto it = composition_energies_.find(atomic_numbers[i]);
+    if (it != composition_energies_.end()) {
+      composition_energy += it->second;
     }
+  }
 
-    // Add composition energies (atomic reference energies)
-    for (int i = 0; i < n_atoms; i++) {
-      int Z = systems[sys_idx].atomic_numbers()[i];
-      auto it = composition_energies_.find(Z);
-      if (it != composition_energies_.end()) {
-        energy += it->second;
+  result.energy = scaled_energy + composition_energy;
+
+  // Extract forces
+  if (compute_forces) {
+    ggml_tensor *grad_tensor = ggml_graph_get_grad(cgraph, edge_vectors_t);
+    if (grad_tensor && grad_tensor->data) {
+      std::vector<float> grad_data(ggml_nelements(grad_tensor));
+      ggml_backend_tensor_get(grad_tensor, grad_data.data(), 0,
+                              ggml_nbytes(grad_tensor));
+
+      // Scatter edge gradients to per-atom forces
+      result.forces.resize(n_atoms * 3, 0.0f);
+      const int stride_slot = 3;
+      const int stride_atom = 3 * max_neighbors;
+
+      for (int ca = 0; ca < n_atoms; ca++) {
+        for (int slot = 0; slot < max_neighbors; slot++) {
+          int flat_idx = ca * max_neighbors + slot;
+          if (pm_data[flat_idx] > 0.5f) continue;
+
+          int na = neighbor_atoms_vec[flat_idx];
+          if (na < 0) continue;
+
+          int base = slot * stride_slot + ca * stride_atom;
+          float gx = grad_data[0 + base];
+          float gy = grad_data[1 + base];
+          float gz = grad_data[2 + base];
+
+          result.forces[ca * 3 + 0] += gx;
+          result.forces[ca * 3 + 1] += gy;
+          result.forces[ca * 3 + 2] += gz;
+
+          result.forces[na * 3 + 0] -= gx;
+          result.forces[na * 3 + 1] -= gy;
+          result.forces[na * 3 + 2] -= gz;
+        }
       }
-    }
 
-    results[sys_idx].energy = energy;
+      // Apply energy scale
+      for (int i = 0; i < n_atoms * 3; i++) {
+        result.forces[i] *= energy_scale_;
+      }
+
+      result.has_forces = true;
+    }
   }
 
   // Cleanup
   ggml_backend_buffer_free(compute_buffer);
-  ggml_backend_free(cpu_backend);
+  ggml_free(compute_ctx);
+  ggml_backend_buffer_free(input_buffer);
+  ggml_free(input_ctx);
 
-  return results;
+  return result;
 }
 
 } // namespace mlipcpp::runtime

@@ -9,6 +9,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "runtime/graph_model.h"
+#include "core/gguf_loader.h"
+#include "mlipcpp/io.h"
+#include "mlipcpp/mlipcpp.h"
+#include "mlipcpp/mlipcpp.hpp"
 
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
@@ -171,7 +175,7 @@ void setup_graph_model(GraphModel &model, const std::string &test_dir,
 
 } // namespace
 
-TEST_CASE("GraphModel detects direct input format", "[graph][model]") {
+TEST_CASE("GraphModel loads graph file", "[graph][model]") {
   const std::string test_dir = "/tmp/pet_full_export";
   const std::string graph_path = test_dir + "/pet_full.json";
 
@@ -182,12 +186,10 @@ TEST_CASE("GraphModel detects direct input format", "[graph][model]") {
   GraphModel model;
   model.load_graph_file(graph_path);
 
-  // Check expected dimensions were detected
-  auto [n_atoms, max_neighbors] = model.expected_dimensions();
-  INFO("Detected n_atoms=" << n_atoms << ", max_neighbors=" << max_neighbors);
-
-  CHECK(n_atoms == 2);
-  CHECK(max_neighbors == 8);
+  // Check graph was loaded
+  const auto &graph = model.interpreter().graph();
+  CHECK(graph.nodes.size() > 100);
+  CHECK(graph.inputs.size() >= 5);
 }
 
 TEST_CASE("GraphModel with direct inputs matches interpreter",
@@ -211,12 +213,7 @@ TEST_CASE("GraphModel with direct inputs matches interpreter",
   GraphModel model;
   setup_graph_model(model, test_dir, weight_ctx, cpu_backend);
 
-  // Set expected dimensions manually (normally from metadata)
-  model.set_expected_dimensions(2, 8);
-
-  // Setup species mapping (Si = 14 -> index 0)
-  // This would normally come from the GGUF file
-  // For now we'll just test with the raw test inputs
+  // Note: species mapping and dimensions are normally from GGUF file
 
   // Load expected output
   auto expected = load_binary<float>(test_dir + "/expected_output.bin");
@@ -237,4 +234,283 @@ TEST_CASE("GraphModel with direct inputs matches interpreter",
   // Cleanup
   ggml_backend_free(cpu_backend);
   ggml_free(weight_ctx);
+}
+
+TEST_CASE("GraphModel GGUF energy prediction", "[graph][model][gguf]") {
+  const std::string model_path = "local/pet-auto.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Auto-exported GGUF not found at " << model_path);
+  }
+  if (!std::filesystem::exists(water_xyz)) {
+    SKIP("Water XYZ file not found");
+  }
+
+  GraphModel model;
+  REQUIRE(model.load_from_gguf(model_path));
+
+  // Verify the GGUF was exported with the current full-model format
+  const auto &graph = model.interpreter().graph();
+  bool has_species_input = false;
+  for (const auto &inp : graph.inputs) {
+    if (inp.name == "species") has_species_input = true;
+  }
+  if (!has_species_input) {
+    SKIP("GGUF uses old graph format (no 'species' input) - re-export with "
+         "export_pet_gguf.py");
+  }
+
+  // Read water system
+  std::ifstream file(water_xyz);
+  REQUIRE(file.is_open());
+  auto water = mlipcpp::io::read_xyz(file);
+  REQUIRE(water.num_atoms() == 3);
+
+  // Predict energy
+  ModelResult result = model.predict(water);
+
+  INFO("Water energy: " << result.energy << " eV");
+  // Energy should be negative and in a reasonable range for water
+  CHECK(result.energy < 0.0f);
+  CHECK(result.energy > -100.0f);
+}
+
+TEST_CASE("GraphModel GGUF forces prediction", "[graph][model][gguf][forces]") {
+  const std::string model_path = "local/pet-auto-forces.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Forces GGUF not found at " << model_path
+         << " - export with: uv run scripts/export_pytorch/export_pet_gguf.py "
+            "--forces -o local/pet-auto-forces.gguf");
+  }
+  if (!std::filesystem::exists(water_xyz)) {
+    SKIP("Water XYZ file not found");
+  }
+
+  GraphModel model;
+  REQUIRE(model.load_from_gguf(model_path));
+
+  std::ifstream file(water_xyz);
+  REQUIRE(file.is_open());
+  auto water = mlipcpp::io::read_xyz(file);
+  REQUIRE(water.num_atoms() == 3);
+
+  // Predict energy + forces
+  ModelResult result = model.predict(water, true);
+
+  INFO("Water energy: " << result.energy << " eV");
+  CHECK(result.energy < 0.0f);
+  CHECK(result.energy > -100.0f);
+
+  // Should have forces for 3 atoms (9 components)
+  REQUIRE(result.forces.size() == 9);
+
+  // Newton's third law: forces should sum to approximately zero
+  float fx_sum = result.forces[0] + result.forces[3] + result.forces[6];
+  float fy_sum = result.forces[1] + result.forces[4] + result.forces[7];
+  float fz_sum = result.forces[2] + result.forces[5] + result.forces[8];
+
+  INFO("Force sum: [" << fx_sum << ", " << fy_sum << ", " << fz_sum << "]");
+  CHECK_THAT(fx_sum, WithinAbs(0.0f, 0.01f));
+  CHECK_THAT(fy_sum, WithinAbs(0.0f, 0.01f));
+  CHECK_THAT(fz_sum, WithinAbs(0.0f, 0.01f));
+
+  // Print per-atom forces
+  for (int i = 0; i < 3; i++) {
+    INFO("Atom " << i << " forces: [" << result.forces[i * 3] << ", "
+                 << result.forces[i * 3 + 1] << ", "
+                 << result.forces[i * 3 + 2] << "] eV/A");
+  }
+}
+
+TEST_CASE("GraphModel dynamic system sizes", "[graph][model][gguf][dynamic]") {
+  const std::string model_path = "local/pet-auto.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+  const std::string si_xyz = "geometries/si.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Auto-exported GGUF not found at " << model_path);
+  }
+  if (!std::filesystem::exists(water_xyz) ||
+      !std::filesystem::exists(si_xyz)) {
+    SKIP("Test XYZ files not found");
+  }
+
+  GraphModel model;
+  REQUIRE(model.load_from_gguf(model_path));
+
+  // Verify GGUF format compatibility
+  const auto &graph = model.interpreter().graph();
+  bool has_species_input = false;
+  for (const auto &inp : graph.inputs) {
+    if (inp.name == "species") has_species_input = true;
+  }
+  if (!has_species_input) {
+    SKIP("GGUF uses old graph format - re-export with export_pet_gguf.py");
+  }
+
+  // Predict water (3 atoms)
+  {
+    std::ifstream file(water_xyz);
+    auto water = mlipcpp::io::read_xyz(file);
+    ModelResult result = model.predict(water);
+    INFO("Water energy: " << result.energy << " eV");
+    CHECK(result.energy < 0.0f);
+  }
+
+  // Predict silicon (2 atoms) - different system size, same model instance
+  {
+    std::ifstream file(si_xyz);
+    auto si = mlipcpp::io::read_xyz(file);
+    ModelResult result = model.predict(si);
+    INFO("Si energy: " << result.energy << " eV");
+    CHECK(result.energy < 0.0f);
+  }
+}
+
+// Helper: check if a GGUF file uses pet-graph architecture
+static bool is_pet_graph_gguf(const std::string &path) {
+  try {
+    mlipcpp::GGUFLoader loader(path);
+    return loader.get_string("general.architecture", "") == "pet-graph";
+  } catch (...) {
+    return false;
+  }
+}
+
+// ============================================================================
+// Predictor API Tests (public C++ API)
+// ============================================================================
+
+TEST_CASE("GraphModel via Predictor API", "[graph][model][api]") {
+  const std::string model_path = "local/pet-auto.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Auto-exported GGUF not found at " << model_path);
+  }
+  if (!is_pet_graph_gguf(model_path)) {
+    SKIP("GGUF uses old architecture - re-export with export_pet_gguf.py");
+  }
+  if (!std::filesystem::exists(water_xyz)) {
+    SKIP("Water XYZ file not found");
+  }
+
+  // Load via public Predictor API (same path users take)
+  mlipcpp::Predictor predictor(model_path);
+  REQUIRE(predictor.model_type() == "PET-Graph");
+
+  // Read water system
+  std::ifstream file(water_xyz);
+  auto water = mlipcpp::io::read_xyz(file);
+  REQUIRE(water.num_atoms() == 3);
+
+  // Predict via raw pointer API
+  auto result = predictor.predict(
+      water.num_atoms(), water.positions(), water.atomic_numbers(),
+      nullptr, nullptr, false);
+
+  INFO("Predictor API water energy: " << result.energy << " eV");
+  CHECK(result.energy < 0.0f);
+  CHECK(result.energy > -100.0f);
+}
+
+TEST_CASE("GraphModel via Predictor API with forces",
+          "[graph][model][api][forces]") {
+  const std::string model_path = "local/pet-auto-forces.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Forces GGUF not found at " << model_path);
+  }
+  if (!is_pet_graph_gguf(model_path)) {
+    SKIP("GGUF uses old architecture - re-export with --forces");
+  }
+  if (!std::filesystem::exists(water_xyz)) {
+    SKIP("Water XYZ file not found");
+  }
+
+  mlipcpp::Predictor predictor(model_path);
+  REQUIRE(predictor.model_type() == "PET-Graph");
+
+  std::ifstream file(water_xyz);
+  auto water = mlipcpp::io::read_xyz(file);
+
+  auto result = predictor.predict(
+      water.num_atoms(), water.positions(), water.atomic_numbers(),
+      nullptr, nullptr, true);
+
+  INFO("Predictor API water energy: " << result.energy << " eV");
+  CHECK(result.energy < 0.0f);
+  CHECK(result.has_forces());
+  REQUIRE(result.forces.size() == 9);
+
+  // Newton's third law
+  float fx_sum = result.forces[0] + result.forces[3] + result.forces[6];
+  float fy_sum = result.forces[1] + result.forces[4] + result.forces[7];
+  float fz_sum = result.forces[2] + result.forces[5] + result.forces[8];
+  CHECK_THAT(fx_sum, WithinAbs(0.0f, 0.01f));
+  CHECK_THAT(fy_sum, WithinAbs(0.0f, 0.01f));
+  CHECK_THAT(fz_sum, WithinAbs(0.0f, 0.01f));
+}
+
+// ============================================================================
+// C API Tests
+// ============================================================================
+
+TEST_CASE("C API loads graph model", "[graph][model][c_api]") {
+  const std::string model_path = "local/pet-auto.gguf";
+  const std::string water_xyz = "geometries/water.xyz";
+
+  if (!std::filesystem::exists(model_path)) {
+    SKIP("Auto-exported GGUF not found at " << model_path);
+  }
+  if (!is_pet_graph_gguf(model_path)) {
+    SKIP("GGUF uses old architecture - re-export with export_pet_gguf.py");
+  }
+  if (!std::filesystem::exists(water_xyz)) {
+    SKIP("Water XYZ file not found");
+  }
+
+  // Test C API lifecycle
+  auto model = mlipcpp_model_create(nullptr);
+  REQUIRE(model != nullptr);
+
+  auto err = mlipcpp_model_load(model, model_path.c_str());
+  REQUIRE(err == MLIPCPP_OK);
+
+  // Check cutoff
+  float cutoff = 0.0f;
+  err = mlipcpp_model_get_cutoff(model, &cutoff);
+  REQUIRE(err == MLIPCPP_OK);
+  CHECK(cutoff > 0.0f);
+
+  // Predict water
+  std::ifstream file(water_xyz);
+  auto water = mlipcpp::io::read_xyz(file);
+
+  mlipcpp_system_t system;
+  system.n_atoms = water.num_atoms();
+  system.positions = water.positions();
+  system.atomic_numbers = water.atomic_numbers();
+  system.cell = nullptr;
+  system.pbc = nullptr;
+
+  mlipcpp_result_t result = nullptr;
+  err = mlipcpp_predict(model, &system, false, &result);
+  REQUIRE(err == MLIPCPP_OK);
+  REQUIRE(result != nullptr);
+
+  float energy = 0.0f;
+  err = mlipcpp_result_get_energy(result, &energy);
+  REQUIRE(err == MLIPCPP_OK);
+
+  INFO("C API water energy: " << energy << " eV");
+  CHECK(energy < 0.0f);
+  CHECK(energy > -100.0f);
+
+  mlipcpp_result_free(result);
+  mlipcpp_model_free(model);
 }

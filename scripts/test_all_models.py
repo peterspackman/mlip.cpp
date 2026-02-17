@@ -21,14 +21,19 @@ from pathlib import Path
 # Available PET models (from HuggingFace lab-cosmo/upet)
 AVAILABLE_MODELS = [
     "pet-mad-s",
+    "pet-omad-xs",
     "pet-omad-s",
-    # "pet-omat-l",  # Large model, slow to download
-    # "pet-spice-s", # May have different architecture
+    "pet-omat-xs",
+    "pet-omat-s",
+    "pet-spice-s",
 ]
 
 def get_geometries(geometries_dir: Path) -> list[Path]:
     """Get all XYZ files in the geometries directory."""
     return sorted(geometries_dir.glob("*.xyz"))
+
+EXPORT_TIMEOUT = 300  # 5 minutes for model download + tracing
+INFERENCE_TIMEOUT = 120  # 2 minutes per inference
 
 def export_model(model_name: str, output_dir: Path, forces: bool = False) -> bool:
     """Export a PET model using export_pet_full.py."""
@@ -41,7 +46,12 @@ def export_model(model_name: str, output_dir: Path, forces: bool = False) -> boo
         cmd.append("--forces")
 
     print(f"  Exporting {model_name}{'(forces)' if forces else ''}...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=EXPORT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"    ERROR: Export timed out after {EXPORT_TIMEOUT}s")
+        return False
     if result.returncode != 0:
         print(f"    ERROR: Export failed")
         print(f"    {result.stderr[:500]}")
@@ -54,7 +64,12 @@ def run_cpp_inference(model_dir: Path, xyz_path: Path, forces: bool = False) -> 
     if forces:
         cmd.append("--forces")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=INFERENCE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"    C++ ERROR: timed out after {INFERENCE_TIMEOUT}s")
+        return None
     if result.returncode != 0:
         print(f"    C++ ERROR: {result.stderr[:200]}")
         return None

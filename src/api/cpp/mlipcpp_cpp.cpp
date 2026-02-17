@@ -10,6 +10,7 @@
 #include "mlipcpp/model.h"
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
+#include "runtime/graph_model.h"
 #include <mutex>
 
 namespace mlipcpp {
@@ -108,6 +109,16 @@ struct Predictor::Impl {
 
       model_type_str = "PET";
       model = std::move(pet_model);
+    } else if (arch == "pet-graph") {
+      auto graph_model = std::make_unique<runtime::GraphModel>();
+      graph_model->set_backend_preference(to_internal(options.backend));
+
+      if (!graph_model->load_from_gguf(path)) {
+        throw std::runtime_error("Failed to load graph model from: " + path);
+      }
+
+      model_type_str = "PET-Graph";
+      model = std::move(graph_model);
     } else {
       throw std::runtime_error("Unsupported model architecture: " + arch);
     }

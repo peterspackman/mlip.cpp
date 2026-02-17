@@ -315,6 +315,8 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
   model.cutoff = loader.get_float32("pet.cutoff", 4.5f);
   model.cutoff_width = loader.get_float32("pet.cutoff_width", 0.2f);
   model.energy_scale = loader.get_float32("pet.energy_scale", 1.0f);
+  model.cutoff_function = loader.get_string("pet.cutoff_function", "cosine");
+  model.num_neighbors_adaptive = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
 
   // Check for forces mode (stored as int32 since GGUF doesn't have bool)
   model.forces_mode = (loader.get_int32("pet.forces_mode", 0) != 0);
@@ -410,6 +412,190 @@ void load_from_gguf(const std::string &gguf_path, GraphInterpreter &interp,
   }
 
   std::cout << "Loaded " << weight_pairs.size() << " weights from GGUF\n";
+}
+
+struct PackedNeighborData {
+  std::vector<int32_t> species;
+  std::vector<int32_t> neighbor_species;
+  std::vector<float> edge_vectors;
+  std::vector<float> edge_distances;
+  std::vector<float> padding_mask;
+  std::vector<int32_t> reverse_neighbor_index;
+  std::vector<float> cutoff_factors;
+  std::vector<float> cutoff_values;    // per-pair cutoff distances (for forces mode)
+  std::vector<int> neighbor_atoms;     // neighbor atom index per slot (for force scatter)
+  int n_atoms;
+  int max_neighbors;
+};
+
+// Pack a neighbor list into padded per-atom arrays for the graph interpreter.
+// Returns a PackedNeighborData struct with all input arrays ready to copy
+// to GGML tensors.
+PackedNeighborData pack_neighbor_list(
+    const NeighborList &nlist,
+    const int32_t *atomic_numbers,
+    const std::map<int, int> &species_to_index,
+    const std::vector<float> &pair_cutoffs,
+    const std::string &cutoff_function,
+    float cutoff_width,
+    float global_cutoff,
+    int n_atoms,
+    int max_neighbors) {
+
+  PackedNeighborData packed;
+  packed.n_atoms = n_atoms;
+  packed.max_neighbors = max_neighbors;
+
+  const int total_slots = n_atoms * max_neighbors;
+
+  // Map atomic numbers to species indices for center atoms
+  packed.species.resize(n_atoms);
+  for (int i = 0; i < n_atoms; i++) {
+    int Z = atomic_numbers[i];
+    auto it = species_to_index.find(Z);
+    if (it == species_to_index.end()) {
+      throw std::runtime_error(
+          "Atomic number " + std::to_string(Z) + " (atom " +
+          std::to_string(i) + ") is not in the model's species map.");
+    }
+    packed.species[i] = it->second;
+  }
+
+  packed.neighbor_species.assign(total_slots, 0);
+  packed.edge_vectors.assign(total_slots * 3, 0.0f);
+  packed.edge_distances.assign(total_slots, 0.0f);
+  packed.padding_mask.assign(total_slots, 1.0f);  // 1.0 = padded, 0.0 = valid
+  packed.cutoff_factors.assign(total_slots, 0.0f);
+  packed.cutoff_values.assign(total_slots, global_cutoff);
+  packed.reverse_neighbor_index.assign(total_slots, 0);
+  packed.neighbor_atoms.assign(total_slots, -1);
+
+  // Build forward edge mapping
+  using EdgeKey = std::tuple<int, int, int, int, int>;
+  std::map<EdgeKey, int> edge_to_flat_idx;
+  std::vector<int> slot_indices(n_atoms, 0);
+  bool has_cell_shifts = !nlist.cell_shifts.empty();
+
+  for (int e = 0; e < nlist.num_pairs(); e++) {
+    int i = nlist.centers[e];
+    int j = nlist.neighbors[e];
+    int slot = slot_indices[i]++;
+    if (slot >= max_neighbors)
+      continue;
+
+    int flat_idx = i * max_neighbors + slot;
+
+    int sa = 0, sb = 0, sc = 0;
+    if (has_cell_shifts) {
+      sa = nlist.cell_shifts[e][0];
+      sb = nlist.cell_shifts[e][1];
+      sc = nlist.cell_shifts[e][2];
+    }
+    edge_to_flat_idx[{i, j, sa, sb, sc}] = flat_idx;
+
+    int Z_j = atomic_numbers[j];
+    auto it = species_to_index.find(Z_j);
+    if (it == species_to_index.end()) {
+      throw std::runtime_error(
+          "Atomic number " + std::to_string(Z_j) + " (neighbor atom " +
+          std::to_string(j) + ") is not in the model's species map.");
+    }
+    packed.neighbor_species[flat_idx] = it->second;
+
+    const auto &ev = nlist.edge_vectors[e];
+    int ev_idx = i * (max_neighbors * 3) + slot * 3;
+    packed.edge_vectors[ev_idx + 0] = ev[0];
+    packed.edge_vectors[ev_idx + 1] = ev[1];
+    packed.edge_vectors[ev_idx + 2] = ev[2];
+
+    packed.edge_distances[flat_idx] = nlist.distances[e];
+    packed.padding_mask[flat_idx] = 0.0f;  // 0.0 = valid edge
+    packed.neighbor_atoms[flat_idx] = j;
+
+    float r = nlist.distances[e];
+    float pc = pair_cutoffs[e];
+    packed.cutoff_values[flat_idx] = pc;
+    if (cutoff_function == "bump") {
+      packed.cutoff_factors[flat_idx] = cutoff_func_bump(r, pc, cutoff_width);
+    } else {
+      packed.cutoff_factors[flat_idx] = cutoff_func_cosine(r, pc, cutoff_width);
+    }
+  }
+
+  // Build reverse neighbor index
+  for (int e = 0; e < nlist.num_pairs(); e++) {
+    int i = nlist.centers[e];
+    int j = nlist.neighbors[e];
+    int sa = 0, sb = 0, sc = 0;
+    if (has_cell_shifts) {
+      sa = nlist.cell_shifts[e][0];
+      sb = nlist.cell_shifts[e][1];
+      sc = nlist.cell_shifts[e][2];
+    }
+
+    auto it_ij = edge_to_flat_idx.find({i, j, sa, sb, sc});
+    if (it_ij == edge_to_flat_idx.end())
+      continue;
+    auto it_ji = edge_to_flat_idx.find({j, i, -sa, -sb, -sc});
+    if (it_ji != edge_to_flat_idx.end()) {
+      packed.reverse_neighbor_index[it_ij->second] = it_ji->second;
+    }
+    // If reverse edge not found, leave as 0 (set during initialization)
+  }
+
+  return packed;
+}
+
+// Scatter edge vector gradients to per-atom forces.
+// grad_data: gradient of energy w.r.t. edge_vectors, shape [3, max_neighbors, n_atoms]
+// Returns per-atom forces [n_atoms * 3], already scaled by energy_scale.
+std::vector<float> scatter_forces(
+    const std::vector<float> &grad_data,
+    const std::vector<float> &pm_data,
+    const std::vector<int> &neighbor_atoms,
+    int n_atoms, int max_neighbors, float energy_scale) {
+
+  std::vector<float> forces(n_atoms * 3, 0.0f);
+
+  const int stride_slot = 3;
+  const int stride_atom = 3 * max_neighbors;
+
+  for (int center_atom = 0; center_atom < n_atoms; center_atom++) {
+    for (int slot = 0; slot < max_neighbors; slot++) {
+      int flat_idx = center_atom * max_neighbors + slot;
+
+      // Skip padding entries (pm_data: 0.0 = valid, 1.0 = padded)
+      if (pm_data[flat_idx] > 0.5f)
+        continue;
+
+      int neighbor_atom = neighbor_atoms[flat_idx];
+      if (neighbor_atom < 0)
+        continue;
+
+      // Get gradient for this edge
+      int base_idx = slot * stride_slot + center_atom * stride_atom;
+      float gx = grad_data[0 + base_idx];
+      float gy = grad_data[1 + base_idx];
+      float gz = grad_data[2 + base_idx];
+
+      // edge_vec = pos[neighbor] - pos[center]
+      // F[center] += grad, F[neighbor] -= grad
+      forces[center_atom * 3 + 0] += gx;
+      forces[center_atom * 3 + 1] += gy;
+      forces[center_atom * 3 + 2] += gz;
+
+      forces[neighbor_atom * 3 + 0] -= gx;
+      forces[neighbor_atom * 3 + 1] -= gy;
+      forces[neighbor_atom * 3 + 2] -= gz;
+    }
+  }
+
+  // Apply energy scale to forces
+  for (int i = 0; i < n_atoms * 3; i++) {
+    forces[i] *= energy_scale;
+  }
+
+  return forces;
 }
 
 void print_usage(const char *prog) {
@@ -692,118 +878,22 @@ int main(int argc, char *argv[]) {
     ggml_backend_buffer_t input_buffer =
         ggml_backend_alloc_ctx_tensors(input_ctx, cpu_backend);
 
-    // Prepare input data
-    std::vector<int32_t> species_data(n_atoms);
-    for (int i = 0; i < n_atoms; i++) {
-      int Z = atomic_numbers[i];
-      auto it = model.species_to_index.find(Z);
-      if (it == model.species_to_index.end()) {
-        std::cerr << "Error: atomic number " << Z << " (atom " << i
-                  << ") is not in the model's species map.\n"
-                  << "The model does not support this element.\n";
-        return 1;
-      }
-      species_data[i] = it->second;
-    }
-    ggml_backend_tensor_set(species, species_data.data(), 0,
-                            species_data.size() * sizeof(int32_t));
+    // Pack neighbor list into padded arrays
+    PackedNeighborData packed = pack_neighbor_list(
+        nlist, atomic_numbers, model.species_to_index, pair_cutoffs,
+        model.cutoff_function, model.cutoff_width, model.cutoff,
+        n_atoms, max_neighbors);
 
-    std::vector<int32_t> ns_data(n_atoms * max_neighbors, 0);
-    std::vector<float> ev_data(n_atoms * max_neighbors * 3, 0.0f);
-    std::vector<float> ed_data(n_atoms * max_neighbors, 0.0f);
-    std::vector<float> pm_data(n_atoms * max_neighbors, 1.0f);  // 1.0 = padded (PyTorch True), 0.0 = valid
-    std::vector<float> cf_data(n_atoms * max_neighbors, 0.0f);
-    std::vector<float> cv_data(n_atoms * max_neighbors, model.cutoff);  // per-pair cutoff values (default: global)
-    std::vector<int32_t> rni_data(n_atoms * max_neighbors, 0);  // 0 for padded edges (masked out later)
-
-    // Track neighbor atom index for each slot (needed for force scatter)
-    std::vector<int> neighbor_atoms(n_atoms * max_neighbors, -1);
-
-    // Key: (center, neighbor, shift_a, shift_b, shift_c)
-    using EdgeKey = std::tuple<int, int, int, int, int>;
-    std::map<EdgeKey, int> edge_to_flat_idx;
-    std::vector<int> slot_indices(n_atoms, 0);
-    bool has_cell_shifts = !nlist.cell_shifts.empty();
-
-    for (int e = 0; e < nlist.num_pairs(); e++) {
-      int i = nlist.centers[e];
-      int j = nlist.neighbors[e];
-      int slot = slot_indices[i]++;
-      if (slot >= max_neighbors)
-        continue;
-
-      int flat_idx = i * max_neighbors + slot;
-
-      int sa = 0, sb = 0, sc = 0;
-      if (has_cell_shifts) {
-        sa = nlist.cell_shifts[e][0];
-        sb = nlist.cell_shifts[e][1];
-        sc = nlist.cell_shifts[e][2];
-      }
-      edge_to_flat_idx[{i, j, sa, sb, sc}] = flat_idx;
-
-      int Z_j = atomic_numbers[j];
-      auto it = model.species_to_index.find(Z_j);
-      if (it == model.species_to_index.end()) {
-        std::cerr << "Error: atomic number " << Z_j << " (neighbor atom " << j
-                  << ") is not in the model's species map.\n"
-                  << "The model does not support this element.\n";
-        return 1;
-      }
-      ns_data[flat_idx] = it->second;
-
-      const auto &ev = nlist.edge_vectors[e];
-      int ev_idx = i * (max_neighbors * 3) + slot * 3;
-      ev_data[ev_idx + 0] = ev[0];
-      ev_data[ev_idx + 1] = ev[1];
-      ev_data[ev_idx + 2] = ev[2];
-
-      ed_data[flat_idx] = nlist.distances[e];
-      pm_data[flat_idx] = 0.0f;  // 0.0 = valid edge (PyTorch False)
-
-      // Store neighbor atom index for force scatter
-      neighbor_atoms[flat_idx] = j;
-
-      // Per-pair cutoff value and cutoff factor
-      float r = nlist.distances[e];
-      float pc = pair_cutoffs[e];
-      cv_data[flat_idx] = pc;  // Store per-pair cutoff for forces-mode graph
-      if (model.cutoff_function == "bump") {
-        cf_data[flat_idx] = cutoff_func_bump(r, pc, model.cutoff_width);
-      } else {
-        cf_data[flat_idx] = cutoff_func_cosine(r, pc, model.cutoff_width);
-      }
-    }
-
-    // Build reverse neighbor index
-    for (int e = 0; e < nlist.num_pairs(); e++) {
-      int i = nlist.centers[e];
-      int j = nlist.neighbors[e];
-      int sa = 0, sb = 0, sc = 0;
-      if (has_cell_shifts) {
-        sa = nlist.cell_shifts[e][0];
-        sb = nlist.cell_shifts[e][1];
-        sc = nlist.cell_shifts[e][2];
-      }
-
-      auto it_ij = edge_to_flat_idx.find({i, j, sa, sb, sc});
-      if (it_ij == edge_to_flat_idx.end())
-        continue;
-      auto it_ji = edge_to_flat_idx.find({j, i, -sa, -sb, -sc});
-      if (it_ji != edge_to_flat_idx.end()) {
-        rni_data[it_ij->second] = it_ji->second;
-      }
-      // If reverse edge not found, leave as -1 (set during initialization)
-    }
-
-    ggml_backend_tensor_set(neighbor_species, ns_data.data(), 0,
-                            ns_data.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(edge_vectors, ev_data.data(), 0,
-                            ev_data.size() * sizeof(float));
-    ggml_backend_tensor_set(padding_mask, pm_data.data(), 0,
-                            pm_data.size() * sizeof(float));
-    ggml_backend_tensor_set(reverse_neighbor_index, rni_data.data(), 0,
-                            rni_data.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(species, packed.species.data(), 0,
+                            packed.species.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(neighbor_species, packed.neighbor_species.data(), 0,
+                            packed.neighbor_species.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(edge_vectors, packed.edge_vectors.data(), 0,
+                            packed.edge_vectors.size() * sizeof(float));
+    ggml_backend_tensor_set(padding_mask, packed.padding_mask.data(), 0,
+                            packed.padding_mask.size() * sizeof(float));
+    ggml_backend_tensor_set(reverse_neighbor_index, packed.reverse_neighbor_index.data(), 0,
+                            packed.reverse_neighbor_index.size() * sizeof(int32_t));
 
     // Set inputs common to both modes
     interp.set_input("species", species);
@@ -814,16 +904,16 @@ int main(int argc, char *argv[]) {
 
     if (!model.forces_mode) {
       // Non-forces mode: provide edge_distances and cutoff_factors as inputs
-      ggml_backend_tensor_set(edge_distances, ed_data.data(), 0,
-                              ed_data.size() * sizeof(float));
-      ggml_backend_tensor_set(cutoff_factors, cf_data.data(), 0,
-                              cf_data.size() * sizeof(float));
+      ggml_backend_tensor_set(edge_distances, packed.edge_distances.data(), 0,
+                              packed.edge_distances.size() * sizeof(float));
+      ggml_backend_tensor_set(cutoff_factors, packed.cutoff_factors.data(), 0,
+                              packed.cutoff_factors.size() * sizeof(float));
       interp.set_input("edge_distances", edge_distances);
       interp.set_input("cutoff_factors", cutoff_factors);
     } else {
       // Forces mode: provide per-pair cutoff values for in-graph cutoff computation
-      ggml_backend_tensor_set(cutoff_values, cv_data.data(), 0,
-                              cv_data.size() * sizeof(float));
+      ggml_backend_tensor_set(cutoff_values, packed.cutoff_values.data(), 0,
+                              packed.cutoff_values.size() * sizeof(float));
       interp.set_input("cutoff_values", cutoff_values);
     }
 
@@ -836,18 +926,20 @@ int main(int argc, char *argv[]) {
         std::ofstream f((dump_dir / name).string(), std::ios::binary);
         f.write(static_cast<const char *>(data), bytes);
       };
-      dump("species.bin", species_data.data(),
-           species_data.size() * sizeof(int32_t));
-      dump("neighbor_species.bin", ns_data.data(),
-           ns_data.size() * sizeof(int32_t));
-      dump("edge_vectors.bin", ev_data.data(), ev_data.size() * sizeof(float));
-      dump("edge_distances.bin", ed_data.data(),
-           ed_data.size() * sizeof(float));
-      dump("padding_mask.bin", pm_data.data(), pm_data.size() * sizeof(float));
-      dump("reverse_neighbor_index.bin", rni_data.data(),
-           rni_data.size() * sizeof(int32_t));
-      dump("cutoff_factors.bin", cf_data.data(),
-           cf_data.size() * sizeof(float));
+      dump("species.bin", packed.species.data(),
+           packed.species.size() * sizeof(int32_t));
+      dump("neighbor_species.bin", packed.neighbor_species.data(),
+           packed.neighbor_species.size() * sizeof(int32_t));
+      dump("edge_vectors.bin", packed.edge_vectors.data(),
+           packed.edge_vectors.size() * sizeof(float));
+      dump("edge_distances.bin", packed.edge_distances.data(),
+           packed.edge_distances.size() * sizeof(float));
+      dump("padding_mask.bin", packed.padding_mask.data(),
+           packed.padding_mask.size() * sizeof(float));
+      dump("reverse_neighbor_index.bin", packed.reverse_neighbor_index.data(),
+           packed.reverse_neighbor_index.size() * sizeof(int32_t));
+      dump("cutoff_factors.bin", packed.cutoff_factors.data(),
+           packed.cutoff_factors.size() * sizeof(float));
 
       std::ofstream mf((dump_dir / "dims.txt").string());
       mf << n_atoms << " " << max_neighbors << "\n";
@@ -902,19 +994,20 @@ int main(int argc, char *argv[]) {
       std::cout << "Graph nodes (forward+backward): "
                 << ggml_graph_n_nodes(cgraph) << "\n";
 
-      // Debug: print info about gradient tensor
-      ggml_tensor *dbg_grad = ggml_graph_get_grad(cgraph, edge_vectors);
-      std::cout << "  Gradient tensor: "
-                << (dbg_grad ? "found" : "NOT FOUND") << "\n";
-      if (dbg_grad) {
-        std::cout << "  Gradient shape: [" << dbg_grad->ne[0] << ", "
-                  << dbg_grad->ne[1] << ", " << dbg_grad->ne[2] << ", "
-                  << dbg_grad->ne[3] << "]\n";
-        std::cout << "  Gradient flags: " << dbg_grad->flags
-                  << " (output=" << (dbg_grad->flags & 4) << ")\n";
+      if (debug) {
+        ggml_tensor *dbg_grad = ggml_graph_get_grad(cgraph, edge_vectors);
+        std::cout << "  Gradient tensor: "
+                  << (dbg_grad ? "found" : "NOT FOUND") << "\n";
+        if (dbg_grad) {
+          std::cout << "  Gradient shape: [" << dbg_grad->ne[0] << ", "
+                    << dbg_grad->ne[1] << ", " << dbg_grad->ne[2] << ", "
+                    << dbg_grad->ne[3] << "]\n";
+          std::cout << "  Gradient flags: " << dbg_grad->flags
+                    << " (output=" << (dbg_grad->flags & 4) << ")\n";
+        }
+        std::cout << "  edge_vectors flags: " << edge_vectors->flags
+                  << " (param=" << (edge_vectors->flags & 2) << ")\n";
       }
-      std::cout << "  edge_vectors flags: " << edge_vectors->flags
-                << " (param=" << (edge_vectors->flags & 2) << ")\n";
     } else {
       // Forward-only mode
       cgraph = ggml_new_graph(compute_ctx);
@@ -1067,67 +1160,24 @@ int main(int argc, char *argv[]) {
         ggml_backend_tensor_get(grad_tensor, grad_data.data(), 0,
                                 ggml_nbytes(grad_tensor));
 
-        // Print gradient statistics (skip NaN from padding positions)
-        float grad_min = 1e30f, grad_max = -1e30f, grad_sum = 0.0f;
-        int nonzero = 0;
-        for (size_t i = 0; i < grad_data.size(); i++) {
-          if (std::isnan(grad_data[i])) continue;
-          if (grad_data[i] < grad_min) grad_min = grad_data[i];
-          if (grad_data[i] > grad_max) grad_max = grad_data[i];
-          grad_sum += grad_data[i];
-          if (grad_data[i] != 0.0f) nonzero++;
-        }
-        std::cout << "\n  Gradient stats: min=" << grad_min
-                  << " max=" << grad_max << " sum=" << grad_sum
-                  << " nonzero=" << nonzero << "/" << grad_data.size() << "\n";
-
-        // Initialize per-atom forces
-        std::vector<float> forces(n_atoms * 3, 0.0f);
-
-        // Scatter edge gradients to position gradients
-        // Chain rule: edge_vec = pos[neighbor] - pos[center]
-        // Therefore: F[center] += grad, F[neighbor] -= grad
-        const int stride_slot = 3;
-        const int stride_atom = 3 * max_neighbors;
-
-        for (int center_atom = 0; center_atom < n_atoms; center_atom++) {
-          for (int slot = 0; slot < max_neighbors; slot++) {
-            int flat_idx = center_atom * max_neighbors + slot;
-
-            // Skip padding entries (pm_data: 0.0 = valid, 1.0 = padded)
-            if (pm_data[flat_idx] > 0.5f)
-              continue;
-
-            int neighbor_atom = neighbor_atoms[flat_idx];
-            if (neighbor_atom < 0)
-              continue;
-
-            // Get gradient for this edge
-            int base_idx = slot * stride_slot + center_atom * stride_atom;
-            float gx = grad_data[0 + base_idx];
-            float gy = grad_data[1 + base_idx];
-            float gz = grad_data[2 + base_idx];
-
-            // Force = -gradient of energy
-            // edge_vec = pos[neighbor] - pos[center]
-            // d(energy)/d(pos[center]) contributes +grad to force[center]
-            // d(energy)/d(pos[neighbor]) contributes -grad to force[neighbor]
-            forces[center_atom * 3 + 0] += gx;
-            forces[center_atom * 3 + 1] += gy;
-            forces[center_atom * 3 + 2] += gz;
-
-            forces[neighbor_atom * 3 + 0] -= gx;
-            forces[neighbor_atom * 3 + 1] -= gy;
-            forces[neighbor_atom * 3 + 2] -= gz;
+        if (debug) {
+          float grad_min = 1e30f, grad_max = -1e30f, grad_sum = 0.0f;
+          int nonzero = 0;
+          for (size_t i = 0; i < grad_data.size(); i++) {
+            if (std::isnan(grad_data[i])) continue;
+            if (grad_data[i] < grad_min) grad_min = grad_data[i];
+            if (grad_data[i] > grad_max) grad_max = grad_data[i];
+            grad_sum += grad_data[i];
+            if (grad_data[i] != 0.0f) nonzero++;
           }
+          std::cout << "\n  Gradient stats: min=" << grad_min
+                    << " max=" << grad_max << " sum=" << grad_sum
+                    << " nonzero=" << nonzero << "/" << grad_data.size() << "\n";
         }
 
-        // Apply energy scale to forces
-        // Forces = -dE/dr = -energy_scale * d(sum(ae))/dr
-        // The backward pass gives d(sum(ae))/dr, so multiply by energy_scale
-        for (int i = 0; i < n_atoms * 3; i++) {
-          forces[i] *= model.energy_scale;
-        }
+        std::vector<float> forces = scatter_forces(
+            grad_data, packed.padding_mask, packed.neighbor_atoms,
+            n_atoms, max_neighbors, model.energy_scale);
 
         // Print forces
         std::cout << "\nForces (eV/A):\n";

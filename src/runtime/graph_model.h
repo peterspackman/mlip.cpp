@@ -11,34 +11,28 @@
 #include <vector>
 
 struct ggml_context;
+struct ggml_backend;
 struct ggml_backend_buffer;
-struct ggml_backend_sched;
 
+typedef struct ggml_backend *ggml_backend_t;
 typedef struct ggml_backend_buffer *ggml_backend_buffer_t;
-typedef struct ggml_backend_sched *ggml_backend_sched_t;
-
-// Forward declaration for batch input structure
-namespace mlipcpp::pet {
-struct BatchedInput;
-}
 
 namespace mlipcpp::runtime {
 
 /**
  * Model implementation using auto-exported computation graphs.
  *
- * This class wraps GraphInterpreter to provide the standard Model interface,
- * enabling automatic PyTorch -> GGML model conversion without manual C++ code.
+ * Wraps GraphInterpreter to provide the standard Model interface,
+ * enabling automatic PyTorch -> GGML model conversion.
  *
- * Key features:
- * - Loads graph JSON and weights from a single GGUF file
- * - Uses NEF (Node-Edge-Feature) format for efficient batched operations
- * - Supports energy prediction (forces via backprop coming later)
+ * Supports dynamic system sizes: the graph is exported with symbolic
+ * dimensions (n_atoms, max_neighbors) that are resolved at runtime.
  *
  * Usage:
  *   GraphModel model;
  *   model.load_from_gguf("model.gguf");
  *   ModelResult result = model.predict(system);
+ *   ModelResult result_f = model.predict(system, true); // with forces
  */
 class GraphModel : public Model {
 public:
@@ -57,17 +51,12 @@ public:
    * The GGUF file must contain:
    * - Weights as tensors
    * - Graph JSON in metadata field "graph.json"
-   * - Model hyperparameters (cutoff, etc.)
-   *
-   * @param path Path to GGUF file
-   * @return true if successful
+   * - Model hyperparameters (cutoff, species map, etc.)
    */
   bool load_from_gguf(const std::string &path);
 
   /**
    * Load graph from separate JSON file (for testing).
-   *
-   * @param path Path to graph JSON file
    */
   void load_graph_file(const std::string &path);
 
@@ -88,41 +77,24 @@ public:
    */
   const GraphInterpreter &interpreter() const { return interp_; }
 
-  /**
-   * Batched prediction on multiple systems.
-   */
-  std::vector<ModelResult>
-  predict_batch(const std::vector<AtomicSystem> &systems,
-                bool compute_forces = false);
-
-  /**
-   * Get the graph's expected input dimensions.
-   * Returns (n_atoms, max_neighbors) or (-1, -1) if not set.
-   */
-  std::pair<int, int> expected_dimensions() const {
-    return {expected_n_atoms_, expected_max_neighbors_};
-  }
-
-  /**
-   * Set expected input dimensions (extracted from graph metadata).
-   */
-  void set_expected_dimensions(int n_atoms, int max_neighbors) {
-    expected_n_atoms_ = n_atoms;
-    expected_max_neighbors_ = max_neighbors;
-  }
-
 private:
   GraphInterpreter interp_;
+
+  // Model hyperparameters
   float cutoff_ = 4.5f;
-  float cutoff_width_ = 0.5f;
+  float cutoff_width_ = 0.2f;
+  float energy_scale_ = 1.0f;
+  std::string cutoff_function_ = "cosine";
+  bool forces_mode_ = false;
+  float num_neighbors_adaptive_ = 0.0f;
+
   BackendPreference backend_preference_ = BackendPreference::Auto;
 
-  // GGML contexts
+  // GGML contexts and backend
   ggml_context *ctx_weights_ = nullptr;
-
-  // Backend system
   std::shared_ptr<BackendProvider> backend_provider_;
   ggml_backend_buffer_t weight_buffer_ = nullptr;
+  ggml_backend_t cpu_backend_ = nullptr;
 
   // Species mapping (atomic number -> index)
   std::map<int, int> species_to_index_;
@@ -133,35 +105,8 @@ private:
   // Neighbor list builder
   NeighborListBuilder neighbor_builder_;
 
-  // Expected graph dimensions (from export metadata)
-  int expected_n_atoms_ = -1;
-  int expected_max_neighbors_ = -1;
-
-  // Whether graph uses direct inputs (species, neighbor_species, edge_vectors, edge_distances)
-  // vs NEF format inputs
-  bool uses_direct_inputs_ = false;
-
-  // Input tensor mapping (graph input name -> BatchedInput field)
-  struct InputMapping {
-    std::string graph_name;
-    std::string batch_field;
-  };
-  std::vector<InputMapping> input_mappings_;
-
-  // Build input mappings from graph specification
-  void build_input_mappings();
-
-  // Detect expected dimensions from graph input shapes
-  void detect_dimensions_from_graph();
-
-  // Register BatchedInput tensors with the interpreter
-  void register_batch_inputs(ggml_context *ctx,
-                             const struct pet::BatchedInput &batch);
-
-  // Prepare simple inputs for direct-format graphs (single system only)
-  // Creates tensors in PyTorch format: species[n_atoms], edge_vectors[n_atoms, max_neighbors, 3], etc.
-  void prepare_direct_inputs(ggml_context *ctx, const AtomicSystem &system,
-                             const NeighborList &nlist);
+  // Predict a single system (all logic lives here)
+  ModelResult predict_single(const AtomicSystem &system, bool compute_forces);
 };
 
 } // namespace mlipcpp::runtime

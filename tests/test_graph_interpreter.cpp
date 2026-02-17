@@ -6,9 +6,6 @@
 #include <ggml-cpu.h>
 
 #include <cstring>
-#include <fstream>
-#include <map>
-#include <set>
 #include <sstream>
 #include <vector>
 
@@ -86,42 +83,82 @@ TEST_CASE("Graph summary", "[runtime]") {
   REQUIRE(summary.find("Nodes: 1") != std::string::npos);
 }
 
-TEST_CASE("Load exported PET transformer graph", "[runtime][pet]") {
-  // Load the exported PET transformer graph if it exists
-  std::ifstream file("/tmp/pet_transformer.json");
-  if (!file.is_open()) {
-    SKIP("PET transformer graph not found at /tmp/pet_transformer.json");
-    return;
-  }
-
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  std::string json = buffer.str();
+TEST_CASE("Execute MATMUL with non-square matrices", "[runtime][matmul][numerical]") {
+  // Test MUL_MAT: output = W @ x  with non-square dimensions
+  // W: [4, 3] (PyTorch) -> [3, 4] (GGML) — 3 input features, 4 output features
+  // x: [3]   (PyTorch) -> [3]   (GGML) — 3 input features
+  // output: [4]
+  std::string json = R"({
+    "version": "1.0.0",
+    "model_type": "test",
+    "inputs": [
+      {"name": "x", "dtype": "f32", "shape": [3]}
+    ],
+    "outputs": [
+      {"name": "y", "node_ref": "node:0"}
+    ],
+    "nodes": [
+      {"id": 0, "op": "MUL_MAT", "name": "matmul", "inputs": ["weight:W", "input:x"], "output_shape": [4], "output_dtype": "f32"}
+    ]
+  })";
 
   GraphInterpreter interp;
-  REQUIRE_NOTHROW(interp.load_graph(json));
-  REQUIRE(interp.has_graph());
+  interp.load_graph(json);
 
-  const auto &graph = interp.graph();
-  INFO("Loaded graph with " << graph.nodes.size() << " nodes");
+  struct ggml_init_params params = {
+      .mem_size = 16 * 1024 * 1024,
+      .mem_buffer = nullptr,
+      .no_alloc = true,
+  };
+  ggml_context *ctx = ggml_init(params);
+  REQUIRE(ctx != nullptr);
 
-  // TorchScript export produces ~40 nodes for transformer
-  REQUIRE(graph.nodes.size() >= 30);
+  // GGML W: [3, 4] (ne[0]=3 input_features, ne[1]=4 output_features)
+  ggml_tensor *W = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 4);
+  ggml_tensor *x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+  ggml_set_input(x);
 
-  // Check for expected operations
-  std::map<std::string, int> op_counts;
-  for (const auto &node : graph.nodes) {
-    op_counts[node.op]++;
-  }
+  interp.set_weight("W", W);
+  interp.set_input("x", x);
+  ggml_tensor *output = interp.build(ctx);
 
-  // Should have flash attention
-  REQUIRE(op_counts["FLASH_ATTN_EXT"] >= 1);
+  REQUIRE(output != nullptr);
+  REQUIRE(output->ne[0] == 4);
+  ggml_set_output(output);
 
-  // Should have matrix multiplications
-  REQUIRE(op_counts["MUL_MAT"] >= 1);
+  ggml_cgraph *cgraph = ggml_new_graph(ctx);
+  ggml_build_forward_expand(cgraph, output);
 
-  // Print summary
-  INFO("Summary:\n" << interp.summary());
+  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+  REQUIRE(cpu_backend != nullptr);
+
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+  REQUIRE(buf != nullptr);
+
+  // W (stored in GGML column-major layout):
+  // Row 0: [1, 2, 3]   -> output[0] = 1*1 + 2*2 + 3*3 = 14
+  // Row 1: [4, 5, 6]   -> output[1] = 4*1 + 5*2 + 6*3 = 32
+  // Row 2: [7, 8, 9]   -> output[2] = 7*1 + 8*2 + 9*3 = 50
+  // Row 3: [10, 11, 12] -> output[3] = 10*1 + 11*2 + 12*3 = 68
+  float W_data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  float x_data[] = {1, 2, 3};
+  ggml_backend_tensor_set(W, W_data, 0, sizeof(W_data));
+  ggml_backend_tensor_set(x, x_data, 0, sizeof(x_data));
+
+  ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
+  REQUIRE(status == GGML_STATUS_SUCCESS);
+
+  float out_data[4];
+  ggml_backend_tensor_get(output, out_data, 0, sizeof(out_data));
+
+  REQUIRE(out_data[0] == 14.0f);
+  REQUIRE(out_data[1] == 32.0f);
+  REQUIRE(out_data[2] == 50.0f);
+  REQUIRE(out_data[3] == 68.0f);
+
+  ggml_backend_buffer_free(buf);
+  ggml_backend_free(cpu_backend);
+  ggml_free(ctx);
 }
 
 TEST_CASE("Build simple addition graph", "[runtime][graph]") {
@@ -302,516 +339,8 @@ TEST_CASE("Build scale operation", "[runtime][graph]") {
   ggml_free(ctx);
 }
 
-// Helper to load a binary float array
-static std::vector<float> load_binary_floats(const std::string &path) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file.is_open()) {
-    return {};
-  }
-  file.seekg(0, std::ios::end);
-  size_t size = file.tellg();
-  file.seekg(0, std::ios::beg);
-  std::vector<float> data(size / sizeof(float));
-  file.read(reinterpret_cast<char *>(data.data()), size);
-  return data;
-}
 
-TEST_CASE("Execute simple MLP and compare to PyTorch", "[runtime][mlp][numerical]") {
-  // This test requires running the Python export first
-  std::ifstream file("/tmp/simple_mlp.json");
-  if (!file.is_open()) {
-    SKIP("Simple MLP graph not found at /tmp/simple_mlp.json");
-    return;
-  }
 
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  std::string json = buffer.str();
-
-  // Load binary data files
-  auto fc1_weight_data = load_binary_floats("/tmp/mlp_fc1_weight.bin");
-  auto fc1_bias_data = load_binary_floats("/tmp/mlp_fc1_bias.bin");
-  auto fc2_weight_data = load_binary_floats("/tmp/mlp_fc2_weight.bin");
-  auto fc2_bias_data = load_binary_floats("/tmp/mlp_fc2_bias.bin");
-  auto input_data = load_binary_floats("/tmp/mlp_input.bin");
-  auto expected_output = load_binary_floats("/tmp/mlp_output.bin");
-
-  if (fc1_weight_data.empty() || input_data.empty()) {
-    SKIP("Binary data files not found - run Python export first");
-    return;
-  }
-
-  GraphInterpreter interp;
-  REQUIRE_NOTHROW(interp.load_graph(json));
-
-  // Create GGML context with no_alloc=true for backend allocation
-  struct ggml_init_params params = {
-      .mem_size = 64 * 1024 * 1024,
-      .mem_buffer = nullptr,
-      .no_alloc = true,
-  };
-  ggml_context *ctx = ggml_init(params);
-  REQUIRE(ctx != nullptr);
-
-  // fc1: [128, 64] in PyTorch -> [64, 128] in GGML (transposed)
-  // fc2: [64, 128] in PyTorch -> [128, 64] in GGML (transposed)
-  ggml_tensor *fc1_weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 128);
-  ggml_tensor *fc1_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
-  ggml_tensor *fc2_weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 64);
-  ggml_tensor *fc2_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
-
-  // Input: [4, 64] in PyTorch -> [64, 4] in GGML
-  ggml_tensor *x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
-  ggml_set_input(x);
-
-  interp.set_weight("fc1_weight", fc1_weight);
-  interp.set_weight("fc1_bias", fc1_bias);
-  interp.set_weight("fc2_weight", fc2_weight);
-  interp.set_weight("fc2_bias", fc2_bias);
-  interp.set_input("x", x);
-
-  // Build the graph
-  ggml_tensor *output = interp.build(ctx);
-  REQUIRE(output != nullptr);
-  REQUIRE(output->ne[0] == 64);
-  REQUIRE(output->ne[1] == 4);
-  ggml_set_output(output);
-
-  // Create compute graph
-  ggml_cgraph *cgraph = ggml_new_graph(ctx);
-  ggml_build_forward_expand(cgraph, output);
-
-  // Allocate using CPU backend
-  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-  REQUIRE(cpu_backend != nullptr);
-
-  ggml_backend_buffer_t buf =
-      ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
-  REQUIRE(buf != nullptr);
-
-  // Copy data to tensors
-  ggml_backend_tensor_set(fc1_weight, fc1_weight_data.data(), 0,
-                          fc1_weight_data.size() * sizeof(float));
-  ggml_backend_tensor_set(fc1_bias, fc1_bias_data.data(), 0,
-                          fc1_bias_data.size() * sizeof(float));
-  ggml_backend_tensor_set(fc2_weight, fc2_weight_data.data(), 0,
-                          fc2_weight_data.size() * sizeof(float));
-  ggml_backend_tensor_set(fc2_bias, fc2_bias_data.data(), 0,
-                          fc2_bias_data.size() * sizeof(float));
-  ggml_backend_tensor_set(x, input_data.data(), 0,
-                          input_data.size() * sizeof(float));
-
-  // Compute
-  ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
-  REQUIRE(status == GGML_STATUS_SUCCESS);
-
-  // Get output data
-  std::vector<float> out_data(expected_output.size());
-  ggml_backend_tensor_get(output, out_data.data(), 0,
-                          out_data.size() * sizeof(float));
-
-  ggml_backend_buffer_free(buf);
-  ggml_backend_free(cpu_backend);
-
-  // Compare output to expected
-  float max_diff = 0.0f;
-  float sum_diff = 0.0f;
-  for (size_t i = 0; i < expected_output.size(); i++) {
-    float diff = std::abs(out_data[i] - expected_output[i]);
-    max_diff = std::max(max_diff, diff);
-    sum_diff += diff;
-  }
-
-  INFO("Max difference: " << max_diff);
-  INFO("Mean difference: " << sum_diff / expected_output.size());
-  INFO("Expected[0:4]: " << expected_output[0] << ", " << expected_output[1]
-                         << ", " << expected_output[2] << ", "
-                         << expected_output[3]);
-  INFO("Got[0:4]: " << out_data[0] << ", " << out_data[1] << ", "
-                    << out_data[2] << ", " << out_data[3]);
-
-  // Should match within floating point tolerance
-  REQUIRE(max_diff < 1e-4f);
-
-  ggml_free(ctx);
-}
-
-TEST_CASE("Load and build PET transformer graph", "[runtime][transformer]") {
-  // This test loads the exported PET transformer graph and verifies it can be built
-  std::ifstream file("/tmp/transformer_validation/transformer.json");
-  if (!file.is_open()) {
-    SKIP("PET transformer graph not found - run export_transformer_validation.py first");
-    return;
-  }
-
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  std::string json = buffer.str();
-
-  GraphInterpreter interp;
-  REQUIRE_NOTHROW(interp.load_graph(json));
-
-  // Verify graph structure
-  const auto &graph = interp.graph();
-  INFO("Graph has " << graph.nodes.size() << " nodes");
-  REQUIRE(graph.nodes.size() == 52);  // 4D-compatible wrapper, no mask
-
-  // Check inputs
-  REQUIRE(graph.inputs.size() == 2);
-  REQUIRE(graph.inputs[0].name == "tokens");
-  REQUIRE(graph.inputs[1].name == "cutoff_factors");
-
-  // Create context with no_alloc for backend allocation
-  struct ggml_init_params params = {
-      .mem_size = 256 * 1024 * 1024,  // 256 MB for transformer
-      .mem_buffer = nullptr,
-      .no_alloc = true,
-  };
-  ggml_context *ctx = ggml_init(params);
-  REQUIRE(ctx != nullptr);
-
-  // Create input tensors - GGML shape [256, 9, 2] = PyTorch [2, 9, 256]
-  ggml_tensor *tokens = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 9, 2);
-  ggml_tensor *cutoff = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 9, 2);
-  ggml_set_input(tokens);
-  ggml_set_input(cutoff);
-
-  interp.set_input("tokens", tokens);
-  interp.set_input("cutoff_factors", cutoff);
-
-  // Create weight tensors
-  // Layer 0 weights (GGML shapes = transposed PyTorch shapes)
-  std::map<std::string, std::pair<int, int>> weight_shapes_2d = {
-      {"layers_0_attention_input_linear_weight", {256, 768}},
-      {"layers_0_attention_output_linear_weight", {256, 256}},
-      {"layers_0_mlp_0_weight", {256, 512}},
-      {"layers_0_mlp_3_weight", {512, 256}},
-      {"layers_1_attention_input_linear_weight", {256, 768}},
-      {"layers_1_attention_output_linear_weight", {256, 256}},
-      {"layers_1_mlp_0_weight", {256, 512}},
-      {"layers_1_mlp_3_weight", {512, 256}},
-  };
-
-  std::map<std::string, int> weight_shapes_1d = {
-      {"layers_0_attention_input_linear_bias", 768},
-      {"layers_0_attention_output_linear_bias", 256},
-      {"layers_0_mlp_0_bias", 512},
-      {"layers_0_mlp_3_bias", 256},
-      {"layers_0_norm_attention_weight", 256},
-      {"layers_0_norm_attention_bias", 256},
-      {"layers_0_norm_mlp_weight", 256},
-      {"layers_0_norm_mlp_bias", 256},
-      {"layers_1_attention_input_linear_bias", 768},
-      {"layers_1_attention_output_linear_bias", 256},
-      {"layers_1_mlp_0_bias", 512},
-      {"layers_1_mlp_3_bias", 256},
-      {"layers_1_norm_attention_weight", 256},
-      {"layers_1_norm_attention_bias", 256},
-      {"layers_1_norm_mlp_weight", 256},
-      {"layers_1_norm_mlp_bias", 256},
-  };
-
-  for (const auto &[name, shape] : weight_shapes_2d) {
-    auto w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shape.first, shape.second);
-    interp.set_weight(name, w);
-  }
-
-  for (const auto &[name, size] : weight_shapes_1d) {
-    auto w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, size);
-    interp.set_weight(name, w);
-  }
-
-  // Try to build the graph
-  ggml_tensor *output = nullptr;
-  REQUIRE_NOTHROW(output = interp.build(ctx));
-  REQUIRE(output != nullptr);
-
-  // Check output shape - GGML [256, 9, 2] = PyTorch [2, 9, 256]
-  INFO("Output shape: [" << output->ne[0] << ", " << output->ne[1] << ", "
-                         << output->ne[2] << "]");
-  REQUIRE(output->ne[0] == 256);
-  REQUIRE(output->ne[1] == 9);
-  REQUIRE(output->ne[2] == 2);
-
-  ggml_free(ctx);
-}
-
-TEST_CASE("Load and build PET energy graph", "[runtime][pet_energy]") {
-  // This test loads the exported PET energy computation graph
-  std::ifstream file("/tmp/pet_energy_validation/pet_energy.json");
-  if (!file.is_open()) {
-    SKIP("PET energy graph not found - run export_pet_energy.py first");
-    return;
-  }
-
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  std::string json = buffer.str();
-
-  GraphInterpreter interp;
-  REQUIRE_NOTHROW(interp.load_graph(json));
-
-  // Verify graph structure
-  const auto &graph = interp.graph();
-  INFO("Graph has " << graph.nodes.size() << " nodes");
-  REQUIRE(graph.nodes.size() == 126);  // Full PET energy path (includes 4 SILU activations)
-
-  // Check inputs
-  REQUIRE(graph.inputs.size() == 1);
-  REQUIRE(graph.inputs[0].name == "tokens");
-
-  // Create context with no_alloc for backend allocation
-  struct ggml_init_params params = {
-      .mem_size = 512 * 1024 * 1024,  // 512 MB for full model
-      .mem_buffer = nullptr,
-      .no_alloc = true,
-  };
-  ggml_context *ctx = ggml_init(params);
-  REQUIRE(ctx != nullptr);
-
-  // Create input tensors - GGML shape [256, 9, 2] = PyTorch [2, 9, 256]
-  ggml_tensor *tokens = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 9, 2);
-  ggml_set_input(tokens);
-  interp.set_input("tokens", tokens);
-
-  // Load metadata to get weight shapes
-  std::ifstream meta_file("/tmp/pet_energy_validation/metadata.json");
-  if (!meta_file.is_open()) {
-    SKIP("Metadata file not found");
-    return;
-  }
-
-  // Parse metadata JSON to get weight shapes
-  // Simple manual parsing for "weights": {"name": [dim0, dim1], ...}
-  std::string meta_content((std::istreambuf_iterator<char>(meta_file)),
-                           std::istreambuf_iterator<char>());
-  meta_file.close();
-
-  // Create weight tensors based on the graph's weight references
-  std::set<std::string> weight_names;
-  for (const auto &node : graph.nodes) {
-    for (const auto &input : node.inputs) {
-      if (input.rfind("weight:", 0) == 0) {
-        weight_names.insert(input.substr(7));
-      }
-    }
-  }
-
-  INFO("Found " << weight_names.size() << " unique weights");
-
-  // Create weight tensors using shapes from metadata
-  for (const auto &name : weight_names) {
-    ggml_tensor *w = nullptr;
-
-    // Find shape in metadata: "name": [dim0, dim1]
-    std::string pattern = "\"" + name + "\": [";
-    size_t pos = meta_content.find(pattern);
-    if (pos != std::string::npos) {
-      pos += pattern.length();
-      size_t end = meta_content.find("]", pos);
-      std::string shape_str = meta_content.substr(pos, end - pos);
-
-      // Parse shape array
-      std::vector<int64_t> shape;
-      std::stringstream ss(shape_str);
-      std::string item;
-      while (std::getline(ss, item, ',')) {
-        shape.push_back(std::stoll(item));
-      }
-
-      // The export already transposes 2D weights for GGML.
-      // Metadata has PyTorch shape [out, in]. After export transpose,
-      // the file has [in, out] which is correct for GGML MUL_MAT.
-      // We just need to reverse for GGML dimension order.
-      std::reverse(shape.begin(), shape.end());
-
-      // Create tensor with appropriate dimensions
-      if (shape.size() == 1) {
-        w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, shape[0]);
-      } else if (shape.size() == 2) {
-        w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shape[0], shape[1]);
-      } else if (shape.size() == 3) {
-        w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, shape[0], shape[1], shape[2]);
-      }
-    }
-
-    if (w) {
-      interp.set_weight(name, w);
-    }
-  }
-
-  // Try to build the graph
-  ggml_tensor *output = nullptr;
-  REQUIRE_NOTHROW(output = interp.build(ctx));
-  REQUIRE(output != nullptr);
-
-  // Check output shape - should be [2] for 2 atoms
-  INFO("Output shape: [" << output->ne[0] << ", " << output->ne[1] << ", "
-                         << output->ne[2] << ", " << output->ne[3] << "]");
-  REQUIRE(output->ne[0] == 2);  // 2 atoms
-
-  ggml_free(ctx);
-}
-
-TEST_CASE("Execute PET energy graph with numerical validation",
-          "[runtime][pet_energy][numerical]") {
-  // Load PET energy graph
-  std::ifstream file("/tmp/pet_energy_validation/pet_energy.json");
-  if (!file.is_open()) {
-    SKIP("PET energy graph not found");
-    return;
-  }
-
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  std::string json = buffer.str();
-  file.close();
-
-  GraphInterpreter interp;
-  REQUIRE_NOTHROW(interp.load_graph(json));
-
-  // Enable debug output
-  interp.set_debug_output_dir("/tmp/pet_debug/cpp");
-
-  // Create GGML context
-  struct ggml_init_params params = {
-      .mem_size = 512 * 1024 * 1024,
-      .mem_buffer = nullptr,
-      .no_alloc = true,
-  };
-  ggml_context *ctx = ggml_init(params);
-  REQUIRE(ctx != nullptr);
-
-  // Load metadata for weight shapes
-  std::ifstream meta_file("/tmp/pet_energy_validation/metadata.json");
-  REQUIRE(meta_file.is_open());
-  std::string meta_content((std::istreambuf_iterator<char>(meta_file)),
-                           std::istreambuf_iterator<char>());
-  meta_file.close();
-
-  // Create input tensor - GGML shape [256, 9, 2]
-  ggml_tensor *tokens = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 9, 2);
-  ggml_set_input(tokens);
-  interp.set_input("tokens", tokens);
-
-  // Create weight tensors from metadata
-  const auto &graph = interp.graph();
-  std::set<std::string> weight_names;
-  for (const auto &node : graph.nodes) {
-    for (const auto &input : node.inputs) {
-      if (input.rfind("weight:", 0) == 0) {
-        weight_names.insert(input.substr(7));
-      }
-    }
-  }
-
-  std::map<std::string, ggml_tensor *> weight_tensors;
-  for (const auto &name : weight_names) {
-    std::string pattern = "\"" + name + "\": [";
-    size_t pos = meta_content.find(pattern);
-    if (pos != std::string::npos) {
-      pos += pattern.length();
-      size_t end = meta_content.find("]", pos);
-      std::string shape_str = meta_content.substr(pos, end - pos);
-
-      std::vector<int64_t> shape;
-      std::stringstream ss(shape_str);
-      std::string item;
-      while (std::getline(ss, item, ',')) {
-        shape.push_back(std::stoll(item));
-      }
-
-      // Reverse shape for GGML dimension ordering
-      // PyTorch [768, 256] -> GGML [256, 768] (same memory, reversed indices)
-      std::reverse(shape.begin(), shape.end());
-
-      ggml_tensor *w = nullptr;
-      if (shape.size() == 1) {
-        w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, shape[0]);
-      } else if (shape.size() == 2) {
-        w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, shape[0], shape[1]);
-      }
-
-      if (w) {
-        weight_tensors[name] = w;
-        interp.set_weight(name, w);
-      }
-    }
-  }
-
-  // Build graph
-  ggml_tensor *output = interp.build(ctx);
-  REQUIRE(output != nullptr);
-  REQUIRE(output->ne[0] == 2);
-  ggml_set_output(output);
-
-  // Create compute graph
-  ggml_cgraph *cgraph = ggml_new_graph(ctx);
-  ggml_build_forward_expand(cgraph, output);
-
-  // Allocate using CPU backend
-  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-  REQUIRE(cpu_backend != nullptr);
-
-  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
-  REQUIRE(buf != nullptr);
-
-  // Load and set input data
-  auto input_data = load_binary_floats("/tmp/pet_energy_validation/input_tokens.bin");
-  REQUIRE(!input_data.empty());
-  INFO("Input data size: " << input_data.size() << " floats");
-  INFO("Input[0:4]: " << input_data[0] << ", " << input_data[1] << ", "
-                      << input_data[2] << ", " << input_data[3]);
-  ggml_backend_tensor_set(tokens, input_data.data(), 0,
-                          input_data.size() * sizeof(float));
-
-  // Load and set weight data
-  int weights_loaded = 0;
-  for (const auto &[name, tensor] : weight_tensors) {
-    std::string path = "/tmp/pet_energy_validation/" + name + ".bin";
-    auto data = load_binary_floats(path);
-    if (!data.empty()) {
-      ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
-      weights_loaded++;
-    }
-  }
-  INFO("Loaded " << weights_loaded << " / " << weight_tensors.size() << " weights");
-
-  // Compute
-  ggml_status status = ggml_backend_graph_compute(cpu_backend, cgraph);
-  REQUIRE(status == GGML_STATUS_SUCCESS);
-
-  // Dump all intermediate tensors for debugging
-  interp.dump_all_tensors();
-  INFO("Debug tensors dumped to /tmp/pet_debug/cpp/");
-
-  // Get output data
-  auto expected_output = load_binary_floats("/tmp/pet_energy_validation/expected_output.bin");
-  REQUIRE(expected_output.size() == 2);
-
-  std::vector<float> out_data(2);
-  ggml_backend_tensor_get(output, out_data.data(), 0, 2 * sizeof(float));
-
-  ggml_backend_buffer_free(buf);
-  ggml_backend_free(cpu_backend);
-
-  // Compare output
-  INFO("Expected: [" << expected_output[0] << ", " << expected_output[1] << "]");
-  INFO("Got: [" << out_data[0] << ", " << out_data[1] << "]");
-  INFO("Expected total: " << expected_output[0] + expected_output[1]);
-  INFO("Got total: " << out_data[0] + out_data[1]);
-
-  float max_diff = 0.0f;
-  for (size_t i = 0; i < 2; i++) {
-    float diff = std::abs(out_data[i] - expected_output[i]);
-    max_diff = std::max(max_diff, diff);
-  }
-
-  INFO("Max difference: " << max_diff);
-  REQUIRE(max_diff < 1e-3f);  // Allow 0.1% error for complex graph
-
-  ggml_free(ctx);
-}
 
 TEST_CASE("Build layer norm graph", "[runtime][graph]") {
   // Test layer norm decomposition
