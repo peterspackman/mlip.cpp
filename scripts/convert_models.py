@@ -6,28 +6,39 @@ Wraps export_pet_gguf.py for each model, producing GGUF files
 suitable for use with mlipcpp's GraphModel / Predictor API.
 
 Usage:
-    uv run scripts/convert_models.py                         # Convert all models
-    uv run scripts/convert_models.py --models pet-mad-s      # Convert one model
-    uv run scripts/convert_models.py --output-dir local/      # Custom output dir
-    uv run scripts/convert_models.py --forces                 # Include forces support
+    uv run scripts/convert_models.py                         # Convert default (small) models
+    uv run scripts/convert_models.py --all                   # Convert all models incl. large/xl
+    uv run scripts/convert_models.py --models pet-omat-xl    # Convert specific model(s)
     uv run scripts/convert_models.py --list                   # List available models
     uv run scripts/convert_models.py --force                  # Re-convert existing files
 """
 
 import argparse
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-AVAILABLE_MODELS = [
+# Default models converted by `convert_models.py` (no flags)
+DEFAULT_MODELS = [
     "pet-mad-s",
+    "pet-oam-l",
     "pet-omad-xs",
     "pet-omad-s",
     "pet-omat-xs",
     "pet-omat-s",
     "pet-spice-s",
+]
+
+# All available uPET models (including large/xl variants)
+ALL_MODELS = DEFAULT_MODELS + [
+    "pet-oam-xl",
+    "pet-omad-l",
+    "pet-omat-m",
+    "pet-omat-l",
+    "pet-omat-xl",
+    "pet-omatpes-l",
+    "pet-spice-l",
 ]
 
 EXPORT_SCRIPT = Path(__file__).parent / "export_pytorch" / "export_pet_gguf.py"
@@ -36,7 +47,6 @@ EXPORT_SCRIPT = Path(__file__).parent / "export_pytorch" / "export_pet_gguf.py"
 def convert_model(
     model_name: str,
     output_dir: Path,
-    forces: bool = False,
     n_atoms: int = 7,
     max_neighbors: int = 11,
 ) -> bool:
@@ -44,8 +54,7 @@ def convert_model(
 
     Returns True on success, False on failure.
     """
-    suffix = "-forces" if forces else ""
-    output_path = output_dir / f"{model_name}{suffix}.gguf"
+    output_path = output_dir / f"{model_name}.gguf"
 
     cmd = [
         sys.executable,
@@ -55,13 +64,11 @@ def convert_model(
         "--n-atoms", str(n_atoms),
         "--max-neighbors", str(max_neighbors),
     ]
-    if forces:
-        cmd.append("--forces")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        print(f"  FAILED: {model_name}{suffix}")
+        print(f"  FAILED: {model_name}")
         # Show last few lines of stderr for diagnosis
         stderr_lines = result.stderr.strip().split("\n")
         for line in stderr_lines[-5:]:
@@ -83,15 +90,15 @@ def main():
     )
     parser.add_argument(
         "--models", nargs="+", default=None,
-        help="Specific models to convert (default: all)",
+        help="Specific models to convert (default: small/xs/s variants)",
     )
     parser.add_argument(
-        "--output-dir", "-o", type=str, default="local",
-        help="Output directory for GGUF files (default: local/)",
+        "--all", action="store_true",
+        help="Convert all models including large/xl variants",
     )
     parser.add_argument(
-        "--forces", action="store_true",
-        help="Also export forces-enabled variants",
+        "--output-dir", "-o", type=str, default="gguf",
+        help="Output directory for GGUF files (default: gguf/)",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -112,39 +119,38 @@ def main():
     args = parser.parse_args()
 
     if args.list:
-        print("Available models:")
-        for m in AVAILABLE_MODELS:
+        print("Default models:")
+        for m in DEFAULT_MODELS:
             print(f"  {m}")
+        print("\nAdditional models (use --all or --models):")
+        for m in ALL_MODELS:
+            if m not in DEFAULT_MODELS:
+                print(f"  {m}")
         return
 
-    models = args.models if args.models else AVAILABLE_MODELS
+    if args.models:
+        models = args.models
+    elif args.all:
+        models = ALL_MODELS
+    else:
+        models = DEFAULT_MODELS
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Validate model names
     for m in models:
-        if m not in AVAILABLE_MODELS:
+        if m not in ALL_MODELS:
             print(f"Warning: '{m}' not in known models list, attempting anyway")
 
-    # Build list of conversions
+    # Build list of conversions, skip already-converted unless --force
     conversions = []
     for model_name in models:
-        conversions.append((model_name, False))
-        if args.forces:
-            conversions.append((model_name, True))
-
-    # Filter out already-converted unless --force
-    if not args.force:
-        filtered = []
-        for model_name, forces in conversions:
-            suffix = "-forces" if forces else ""
-            output_path = output_dir / f"{model_name}{suffix}.gguf"
-            if output_path.exists():
-                size_mb = output_path.stat().st_size / (1024 * 1024)
-                print(f"  SKIP: {output_path.name} already exists ({size_mb:.1f} MB)")
-            else:
-                filtered.append((model_name, forces))
-        conversions = filtered
+        output_path = output_dir / f"{model_name}.gguf"
+        if not args.force and output_path.exists():
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            print(f"  SKIP: {output_path.name} already exists ({size_mb:.1f} MB)")
+        else:
+            conversions.append(model_name)
 
     if not conversions:
         print("Nothing to convert.")
@@ -156,10 +162,9 @@ def main():
     success = 0
     failed = 0
 
-    for i, (model_name, forces) in enumerate(conversions):
-        suffix = " (forces)" if forces else ""
-        print(f"[{i+1}/{len(conversions)}] {model_name}{suffix}...")
-        if convert_model(model_name, output_dir, forces,
+    for i, model_name in enumerate(conversions):
+        print(f"[{i+1}/{len(conversions)}] {model_name}...")
+        if convert_model(model_name, output_dir,
                          args.n_atoms, args.max_neighbors):
             success += 1
         else:

@@ -33,7 +33,7 @@ namespace fs = std::filesystem;
 
 // Test data paths
 static const char *MANUAL_MODEL_PATH = "local/pet-mad.gguf";
-static const char *AUTO_MODEL_PATH = "local/pet-auto.gguf";
+static const char *AUTO_MODEL_PATH = "gguf/pet-auto.gguf";
 static const char *WATER_XYZ = "geometries/water.xyz";
 static const char *SI_XYZ = "geometries/si.xyz";
 

@@ -142,25 +142,35 @@ struct Predictor::Impl {
     // Use predict_batch for NC forces support
     auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
     if (pet_model) {
+      const bool compute_grad =
+          (options.compute_forces || options.compute_stress) &&
+          !options.use_nc_forces;
       auto internal_results = pet_model->predict_batch(
           {system},
-          options.compute_forces && !options.use_nc_forces,  // gradient-based forces
-          options.use_nc_forces  // NC forces from forward pass
+          compute_grad, // gradient-based outputs
+          options.use_nc_forces // NC outputs from forward pass
       );
       auto &internal_result = internal_results[0];
 
       Result result;
       result.energy = internal_result.energy;
-      if (internal_result.has_forces) {
+      if (options.compute_forces && internal_result.has_forces) {
         result.forces = std::move(internal_result.forces);
       }
-      if (internal_result.has_stress) {
+      if (options.compute_stress && internal_result.has_stress) {
         result.stress = std::move(internal_result.stress);
       }
       return result;
     } else {
       // Fallback for non-PET models
-      return predict_impl(system, options.compute_forces);
+      auto result = predict_impl(system, options.compute_forces || options.compute_stress);
+      if (!options.compute_forces) {
+        result.forces.clear();
+      }
+      if (!options.compute_stress) {
+        result.stress.clear();
+      }
+      return result;
     }
   }
 };

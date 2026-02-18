@@ -29,7 +29,6 @@ stdout
 
 # Development directories
 testing/
-local/
 
 # WASM build output
 wasm/

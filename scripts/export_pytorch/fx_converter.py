@@ -7,6 +7,7 @@ Supports two export modes:
 
 import json
 import operator
+import re
 import torch
 import torch.fx as fx
 from torch.fx.passes.shape_prop import ShapeProp
@@ -841,6 +842,7 @@ def convert_exported_to_gir(
     input_names: List[str] = None,
     input_dtypes: Dict[str, GGMLDtype] = None,
     pre_extracted_weights: Dict[str, torch.Tensor] = None,
+    dynamic_shapes: Optional[Any] = None,
     strict_mode: bool = False,
 ) -> Tuple[GGMLGraph, Dict[str, torch.Tensor]]:
     """Convert a torch.export exported graph to GIR.
@@ -870,6 +872,64 @@ def convert_exported_to_gir(
 
     # Track placeholder count for input names (excluding parameter placeholders)
     placeholder_idx = 0
+    symbol_token_to_name: Dict[str, str] = {}
+
+    def _dim_name_from_spec(dim_spec: Any) -> Optional[str]:
+        if dim_spec is None:
+            return None
+        if hasattr(dim_spec, "__name__"):
+            return str(dim_spec.__name__)
+        if isinstance(dim_spec, str):
+            return dim_spec
+        return None
+
+    def _sym_expr_to_runtime_name(expr: str) -> Optional[str]:
+        cleaned = expr.replace(" ", "")
+        if cleaned in {"n_atoms", "max_neighbors", "n_edges", "seq_len", "max_neighbors_plus_one"}:
+            return cleaned
+        if cleaned in {"n_atoms*max_neighbors", "max_neighbors*n_atoms"}:
+            return "n_edges"
+        if cleaned in {"max_neighbors+1", "1+max_neighbors", "(max_neighbors+1)", "(1+max_neighbors)"}:
+            return "max_neighbors_plus_one"
+        if cleaned in {
+            "n_atoms*(max_neighbors+1)",
+            "n_atoms*(1+max_neighbors)",
+            "(max_neighbors+1)*n_atoms",
+            "(1+max_neighbors)*n_atoms",
+        }:
+            return "seq_len"
+        return None
+
+    def _to_runtime_dim(dim: Any) -> Union[int, str]:
+        if isinstance(dim, int):
+            return dim
+
+        raw = str(dim)
+        compact = raw.replace(" ", "")
+        if compact in symbol_token_to_name:
+            return symbol_token_to_name[compact]
+
+        # Replace raw torch symbolic tokens (e.g. s0, s11) with runtime names.
+        expr = compact
+        for token, name in sorted(symbol_token_to_name.items(), key=lambda x: len(x[0]), reverse=True):
+            expr = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])",
+                name,
+                expr,
+            )
+
+        runtime_name = _sym_expr_to_runtime_name(expr)
+        if runtime_name is not None:
+            return runtime_name
+
+        # Preserve unknown symbolic strings for debugging; runtime parser will
+        # gracefully fall back to -1 for unsupported symbols.
+        return expr
+
+    def _to_runtime_shape(shape: Optional[List[Any]]) -> List[Union[int, str]]:
+        if not shape:
+            return []
+        return [_to_runtime_dim(dim) for dim in shape]
 
     # Get any additional parameters and buffers
     for name, param in exported_module.named_parameters():
@@ -922,10 +982,20 @@ def convert_exported_to_gir(
                 # This is an actual input
                 inp_name = input_names[placeholder_idx] if input_names and placeholder_idx < len(input_names) else node.name
                 inp_dtype = input_dtypes.get(inp_name, dtype) if input_dtypes else dtype
+                if dynamic_shapes is not None and shape is not None and placeholder_idx < len(dynamic_shapes):
+                    spec = dynamic_shapes[placeholder_idx]
+                    if isinstance(spec, dict):
+                        for dim_idx, dim_spec in spec.items():
+                            dim_name = _dim_name_from_spec(dim_spec)
+                            if dim_name is None:
+                                continue
+                            if isinstance(dim_idx, int) and 0 <= dim_idx < len(shape):
+                                token = str(shape[dim_idx]).replace(" ", "")
+                                symbol_token_to_name[token] = dim_name
                 gir_inputs.append(GGMLInput(
                     name=inp_name,
                     dtype=inp_dtype,
-                    shape=shape or [],
+                    shape=_to_runtime_shape(shape),
                 ))
                 name_map[node.name] = f"input:{inp_name}"
                 placeholder_idx += 1
@@ -975,7 +1045,7 @@ def convert_exported_to_gir(
                         op="VIEW",
                         name=node.name,
                         inputs=[input_ref],
-                        output_shape=chunk_output_shape,
+                        output_shape=_to_runtime_shape(chunk_output_shape),
                         output_dtype=dtype,
                         params={"index": idx},
                     ))
@@ -1015,20 +1085,25 @@ def convert_exported_to_gir(
                             ref = name_map.get(item.name)
                             if ref:
                                 input_refs.append(ref)
-                        elif isinstance(item, (int, float)):
+                        elif not isinstance(item, fx.Node):
+                            dim_value = _to_runtime_dim(item)
                             if "shape" not in params:
                                 params["shape"] = []
-                            params["shape"].append(item)
+                            params["shape"].append(dim_value)
 
             # Handle specific ops
             if ggml_op == "VIEW" or ggml_op == "RESHAPE":
-                # Shape is usually in args[1] or the rest of args
-                if len(node.args) > 1:
+                # Prefer propagated output shape: this preserves symbolic dims
+                # (e.g. n_edges) and avoids leaking intermediate sym_size nodes.
+                if shape:
+                    params["shape"] = _to_runtime_shape(shape)
+                # Fallback: infer from args when shape metadata is unavailable.
+                elif len(node.args) > 1:
                     shape_arg = node.args[1]
                     if isinstance(shape_arg, (list, tuple)):
-                        params["shape"] = list(shape_arg)
-                    elif isinstance(shape_arg, fx.Node) and shape:
-                        params["shape"] = shape
+                        params["shape"] = [_to_runtime_dim(dim) for dim in shape_arg]
+                    elif isinstance(shape_arg, fx.Node):
+                        params["shape"] = []
 
             elif ggml_op == "PERMUTE":
                 # Permutation indices
@@ -1165,7 +1240,7 @@ def convert_exported_to_gir(
                 op=ggml_op,
                 name=node.name,
                 inputs=input_refs,
-                output_shape=shape or [],
+                output_shape=_to_runtime_shape(shape),
                 output_dtype=dtype,
                 params=params if params else None,
             ))
@@ -1181,8 +1256,11 @@ def convert_exported_to_gir(
                 params = {}
 
                 if method_name in ("view", "reshape"):
-                    shape_args = [a for a in node.args[1:] if isinstance(a, int)]
-                    params["shape"] = shape_args if shape_args else (shape or [])
+                    if shape:
+                        params["shape"] = _to_runtime_shape(shape)
+                    else:
+                        shape_args = [_to_runtime_dim(a) for a in node.args[1:] if not isinstance(a, fx.Node)]
+                        params["shape"] = shape_args
 
                 elif method_name == "permute":
                     perm = [a for a in node.args[1:] if isinstance(a, int)]
@@ -1197,7 +1275,7 @@ def convert_exported_to_gir(
                     op=ggml_op,
                     name=node.name,
                     inputs=[input_ref],
-                    output_shape=shape or [],
+                    output_shape=_to_runtime_shape(shape),
                     output_dtype=dtype,
                     params=params if params else None,
                 ))
@@ -1217,7 +1295,7 @@ def convert_exported_to_gir(
                         ref = name_map.get(arg.name, f"node:{node_id-1}")
                         out_shape = []
                         if "val" in arg.meta and hasattr(arg.meta["val"], "shape"):
-                            out_shape = list(arg.meta["val"].shape)
+                            out_shape = _to_runtime_shape(list(arg.meta["val"].shape))
                         gir_outputs.append(GGMLOutput(
                             name=f"output_{i}" if len(output_args) > 1 else "output",
                             node_ref=ref,
@@ -1230,7 +1308,7 @@ def convert_exported_to_gir(
                     name="output",
                     node_ref=ref,
                     dtype=dtype,
-                    shape=shape or [],
+                    shape=_to_runtime_shape(shape),
                 ))
 
     return GGMLGraph(
@@ -1527,6 +1605,7 @@ def export_torch_model(
     output_path: Path,
     input_names: List[str] = None,
     input_dtypes: Dict[str, str] = None,
+    dynamic_shapes: Optional[Any] = None,
     strict: bool = False,
 ) -> Tuple[GGMLGraph, Dict[str, torch.Tensor]]:
     """Export a PyTorch module via torch.export to GIR.
@@ -1549,9 +1628,27 @@ def export_torch_model(
 
     # Use torch.export
     print("Running torch.export...")
-    exported = torch.export.export(module, example_inputs, strict=strict)
+    if dynamic_shapes is None:
+        exported = torch.export.export(module, example_inputs, strict=strict)
+    else:
+        exported = torch.export.export(
+            module, example_inputs, dynamic_shapes=dynamic_shapes, strict=strict
+        )
 
     print(f"Export succeeded! Graph has {len(list(exported.graph_module.graph.nodes))} nodes")
+
+    def _flatten_dynamic_specs(spec: Any) -> List[Any]:
+        # Keep dict leaves intact; only recurse list/tuple containers.
+        if isinstance(spec, (list, tuple)):
+            out: List[Any] = []
+            for item in spec:
+                out.extend(_flatten_dynamic_specs(item))
+            return out
+        return [spec]
+
+    flat_dynamic_shapes = (
+        _flatten_dynamic_specs(dynamic_shapes) if dynamic_shapes is not None else None
+    )
 
     # Build input shapes and dtypes dict
     input_shapes = {}
@@ -1590,6 +1687,7 @@ def export_torch_model(
         input_names,
         input_dtype_map,
         weights,  # Pass pre-extracted weights
+        dynamic_shapes=flat_dynamic_shapes,
     )
 
     # Merge any additional weights found during conversion

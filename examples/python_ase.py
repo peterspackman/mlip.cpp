@@ -19,7 +19,7 @@ import sys
 try:
     from ase import Atoms
     from ase.build import molecule, bulk
-    from ase.optimize import BFGS
+    from ase.optimize import LBFGSLineSearch
 except ImportError:
     print("ASE is required for this example. Install with: pip install ase")
     sys.exit(1)
@@ -48,7 +48,8 @@ def example_molecule(model_path: str):
 
     # Optimize geometry
     print("\nOptimizing geometry...")
-    opt = BFGS(atoms, logfile=None)
+    # Line-search variant is generally more robust for graph-exported models.
+    opt = LBFGSLineSearch(atoms, logfile=None)
     opt.run(fmax=0.01)
 
     print(f"Final energy: {atoms.get_potential_energy():.6f} eV")

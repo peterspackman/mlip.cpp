@@ -24,6 +24,7 @@ import numpy as np
 import warnings
 from pathlib import Path
 import sys
+from packaging.version import Version
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -63,14 +64,40 @@ def load_pet_model(model_name: str):
     from metatrain.utils.io import load_model as load_metatrain_model
     from upet._models import upet_get_version_to_load
 
-    version = upet_get_version_to_load(model_base, size)
-    model_string = f"{model_base}-{size}-v{version}.ckpt"
-    print(f"Downloading {model_string} from HuggingFace...")
-    path = hf_hub_download(
-        repo_id="lab-cosmo/upet",
-        filename=model_string,
-        subfolder="models",
-    )
+    path = None
+    model_string = None
+    try:
+        version = upet_get_version_to_load(model_base, size)
+        model_string = f"{model_base}-{size}-v{version}.ckpt"
+        print(f"Downloading {model_string} from HuggingFace...")
+        path = hf_hub_download(
+            repo_id="lab-cosmo/upet",
+            filename=model_string,
+            subfolder="models",
+        )
+    except Exception as e:
+        # Offline/cached fallback: resolve latest matching checkpoint from local HF cache.
+        cache_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--lab-cosmo--upet" / "snapshots"
+        pattern = f"{model_base}-{size}-v*.ckpt"
+        candidates = sorted(cache_root.glob(f"*/models/{pattern}"))
+        if not candidates:
+            raise RuntimeError(
+                f"Failed to resolve {model_base}-{size} from HuggingFace and no cached "
+                f"checkpoint found matching {pattern} under {cache_root}"
+            ) from e
+
+        def _ver_key(p: Path):
+            stem = p.stem  # pet-oam-l-v0.1.0
+            v = stem.rsplit("-v", 1)[-1]
+            try:
+                return Version(v)
+            except Exception:
+                return Version("0")
+
+        path_obj = max(candidates, key=_ver_key)
+        model_string = path_obj.name
+        path = str(path_obj)
+        print(f"Using cached checkpoint {model_string} at {path}")
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
@@ -296,26 +323,32 @@ class PETFullModel(torch.nn.Module):
             reverse_neighbor_index = args[2]
             cutoff_factors = args[3]
 
+        n_atoms = species.shape[0]
+        max_neighbors = neighbor_species.shape[1]
+
         # Initial neighbor species embeddings
         neighbor_embeds_flat = self.neighbor_embedder(neighbor_species.flatten())
-        input_messages = neighbor_embeds_flat.view(self.n_atoms, self.max_neighbors, self.d_pet)
+        input_messages = neighbor_embeds_flat.view(n_atoms, max_neighbors, self.d_pet)
 
         if self.featurizer_type == 'feedforward':
             return self._forward_feedforward(
                 species, neighbor_species, edge_vectors, edge_distances,
-                padding_mask, reverse_neighbor_index, cutoff_factors, input_messages
+                padding_mask, reverse_neighbor_index, cutoff_factors,
+                input_messages, n_atoms, max_neighbors
             )
         else:
             return self._forward_residual(
                 species, neighbor_species, edge_vectors, edge_distances,
-                padding_mask, reverse_neighbor_index, cutoff_factors, input_messages
+                padding_mask, reverse_neighbor_index, cutoff_factors,
+                input_messages, n_atoms, max_neighbors
             )
 
     def _forward_residual(self, species, neighbor_species, edge_vectors, edge_distances,
-                          padding_mask, reverse_neighbor_index, cutoff_factors, input_messages):
+                          padding_mask, reverse_neighbor_index, cutoff_factors,
+                          input_messages, n_atoms, max_neighbors):
         """Residual featurization: per-layer energy accumulation (pet-mad-s style)."""
         # Initialize atomic energies accumulator
-        atomic_energies = species.new_zeros(self.n_atoms, dtype=torch.float32)
+        atomic_energies = species.new_zeros(n_atoms, dtype=torch.float32)
 
         # Process through GNN layers with per-layer energy readout
         for gnn_idx, (node_embedder, gnn_layer) in enumerate(
@@ -366,10 +399,10 @@ class PETFullModel(torch.nn.Module):
 
             # Message passing: prepare input for next layer (simple average)
             flat_output = output_edge.reshape(
-                self.n_atoms * self.max_neighbors, self.d_pet
+                n_atoms * max_neighbors, self.d_pet
             )
             reversed_messages = flat_output[reverse_neighbor_index].reshape(
-                self.n_atoms, self.max_neighbors, self.d_pet
+                n_atoms, max_neighbors, self.d_pet
             )
             # Zero out padded positions (reverse_idx for padded slots may point to valid edges)
             reversed_messages = torch.where(
@@ -382,7 +415,8 @@ class PETFullModel(torch.nn.Module):
         return atomic_energies
 
     def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
-                             padding_mask, reverse_neighbor_index, cutoff_factors, input_messages):
+                             padding_mask, reverse_neighbor_index, cutoff_factors,
+                             input_messages, n_atoms, max_neighbors):
         """Feedforward featurization: combination_mlps between layers, final-only energy (pet-omad-s style)."""
         # Single node embedder used for all layers
         input_node_embeddings = self.node_embedders[0](species)
@@ -422,10 +456,10 @@ class PETFullModel(torch.nn.Module):
             # Message passing with combination MLPs
             # Reverse the edge messages
             flat_output = output_edge.reshape(
-                self.n_atoms * self.max_neighbors, self.d_pet
+                n_atoms * max_neighbors, self.d_pet
             )
             new_input_messages = flat_output[reverse_neighbor_index].reshape(
-                self.n_atoms, self.max_neighbors, self.d_pet
+                n_atoms, max_neighbors, self.d_pet
             )
             # Zero out padded positions (reverse_idx for padded slots may point to valid edges)
             new_input_messages = torch.where(

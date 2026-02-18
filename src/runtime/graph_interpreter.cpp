@@ -188,6 +188,10 @@ void GraphInterpreter::init_constants() {
       }
     }
   }
+
+  // Constants are context-owned; clear pointers after initialization to avoid
+  // stale writes on subsequent builds with different contexts.
+  pending_constants_.clear();
 }
 
 ggml_tensor *GraphInterpreter::resolve_input(ggml_context *ctx,
@@ -233,7 +237,9 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
     throw std::runtime_error("No graph loaded");
   }
 
+  output_ = nullptr;
   node_outputs_.clear();
+  pending_constants_.clear();
 
   // Build nodes in order (they should already be topologically sorted)
   for (const auto &node : graph_.nodes) {

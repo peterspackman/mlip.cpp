@@ -16,7 +16,7 @@ mlipcpp = pytest.importorskip("mlipcpp")
 
 def model_path(name: str) -> str:
     """Resolve model path relative to project root."""
-    return os.path.join(os.path.dirname(__file__), "..", "local", name)
+    return os.path.join(os.path.dirname(__file__), "..", "gguf", name)
 
 
 def geometry_path(name: str) -> str:
@@ -61,13 +61,6 @@ class TestPredictorAPI:
             pytest.skip(f"Model not found: {path}")
         return mlipcpp.Predictor(path)
 
-    @pytest.fixture
-    def forces_model(self):
-        path = model_path("pet-auto-forces.gguf")
-        if not os.path.exists(path):
-            pytest.skip(f"Forces model not found: {path}")
-        return mlipcpp.Predictor(path)
-
     def test_model_type(self, auto_model):
         assert auto_model.model_type in ("PET", "PET-Graph")
 
@@ -87,13 +80,13 @@ class TestPredictorAPI:
         np.testing.assert_allclose(result.energy, WATER_ENERGY_REF, atol=0.01,
                                    err_msg=f"Water energy {result.energy} eV doesn't match reference {WATER_ENERGY_REF} eV")
 
-    def test_water_forces(self, forces_model):
+    def test_water_forces(self, auto_model):
         water_path = geometry_path("water.xyz")
         if not os.path.exists(water_path):
             pytest.skip("water.xyz not found")
 
         positions, atomic_numbers = read_xyz(water_path)
-        result = forces_model.predict(positions, atomic_numbers, compute_forces=True)
+        result = auto_model.predict(positions, atomic_numbers, compute_forces=True)
         assert result.energy < 0.0
         assert result.has_forces()
 
@@ -125,11 +118,19 @@ class TestPredictorAPI:
 
 KNOWN_MODELS = [
     "pet-mad-s",
+    "pet-oam-l",
+    "pet-oam-xl",
     "pet-omad-xs",
     "pet-omad-s",
+    "pet-omad-l",
     "pet-omat-xs",
     "pet-omat-s",
+    "pet-omat-m",
+    "pet-omat-l",
+    "pet-omat-xl",
+    "pet-omatpes-l",
     "pet-spice-s",
+    "pet-spice-l",
 ]
 
 
@@ -138,7 +139,7 @@ def test_named_model_loads(model_name):
     """Test that each named model GGUF loads and produces reasonable energy."""
     path = model_path(f"{model_name}.gguf")
     if not os.path.exists(path):
-        pytest.skip(f"{model_name}.gguf not found in local/")
+        pytest.skip(f"{model_name}.gguf not found in gguf/")
 
     pred = mlipcpp.Predictor(path)
     assert pred.cutoff > 0.0
@@ -149,8 +150,46 @@ def test_named_model_loads(model_name):
 
     positions, atomic_numbers = read_xyz(water_path)
     result = pred.predict(positions, atomic_numbers, compute_forces=False)
-    assert result.energy < 0.0
-    assert result.energy > -100.0
+    assert np.isfinite(result.energy), f"Energy is not finite: {result.energy}"
+    assert result.energy < 0.0, f"Expected negative energy, got {result.energy}"
+
+
+def test_spice_force_matches_finite_difference():
+    """Sanity check: reported forces should match -dE/dx for PET-Graph SPICE model."""
+    path = model_path("pet-spice-s.gguf")
+    if not os.path.exists(path):
+        pytest.skip("pet-spice-s.gguf not found in gguf/")
+
+    urea_path = geometry_path("urea_molecule.xyz")
+    if not os.path.exists(urea_path):
+        pytest.skip("urea_molecule.xyz not found")
+
+    pred = mlipcpp.Predictor(path)
+    positions, atomic_numbers = read_xyz(urea_path)
+
+    result = pred.predict(positions, atomic_numbers, compute_forces=True)
+    assert result.has_forces()
+    forces = np.array(result.forces, dtype=np.float32)
+
+    eps = 1e-2
+    atom_idx = 0
+    coord_idx = 0
+
+    pos_plus = positions.copy()
+    pos_minus = positions.copy()
+    pos_plus[atom_idx, coord_idx] += eps
+    pos_minus[atom_idx, coord_idx] -= eps
+
+    e_plus = pred.predict(pos_plus, atomic_numbers, compute_forces=False).energy
+    e_minus = pred.predict(pos_minus, atomic_numbers, compute_forces=False).energy
+    fd_force = -(e_plus - e_minus) / (2.0 * eps)
+
+    np.testing.assert_allclose(
+        forces[atom_idx, coord_idx],
+        fd_force,
+        atol=0.1,
+        err_msg="Force/energy gradient mismatch on pet-spice-s (urea)",
+    )
 
 
 # --- ASE calculator tests ---

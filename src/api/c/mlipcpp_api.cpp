@@ -537,15 +537,28 @@ mlipcpp_error_t mlipcpp_predict_with_options(mlipcpp_model_t model,
     // Run prediction using predict_batch for NC forces support
     auto *pet_model = dynamic_cast<mlipcpp::pet::PETModel *>(model->model.get());
     if (pet_model) {
+      const bool compute_grad =
+          (options->compute_forces || options->compute_stress) &&
+          !options->use_nc_forces;
       auto results = pet_model->predict_batch(
           {cpp_system},
-          options->compute_forces && !options->use_nc_forces,  // gradient-based forces
-          options->use_nc_forces  // NC forces from forward pass
+          compute_grad,            // gradient-based outputs
+          options->use_nc_forces   // NC outputs from forward pass
       );
       model->last_result = std::move(results[0]);
     } else {
       // Fallback for non-PET models
-      model->last_result = model->model->predict(cpp_system, options->compute_forces);
+      model->last_result = model->model->predict(
+          cpp_system, options->compute_forces || options->compute_stress);
+    }
+
+    if (!options->compute_forces) {
+      model->last_result.forces.clear();
+      model->last_result.has_forces = false;
+    }
+    if (!options->compute_stress) {
+      model->last_result.stress.clear();
+      model->last_result.has_stress = false;
     }
     model->last_n_atoms = system->n_atoms;
 

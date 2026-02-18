@@ -237,7 +237,7 @@ TEST_CASE("GraphModel with direct inputs matches interpreter",
 }
 
 TEST_CASE("GraphModel GGUF energy prediction", "[graph][model][gguf]") {
-  const std::string model_path = "local/pet-auto.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
 
   if (!std::filesystem::exists(model_path)) {
@@ -277,13 +277,11 @@ TEST_CASE("GraphModel GGUF energy prediction", "[graph][model][gguf]") {
 }
 
 TEST_CASE("GraphModel GGUF forces prediction", "[graph][model][gguf][forces]") {
-  const std::string model_path = "local/pet-auto-forces.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
 
   if (!std::filesystem::exists(model_path)) {
-    SKIP("Forces GGUF not found at " << model_path
-         << " - export with: uv run scripts/export_pytorch/export_pet_gguf.py "
-            "--forces -o local/pet-auto-forces.gguf");
+    SKIP("Auto-exported GGUF not found at " << model_path);
   }
   if (!std::filesystem::exists(water_xyz)) {
     SKIP("Water XYZ file not found");
@@ -326,7 +324,7 @@ TEST_CASE("GraphModel GGUF forces prediction", "[graph][model][gguf][forces]") {
 }
 
 TEST_CASE("GraphModel dynamic system sizes", "[graph][model][gguf][dynamic]") {
-  const std::string model_path = "local/pet-auto.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
   const std::string si_xyz = "geometries/si.xyz";
 
@@ -385,7 +383,7 @@ static bool is_pet_graph_gguf(const std::string &path) {
 // ============================================================================
 
 TEST_CASE("GraphModel via Predictor API", "[graph][model][api]") {
-  const std::string model_path = "local/pet-auto.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
 
   if (!std::filesystem::exists(model_path)) {
@@ -419,14 +417,14 @@ TEST_CASE("GraphModel via Predictor API", "[graph][model][api]") {
 
 TEST_CASE("GraphModel via Predictor API with forces",
           "[graph][model][api][forces]") {
-  const std::string model_path = "local/pet-auto-forces.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
 
   if (!std::filesystem::exists(model_path)) {
     SKIP("Forces GGUF not found at " << model_path);
   }
   if (!is_pet_graph_gguf(model_path)) {
-    SKIP("GGUF uses old architecture - re-export with --forces");
+    SKIP("GGUF uses old architecture - re-export");
   }
   if (!std::filesystem::exists(water_xyz)) {
     SKIP("Water XYZ file not found");
@@ -461,7 +459,7 @@ TEST_CASE("GraphModel via Predictor API with forces",
 // ============================================================================
 
 TEST_CASE("C API loads graph model", "[graph][model][c_api]") {
-  const std::string model_path = "local/pet-auto.gguf";
+  const std::string model_path = "gguf/pet-auto.gguf";
   const std::string water_xyz = "geometries/water.xyz";
 
   if (!std::filesystem::exists(model_path)) {

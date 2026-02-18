@@ -214,8 +214,8 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
                                        bool compute_forces) {
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
-        "GraphModel: forces requested but model was not exported with "
-        "--forces mode. Re-export with --forces.");
+        "GraphModel: forces requested but model was exported with "
+        "--no-forces. Re-export without --no-forces to enable forces.");
   }
 
   const int n_atoms = static_cast<int>(system.num_atoms());
@@ -232,6 +232,9 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
   int max_neighbors = 0;
   for (int i = 0; i < n_atoms; i++) {
     max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
+  }
+  if (max_neighbors == 0) {
+    max_neighbors = 1;
   }
 
   // Per-pair cutoff distances (for bump cutoff computation)

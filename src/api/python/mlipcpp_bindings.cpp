@@ -136,9 +136,13 @@ NB_MODULE(_mlipcpp, m) {
               pbc_ptr = pbc_arr.data();
             }
 
+            mlipcpp::PredictOptions options;
+            options.compute_forces = compute_forces || compute_stress;
+            options.compute_stress = compute_stress;
+
             return self.predict(static_cast<int32_t>(n_atoms), positions.data(),
                                 atomic_numbers.data(), cell_ptr, pbc_ptr,
-                                compute_forces);
+                                options);
           },
           "positions"_a, "atomic_numbers"_a, "cell"_a = nb::none(),
           "pbc"_a = nb::none(), "compute_forces"_a = true,

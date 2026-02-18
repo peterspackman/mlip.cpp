@@ -17,13 +17,13 @@ import struct
 import sys
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Set
+from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from export_pytorch.fx_converter import export_torch_model, symbolize_dimensions
+from export_pytorch.fx_converter import export_torch_model
 from export_pytorch.export_pet_full import (
     PETFullModel, load_pet_model, get_model_params,
     get_species_mapping, get_composition_energies, get_energy_scale,
@@ -243,16 +243,16 @@ def main():
         help="Model name: 'pet-mad-1.0.2' (legacy) or upet name like 'pet-mad-s'",
     )
     parser.add_argument(
-        "--forces", action="store_true",
-        help="Export with forces support (manual attention, in-graph distance/cutoff)",
+        "--no-forces", action="store_true",
+        help="Export without forces support (energy only, smaller graph)",
     )
     parser.add_argument(
         "--n-atoms", type=int, default=7,
-        help="Export atoms (use primes to avoid collisions with model constants)",
+        help="Example atom count used for tracing",
     )
     parser.add_argument(
         "--max-neighbors", type=int, default=11,
-        help="Export neighbors (use primes to avoid collisions with model constants)",
+        help="Example max-neighbors count used for tracing",
     )
     args = parser.parse_args()
 
@@ -273,12 +273,12 @@ def main():
     print(f"  d_pet={d_pet}, cutoff={cutoff}, cutoff_width={cutoff_width}")
     print(f"  cutoff_function={cutoff_function}, num_neighbors_adaptive={num_neighbors_adaptive}")
     print(f"  Export dimensions: n_atoms={n_atoms}, max_neighbors={max_neighbors}")
-    print(f"  Forces mode: {args.forces}")
+    print(f"  Forces mode: {not args.no_forces}")
 
     # Create wrapper with full computation path
     wrapper = PETFullModel(
         pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
-        forces=args.forces, cutoff=cutoff, cutoff_width=cutoff_width,
+        forces=not args.no_forces, cutoff=cutoff, cutoff_width=cutoff_width,
         cutoff_function=cutoff_function,
     )
     wrapper.eval()
@@ -291,7 +291,7 @@ def main():
     padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
     reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
 
-    if args.forces:
+    if not args.no_forces:
         cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
         example_inputs = (species, neighbor_species, edge_vectors,
                          padding_mask, reverse_neighbor_index, cutoff_values_input)
@@ -305,6 +305,39 @@ def main():
         input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
                        "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
 
+    # Use symbolic dynamic dimensions instead of numeric post-substitution.
+    n_atoms_dim = torch.export.Dim("n_atoms", min=1, max=max(2, n_atoms))
+    max_neighbors_dim = torch.export.Dim(
+        "max_neighbors", min=1, max=max(2, max_neighbors)
+    )
+    n_edges_dim = torch.export.Dim(
+        "n_edges", min=1, max=max(2, n_atoms * max_neighbors)
+    )
+
+    if not args.no_forces:
+        dynamic_shapes = (
+            {0: n_atoms_dim},                      # species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
+            (                                       # *args
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
+                {0: n_edges_dim},                       # reverse_neighbor_index
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_values
+            ),
+        )
+    else:
+        dynamic_shapes = (
+            {0: n_atoms_dim},                      # species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
+            (                                       # *args
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_distances
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
+                {0: n_edges_dim},                       # reverse_neighbor_index
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_factors
+            ),
+        )
+
     # Export via torch.export
     print("\nExporting graph via torch.export...")
     graph, weights = export_torch_model(
@@ -316,24 +349,13 @@ def main():
             "neighbor_species": "i32",
             "reverse_neighbor_index": "i32",
         },
+        dynamic_shapes=dynamic_shapes,
         strict=False,
     )
     print(f"  Graph: {len(graph.nodes)} nodes, {len(weights)} weights")
 
-    # Symbolize dimensions for dynamic shapes
-    print("Symbolizing dimensions...")
-    model_constants = {1, 3, 4, 8, 32, 128, 256, 512, 768, d_pet}
-    protected = model_constants - {n_atoms, max_neighbors,
-                                   n_atoms * max_neighbors,
-                                   max_neighbors + 1,
-                                   n_atoms * (max_neighbors + 1)}
-    graph = symbolize_dimensions(graph, {
-        "n_atoms": n_atoms,
-        "max_neighbors": max_neighbors,
-    }, protected_values=protected)
-
     graph_json = json.dumps(graph.to_dict())
-    print(f"  Symbolized graph: {len(graph_json)} bytes")
+    print(f"  Graph JSON: {len(graph_json)} bytes")
 
     # Get species mapping, composition energies, and energy scale
     species_to_index = get_species_mapping(pet)
@@ -367,7 +389,7 @@ def main():
     writer.add_int32("pet.d_pet", d_pet)
     writer.add_float32("pet.energy_scale", energy_scale)
     writer.add_string("pet.cutoff_function", cutoff_function)
-    writer.add_int32("pet.forces_mode", 1 if args.forces else 0)
+    writer.add_int32("pet.forces_mode", 1 if not args.no_forces else 0)
     writer.add_float32("pet.num_neighbors_adaptive",
                        float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else 0.0)
 
