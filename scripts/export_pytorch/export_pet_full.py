@@ -18,13 +18,14 @@ Usage:
 
 import json
 import math
+import argparse
 import torch
-import torch.nn.functional as F
 import numpy as np
 import warnings
 from pathlib import Path
 import sys
 from packaging.version import Version
+from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -539,23 +540,167 @@ def compute_reverse_neighbor_index(n_atoms: int, max_neighbors: int,
     return reverse_idx
 
 
+def build_example_inputs(
+    example_n_atoms: int,
+    example_max_neighbors: int,
+    cutoff: float,
+    forces: bool,
+) -> Tuple[Tuple[torch.Tensor, ...], List[str]]:
+    """Build deterministic example inputs and input names for tracing/export."""
+    torch.manual_seed(42)
+    species = torch.zeros(example_n_atoms, dtype=torch.long)
+    neighbor_species = torch.zeros(example_n_atoms, example_max_neighbors, dtype=torch.long)
+    edge_vectors = torch.randn(example_n_atoms, example_max_neighbors, 3)
+    padding_mask = torch.ones(example_n_atoms, example_max_neighbors, dtype=torch.bool)
+    reverse_neighbor_index = torch.arange(example_n_atoms * example_max_neighbors, dtype=torch.long)
+
+    if forces:
+        cutoff_values = torch.full((example_n_atoms, example_max_neighbors), cutoff)
+        example_inputs = (
+            species,
+            neighbor_species,
+            edge_vectors,
+            padding_mask,
+            reverse_neighbor_index,
+            cutoff_values,
+        )
+        input_names = [
+            "species",
+            "neighbor_species",
+            "edge_vectors",
+            "padding_mask",
+            "reverse_neighbor_index",
+            "cutoff_values",
+        ]
+    else:
+        edge_distances = torch.rand(example_n_atoms, example_max_neighbors) * 3.0
+        cutoff_factors = torch.ones(example_n_atoms, example_max_neighbors)
+        example_inputs = (
+            species,
+            neighbor_species,
+            edge_vectors,
+            edge_distances,
+            padding_mask,
+            reverse_neighbor_index,
+            cutoff_factors,
+        )
+        input_names = [
+            "species",
+            "neighbor_species",
+            "edge_vectors",
+            "edge_distances",
+            "padding_mask",
+            "reverse_neighbor_index",
+            "cutoff_factors",
+        ]
+
+    return example_inputs, input_names
+
+
+def save_weights(weights: Dict[str, torch.Tensor], output_dir: Path) -> None:
+    """Save all exported weights as float32 binary blobs."""
+    print(f"\nSaving {len(weights)} weights...")
+    for name, tensor in weights.items():
+        filepath = output_dir / f"{name}.bin"
+        tensor.detach().cpu().numpy().astype(np.float32).tofile(filepath)
+
+
+def save_example_inputs(
+    input_names: List[str],
+    example_inputs: Tuple[torch.Tensor, ...],
+    output_dir: Path,
+) -> None:
+    """Save tracing inputs in binary format used by local tooling."""
+    for name, tensor in zip(input_names, example_inputs):
+        path = output_dir / f"input_{name}.bin"
+        if tensor.dtype in (torch.long, torch.int32, torch.int64):
+            tensor.cpu().numpy().astype(np.int32).tofile(path)
+        elif tensor.dtype == torch.bool:
+            tensor.cpu().numpy().astype(np.bool_).tofile(path)
+        else:
+            tensor.cpu().numpy().astype(np.float32).tofile(path)
+
+
+def save_exported_program(
+    wrapper: torch.nn.Module,
+    example_inputs: Tuple[torch.Tensor, ...],
+    output_path: Path,
+) -> None:
+    """Export and save a PyTorch ExportedProgram (.pt2)."""
+    print(f"\nSaving compiled exported program to {output_path} ...")
+    exported_program = torch.export.export(wrapper, example_inputs, strict=False)
+    torch.export.save(exported_program, str(output_path))
+    print("Saved compiled exported program.")
+
+
+def build_metadata(
+    example_n_atoms: int,
+    example_max_neighbors: int,
+    d_pet: int,
+    graph,
+    weights: Dict[str, torch.Tensor],
+    expected_output: torch.Tensor,
+    cutoff: float,
+    cutoff_width: float,
+    cutoff_function: str,
+    num_neighbors_adaptive,
+    forces: bool,
+    model_name: str,
+    featurizer_type: str,
+    num_gnn_layers: int,
+    num_readout_layers: int,
+    species_to_index: Dict[int, int],
+    composition_energies: Dict[int, float],
+    energy_scale: float,
+) -> Dict:
+    """Assemble metadata payload persisted to metadata.json."""
+    return {
+        "example_n_atoms": example_n_atoms,
+        "example_max_neighbors": example_max_neighbors,
+        # Backward-compatible aliases for existing tooling.
+        "n_atoms": example_n_atoms,
+        "max_neighbors": example_max_neighbors,
+        "d_pet": d_pet,
+        "num_nodes": len(graph.nodes),
+        "num_weights": len(weights),
+        "expected_total_energy": expected_output.sum().item(),
+        "cutoff": float(cutoff),
+        "cutoff_width": float(cutoff_width),
+        "cutoff_function": cutoff_function,
+        "num_neighbors_adaptive": float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else None,
+        "forces": forces,
+        "model_name": model_name,
+        "featurizer_type": featurizer_type,
+        "num_gnn_layers": num_gnn_layers,
+        "num_readout_layers": num_readout_layers,
+        "species_to_index": species_to_index,
+        "composition_energies": composition_energies,
+        "energy_scale": energy_scale,
+        "weights": {name: list(t.shape) for name, t in weights.items()},
+    }
+
+
 # --- Export ---
 
 def export_pet_full(
     output_dir: Path = Path("/tmp/pet_full_export"),
-    n_atoms: int = 7,
-    max_neighbors: int = 11,
+    example_n_atoms: int = 7,
+    example_max_neighbors: int = 11,
     model_name: str = "pet-mad-1.0.2",
     forces: bool = False,
+    save_compiled: bool = False,
+    compiled_filename: str = "pet_full_exported.pt2",
 ):
     """Export full PET computation path with neighbor list inputs.
 
     Args:
         output_dir: Directory for output files
-        n_atoms: Number of atoms for export dimensions (use primes)
-        max_neighbors: Max neighbors per atom for export dimensions (use primes)
+        example_n_atoms: Example atom count used only for tracing/export
+        example_max_neighbors: Example max neighbors used only for tracing/export
         model_name: Model identifier (see load_pet_model docstring)
         forces: If True, export with manual attention and in-graph distance/cutoff
+        save_compiled: If True, save a compiled torch.export program (.pt2)
+        compiled_filename: File name for the compiled export artifact
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -577,41 +722,24 @@ def export_pet_full(
     print(f"d_pet: {d_pet}, cutoff: {cutoff}, cutoff_width: {cutoff_width}")
     print(f"cutoff_function: {cutoff_function}, num_neighbors_adaptive: {num_neighbors_adaptive}")
     print(f"featurizer_type: {featurizer_type}, gnn_layers: {num_gnn_layers}, readout_layers: {num_readout_layers}")
-    print(f"n_atoms: {n_atoms}, max_neighbors: {max_neighbors}")
+    print(f"example_n_atoms: {example_n_atoms}, example_max_neighbors: {example_max_neighbors}")
     print(f"forces: {forces}")
 
     # Create wrapper using actual GNN layers
     wrapper = PETFullModel(
-        pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
+        pet, n_atoms=example_n_atoms, max_neighbors=example_max_neighbors, d_pet=d_pet,
         forces=forces, cutoff=cutoff, cutoff_width=cutoff_width,
         cutoff_function=cutoff_function
     )
     wrapper.eval()
 
-    # Create test inputs
-    torch.manual_seed(42)
-    species = torch.zeros(n_atoms, dtype=torch.long)
-    neighbor_species = torch.zeros(n_atoms, max_neighbors, dtype=torch.long)
-    edge_vectors = torch.randn(n_atoms, max_neighbors, 3)
-    padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
-    reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
-
-    if forces:
-        # Forces mode: edge_distances and cutoff_factors computed in-graph
-        # cutoff_values: per-pair cutoff radii (from adaptive cutoff or global)
-        cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
-        example_inputs = (species, neighbor_species, edge_vectors,
-                         padding_mask, reverse_neighbor_index, cutoff_values_input)
-        input_names = ["species", "neighbor_species", "edge_vectors",
-                       "padding_mask", "reverse_neighbor_index", "cutoff_values"]
-    else:
-        # Forward-only mode: all inputs provided externally
-        edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
-        cutoff_factors = torch.ones(n_atoms, max_neighbors)
-        example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
-                         padding_mask, reverse_neighbor_index, cutoff_factors)
-        input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
-                       "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
+    # Create deterministic tracing inputs.
+    example_inputs, input_names = build_example_inputs(
+        example_n_atoms=example_n_atoms,
+        example_max_neighbors=example_max_neighbors,
+        cutoff=cutoff,
+        forces=forces,
+    )
 
     # Run forward pass
     print("\nRunning forward pass...")
@@ -624,103 +752,92 @@ def export_pet_full(
 
     # Export via torch.export
     print("\nExporting via torch.export...")
-    try:
-        input_dtypes = {
-            "species": "i32",
-            "neighbor_species": "i32",
-            "reverse_neighbor_index": "i32",
-        }
+    input_dtypes = {
+        "species": "i32",
+        "neighbor_species": "i32",
+        "reverse_neighbor_index": "i32",
+    }
 
-        graph, weights = export_torch_model(
-            wrapper,
-            example_inputs,
-            output_dir / "pet_full.json",
-            input_names=input_names,
-            input_dtypes=input_dtypes,
-            strict=False,
+    graph, weights = export_torch_model(
+        wrapper,
+        example_inputs,
+        output_dir / "pet_full.json",
+        input_names=input_names,
+        input_dtypes=input_dtypes,
+        strict=False,
+    )
+
+    # Symbolize dynamic dimensions
+    print("\nSymbolizing dimensions...")
+    model_constants = {1, 3, 4, 8, 32, 128, 256, 512, 768, d_pet}
+    protected = model_constants - {
+        example_n_atoms,
+        example_max_neighbors,
+        example_n_atoms * example_max_neighbors,
+        example_max_neighbors + 1,
+        example_n_atoms * (example_max_neighbors + 1),
+    }
+    graph = symbolize_dimensions(
+        graph,
+        {"n_atoms": example_n_atoms, "max_neighbors": example_max_neighbors},
+        protected_values=protected,
+    )
+
+    # Re-save with symbolized dimensions
+    with open(output_dir / "pet_full.json", "w") as f:
+        json.dump(graph.to_dict(), f, indent=2)
+    print("Saved symbolized graph with dynamic dimensions")
+
+    save_weights(weights=weights, output_dir=output_dir)
+    save_example_inputs(
+        input_names=input_names,
+        example_inputs=example_inputs,
+        output_dir=output_dir,
+    )
+    expected_output.numpy().astype(np.float32).tofile(output_dir / "expected_output.bin")
+
+    if save_compiled:
+        save_exported_program(
+            wrapper=wrapper,
+            example_inputs=example_inputs,
+            output_path=output_dir / compiled_filename,
         )
 
-        # Symbolize dynamic dimensions
-        print("\nSymbolizing dimensions...")
-        model_constants = {1, 3, 4, 8, 32, 128, 256, 512, 768, d_pet}
-        protected = model_constants - {n_atoms, max_neighbors,
-                                       n_atoms * max_neighbors,
-                                       max_neighbors + 1,
-                                       n_atoms * (max_neighbors + 1)}
-        graph = symbolize_dimensions(graph, {
-            "n_atoms": n_atoms,
-            "max_neighbors": max_neighbors,
-        }, protected_values=protected)
+    # Get species mapping, composition energies, and scale factor
+    species_to_index = get_species_mapping(pet)
+    composition_energies = get_composition_energies(pet)
+    energy_scale = get_energy_scale(pet)
+    print(f"Energy scale factor: {energy_scale}")
 
-        # Re-save with symbolized dimensions
-        with open(output_dir / "pet_full.json", "w") as f:
-            json.dump(graph.to_dict(), f, indent=2)
-        print(f"Saved symbolized graph with dynamic dimensions")
+    metadata = build_metadata(
+        example_n_atoms=example_n_atoms,
+        example_max_neighbors=example_max_neighbors,
+        d_pet=d_pet,
+        graph=graph,
+        weights=weights,
+        expected_output=expected_output,
+        cutoff=cutoff,
+        cutoff_width=cutoff_width,
+        cutoff_function=cutoff_function,
+        num_neighbors_adaptive=num_neighbors_adaptive,
+        forces=forces,
+        model_name=model_name,
+        featurizer_type=featurizer_type,
+        num_gnn_layers=num_gnn_layers,
+        num_readout_layers=num_readout_layers,
+        species_to_index=species_to_index,
+        composition_energies=composition_energies,
+        energy_scale=energy_scale,
+    )
+    with open(output_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
 
-        # Save weights
-        print(f"\nSaving {len(weights)} weights...")
-        for name, tensor in weights.items():
-            data = tensor.detach().cpu().numpy()
-            filepath = output_dir / f"{name}.bin"
-            data.astype(np.float32).tofile(filepath)
-
-        # Save inputs
-        for i, (name, tensor) in enumerate(zip(input_names, example_inputs)):
-            if tensor.dtype in (torch.long, torch.int32, torch.int64):
-                tensor.numpy().astype(np.int32).tofile(output_dir / f"input_{name}.bin")
-            elif tensor.dtype == torch.bool:
-                tensor.numpy().astype(np.bool_).tofile(output_dir / f"input_{name}.bin")
-            else:
-                tensor.numpy().astype(np.float32).tofile(output_dir / f"input_{name}.bin")
-
-        # Save expected output
-        expected_output.numpy().astype(np.float32).tofile(output_dir / "expected_output.bin")
-
-        # Get species mapping, composition energies, and scale factor
-        species_to_index = get_species_mapping(pet)
-        composition_energies = get_composition_energies(pet)
-        energy_scale = get_energy_scale(pet)
-        print(f"Energy scale factor: {energy_scale}")
-
-        # Save metadata
-        metadata = {
-            "n_atoms": n_atoms,
-            "max_neighbors": max_neighbors,
-            "d_pet": d_pet,
-            "num_nodes": len(graph.nodes),
-            "num_weights": len(weights),
-            "expected_total_energy": expected_output.sum().item(),
-            "cutoff": float(cutoff),
-            "cutoff_width": float(cutoff_width),
-            "cutoff_function": cutoff_function,
-            "num_neighbors_adaptive": float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else None,
-            "forces": forces,
-            "model_name": model_name,
-            "featurizer_type": featurizer_type,
-            "num_gnn_layers": num_gnn_layers,
-            "num_readout_layers": num_readout_layers,
-            "species_to_index": species_to_index,
-            "composition_energies": composition_energies,
-            "energy_scale": energy_scale,
-            "weights": {name: list(t.shape) for name, t in weights.items()}
-        }
-        with open(output_dir / "metadata.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        print(f"\nAll files saved to {output_dir}")
-        print(f"Graph: {len(graph.nodes)} nodes")
-
-        return graph, weights
-
-    except Exception as e:
-        print(f"\nExport failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None
+    print(f"\nAll files saved to {output_dir}")
+    print(f"Graph: {len(graph.nodes)} nodes")
+    return graph, weights
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Export PET model to GIR format")
     parser.add_argument("--output", "-o", type=str, default="/tmp/pet_full_export",
                         help="Output directory")
@@ -728,16 +845,35 @@ if __name__ == "__main__":
                         help="Model name: 'pet-mad-1.0.2' (legacy) or upet name like 'pet-mad-s'")
     parser.add_argument("--forces", action="store_true",
                         help="Export with forces support (manual attention, in-graph distance/cutoff)")
-    parser.add_argument("--n-atoms", type=int, default=7,
-                        help="Number of atoms for export (use primes to avoid model constant collisions)")
-    parser.add_argument("--max-neighbors", type=int, default=11,
-                        help="Max neighbors for export (use primes)")
+    parser.add_argument("--example-n-atoms", type=int, default=7,
+                        help="Example atom count used only for tracing/export")
+    parser.add_argument("--example-max-neighbors", type=int, default=11,
+                        help="Example max neighbors used only for tracing/export")
+    parser.add_argument("--n-atoms", dest="deprecated_n_atoms", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--max-neighbors", dest="deprecated_max_neighbors", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--save-compiled", action="store_true",
+                        help="Also save compiled torch.export artifact (.pt2)")
+    parser.add_argument("--compiled-filename", type=str, default="pet_full_exported.pt2",
+                        help="Filename for compiled export artifact")
     args = parser.parse_args()
+
+    example_n_atoms = args.example_n_atoms
+    example_max_neighbors = args.example_max_neighbors
+    if args.deprecated_n_atoms is not None:
+        print("Warning: --n-atoms is deprecated; use --example-n-atoms.")
+        example_n_atoms = args.deprecated_n_atoms
+    if args.deprecated_max_neighbors is not None:
+        print("Warning: --max-neighbors is deprecated; use --example-max-neighbors.")
+        example_max_neighbors = args.deprecated_max_neighbors
 
     export_pet_full(
         output_dir=Path(args.output),
-        n_atoms=args.n_atoms,
-        max_neighbors=args.max_neighbors,
+        example_n_atoms=example_n_atoms,
+        example_max_neighbors=example_max_neighbors,
         model_name=args.model,
         forces=args.forces,
+        save_compiled=args.save_compiled,
+        compiled_filename=args.compiled_filename,
     )
