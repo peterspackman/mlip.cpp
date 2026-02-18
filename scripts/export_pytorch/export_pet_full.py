@@ -19,6 +19,7 @@ Usage:
 import json
 import math
 import argparse
+import re
 import torch
 import numpy as np
 import warnings
@@ -33,6 +34,44 @@ from export_pytorch.fx_converter import export_torch_model, symbolize_dimensions
 
 
 # --- Model Loading ---
+
+def resolve_upet_checkpoint_name(model_base: str, size: str) -> str:
+    """Resolve checkpoint filename for a upet model across API versions."""
+    from huggingface_hub import list_repo_files
+
+    version = None
+    try:
+        from upet._models import upet_get_version_to_load as _resolve_version  # type: ignore
+        version = _resolve_version(model_base, size)
+    except Exception:
+        try:
+            # Compatibility with older naming on some installations.
+            from upet._models import get_version_to_load as _resolve_version  # type: ignore
+            version = _resolve_version(model_base, size)
+        except Exception:
+            version = None
+
+    if version is not None:
+        return f"{model_base}-{size}-v{version}.ckpt"
+
+    pattern = re.compile(rf"^models/{re.escape(model_base)}-{re.escape(size)}-v(.+)\.ckpt$")
+    candidates = []
+    for path in list_repo_files(repo_id="lab-cosmo/upet"):
+        match = pattern.match(path)
+        if match:
+            try:
+                candidates.append((Version(match.group(1)), path.split("/", 1)[1]))
+            except Exception:
+                continue
+
+    if not candidates:
+        raise RuntimeError(
+            f"Could not resolve checkpoint for {model_base}-{size} "
+            "from upet API or Hugging Face file listing."
+        )
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
 
 def load_pet_model(model_name: str):
     """Load a raw PET model by name.
@@ -63,13 +102,11 @@ def load_pet_model(model_name: str):
 
     from huggingface_hub import hf_hub_download
     from metatrain.utils.io import load_model as load_metatrain_model
-    from upet._models import upet_get_version_to_load
 
     path = None
     model_string = None
     try:
-        version = upet_get_version_to_load(model_base, size)
-        model_string = f"{model_base}-{size}-v{version}.ckpt"
+        model_string = resolve_upet_checkpoint_name(model_base, size)
         print(f"Downloading {model_string} from HuggingFace...")
         path = hf_hub_download(
             repo_id="lab-cosmo/upet",
