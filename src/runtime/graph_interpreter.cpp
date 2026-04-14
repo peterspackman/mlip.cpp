@@ -1126,16 +1126,9 @@ ggml_tensor *GraphInterpreter::build_flash_attn(ggml_context *ctx,
   // Use ggml_flash_attn_ext.
   // Q, K, V are all [head_dim, seq, heads, batch] in GGML order.
   //
-  // flash_attn_ext requires:
-  // 1. mask ne[1] padded to GGML_KQ_MASK_PAD (64)
-  // 2. mask in F16 format (the kernel reads mask data as ggml_fp16_t)
+  // flash_attn_ext expects mask shape [n_kv, n_batch, ne32, ne33] and F16 dtype.
   if (mask) {
-    int64_t seq_q = q->ne[1];
-    int64_t seq_q_pad = GGML_PAD(seq_q, GGML_KQ_MASK_PAD);
-
-    if (seq_q_pad != mask->ne[1]) {
-      mask = ggml_pad(ctx, mask, 0, static_cast<int>(seq_q_pad - mask->ne[1]), 0, 0);
-    }
+    GGML_ASSERT(mask->ne[1] == q->ne[1] && "mask n_batch dim must match q seq dim");
     if (mask->type != GGML_TYPE_F16) {
       mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
     }

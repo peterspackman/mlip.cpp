@@ -30,6 +30,13 @@ stdout
 # Development directories
 testing/
 
+# Local experiments and artifacts (not part of mlipcpp)
+local/
+petk_codegen/
+tinypet/
+scripts/repro_ase_optimizer_segfault.py
+scripts/stress_ase_optimizer_segfault.py
+
 # WASM build output
 wasm/
 

@@ -8,6 +8,7 @@ Supports two export modes:
 import json
 import operator
 import re
+from collections import defaultdict, deque
 import torch
 import torch.fx as fx
 from torch.fx.passes.shape_prop import ShapeProp
@@ -205,6 +206,8 @@ ATEN_TO_GGML = {
     "aten.layer_norm": "LAYER_NORM",
     "aten.native_layer_norm.default": "LAYER_NORM",
     "aten.native_layer_norm": "LAYER_NORM",
+    "aten.native_layer_norm_backward.default": "LAYER_NORM_BACKWARD",
+    "aten.native_layer_norm_backward": "LAYER_NORM_BACKWARD",
     "aten.rms_norm.default": "RMS_NORM",
     "aten.rms_norm": "RMS_NORM",
 
@@ -230,9 +233,29 @@ ATEN_TO_GGML = {
     # Comparison/mask
     "aten.where.self": "WHERE",
     "aten.where": "WHERE",
+    "aten.where.ScalarSelf": "WHERE",
     "aten.masked_fill.Scalar": "MASKED_FILL",
     "aten.masked_fill": "MASKED_FILL",
     "aten.bitwise_not": "BITWISE_NOT",
+    "aten.ge.Scalar": "GE",
+    "aten.ge": "GE",
+    "aten.le.Scalar": "LE",
+    "aten.le": "LE",
+    "aten.logical_and": "LOGICAL_AND",
+    "aten.logical_and_": "LOGICAL_AND",
+    "aten.scalar_tensor": "SCALAR_CONST",
+    "aten.ones_like": "NEW_ONES",
+    "aten.detach_": "CONT",
+    "aten.index_put": "INDEX_PUT",
+    "aten.index_put.default": "INDEX_PUT",
+    "aten.narrow": "SLICE",
+    "aten.narrow.default": "SLICE",
+    "aten.slice_backward": "SLICE_BACKWARD",
+    "aten.slice_backward.default": "SLICE_BACKWARD",
+    "aten.select_backward": "SELECT_BACKWARD",
+    "aten.select_backward.default": "SELECT_BACKWARD",
+    "aten._softmax_backward_data": "SOFTMAX_BACKWARD",
+    "aten._softmax_backward_data.default": "SOFTMAX_BACKWARD",
 
     # Copy
     "aten.copy_.default": "COPY",
@@ -968,10 +991,16 @@ def convert_exported_to_gir(
                     dtype = GGMLDtype.F32
 
         if node.op == "placeholder":
-            # torch.export lifts parameters as placeholders with p_ prefix
-            # and constants with c_ prefix
+            # torch.export lifts parameters/constants/buffers as placeholders:
+            # - p_... parameters
+            # - c_... lifted constants
+            # - b_... buffers
             node_target = str(node.target)
-            if node_target.startswith("p_") or node_target.startswith("c_"):
+            if (
+                node_target.startswith("p_")
+                or node_target.startswith("c_")
+                or node_target.startswith("b_")
+            ):
                 # This is a lifted parameter or constant - treat as weight
                 # The state_dict key matches the original module path
                 # p_node_embedders_0_weight -> node_embedders.0.weight in state_dict
@@ -1013,12 +1042,19 @@ def convert_exported_to_gir(
             # Handle special cases
             if node.target == operator.getitem:
                 # getitem is used for tuple unpacking (e.g., after split/chunk)
-                input_ref = name_map.get(node.args[0].name, f"node:{node_id-1}")
+                input_node = node.args[0] if len(node.args) > 0 else None
+                input_ref = name_map.get(input_node.name, f"node:{node_id-1}") if isinstance(input_node, fx.Node) else f"node:{node_id-1}"
                 idx = node.args[1]
                 if isinstance(idx, int):
+                    if isinstance(input_node, fx.Node) and hasattr(input_node, "target"):
+                        input_target_name = str(input_node.target)
+                        # native_layer_norm_backward returns (grad_input, grad_weight, grad_bias).
+                        # For force export we only need grad_input (getitem idx=0).
+                        if "native_layer_norm_backward" in input_target_name:
+                            name_map[node.name] = input_ref
+                            continue
                     # Check if input is from a CHUNK node - need to compute proper shape
                     chunk_output_shape = shape or []
-                    input_node = node.args[0]
                     if isinstance(input_node, fx.Node) and hasattr(input_node, 'target'):
                         # Use str() to get target name - works for both OpOverload and regular targets
                         input_target_name = str(input_node.target)
@@ -1139,6 +1175,20 @@ def convert_exported_to_gir(
                 if len(node.args) > 1 and isinstance(node.args[1], int):
                     params["dim"] = node.args[1]
 
+            elif ggml_op == "SOFTMAX_BACKWARD":
+                # _softmax_backward_data(grad, output, dim, input_dtype)
+                input_refs = []
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    grad_ref = name_map.get(node.args[0].name)
+                    if grad_ref:
+                        input_refs.append(grad_ref)
+                if len(node.args) >= 2 and isinstance(node.args[1], fx.Node):
+                    out_ref = name_map.get(node.args[1].name)
+                    if out_ref:
+                        input_refs.append(out_ref)
+                if len(node.args) >= 3 and isinstance(node.args[2], int):
+                    params["dim"] = node.args[2]
+
             elif ggml_op == "LAYER_NORM":
                 # native_layer_norm: input, normalized_shape, weight, bias, eps
                 # Reorder to: input, weight, bias
@@ -1149,6 +1199,18 @@ def convert_exported_to_gir(
                     eps = node.args[4] if len(node.args) > 4 else 1e-5
                     input_refs = [r for r in [inp_ref, weight_ref, bias_ref] if r]
                     params["eps"] = eps
+
+            elif ggml_op == "LAYER_NORM_BACKWARD":
+                # native_layer_norm_backward(grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask)
+                # We model grad_input only.
+                grad_ref = name_map.get(node.args[0].name) if len(node.args) > 0 and isinstance(node.args[0], fx.Node) else None
+                inp_ref = name_map.get(node.args[1].name) if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else None
+                mean_ref = name_map.get(node.args[3].name) if len(node.args) > 3 and isinstance(node.args[3], fx.Node) else None
+                rstd_ref = name_map.get(node.args[4].name) if len(node.args) > 4 and isinstance(node.args[4], fx.Node) else None
+                weight_ref = name_map.get(node.args[5].name) if len(node.args) > 5 and isinstance(node.args[5], fx.Node) else None
+                input_refs = [r for r in [grad_ref, inp_ref, mean_ref, rstd_ref, weight_ref] if r]
+                if len(node.args) > 2 and isinstance(node.args[2], (list, tuple)):
+                    params["normalized_ndim"] = len(node.args[2])
 
             elif ggml_op == "RMS_NORM":
                 # rms_norm: input, normalized_shape, weight, eps
@@ -1182,6 +1244,181 @@ def convert_exported_to_gir(
                 if len(node.args) >= 3:
                     params["dim"] = node.args[1]
                     params["index"] = node.args[2]
+
+            elif ggml_op == "SUM_ROWS":
+                # aten.sum(dim=..., keepdim=...) or aten.sum() (reduce all dims)
+                params.pop("shape", None)
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    src_ref = name_map.get(node.args[0].name)
+                    input_refs = [src_ref] if src_ref else []
+                else:
+                    input_refs = []
+
+                dims = None
+                reduce_all = False
+                if len(node.args) >= 2:
+                    dim_arg = node.args[1]
+                    if dim_arg is None:
+                        reduce_all = True
+                    elif isinstance(dim_arg, int):
+                        dims = [int(dim_arg)]
+                    elif isinstance(dim_arg, (list, tuple)):
+                        dims = [int(d) for d in dim_arg if isinstance(d, int)]
+                if "dim" in node.kwargs:
+                    dim_arg = node.kwargs["dim"]
+                    if dim_arg is None:
+                        reduce_all = True
+                    elif isinstance(dim_arg, int):
+                        dims = [int(dim_arg)]
+                    elif isinstance(dim_arg, (list, tuple)):
+                        dims = [int(d) for d in dim_arg if isinstance(d, int)]
+
+                keepdim = False
+                if len(node.args) >= 3 and isinstance(node.args[2], bool):
+                    keepdim = bool(node.args[2])
+                if "keepdim" in node.kwargs and isinstance(node.kwargs["keepdim"], bool):
+                    keepdim = bool(node.kwargs["keepdim"])
+
+                if dims is not None:
+                    params["dims"] = dims
+                elif reduce_all or target_name == "aten.sum.default":
+                    params["reduce_all"] = True
+                params["keepdim"] = keepdim
+
+            elif ggml_op == "WHERE":
+                # WHERE supports:
+                # - aten.where.self(condition, x, y)
+                # - aten.where.ScalarSelf(condition, scalar, y)
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    cond_ref = name_map.get(node.args[0].name)
+                    if cond_ref:
+                        input_refs = [cond_ref]
+                    else:
+                        input_refs = []
+                else:
+                    input_refs = []
+
+                if len(node.args) >= 2:
+                    if isinstance(node.args[1], fx.Node):
+                        ref = name_map.get(node.args[1].name)
+                        if ref:
+                            input_refs.append(ref)
+                    elif isinstance(node.args[1], (int, float)):
+                        params["x_scalar"] = float(node.args[1])
+
+                if len(node.args) >= 3:
+                    if isinstance(node.args[2], fx.Node):
+                        ref = name_map.get(node.args[2].name)
+                        if ref:
+                            input_refs.append(ref)
+                    elif isinstance(node.args[2], (int, float)):
+                        params["y_scalar"] = float(node.args[2])
+
+            elif ggml_op in ("GE", "LE"):
+                # Comparison op: tensor >= scalar / tensor <= scalar
+                # or tensor vs tensor.
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    lhs_ref = name_map.get(node.args[0].name)
+                    input_refs = [lhs_ref] if lhs_ref else []
+                if len(node.args) >= 2:
+                    if isinstance(node.args[1], fx.Node):
+                        rhs_ref = name_map.get(node.args[1].name)
+                        if rhs_ref:
+                            input_refs.append(rhs_ref)
+                    elif isinstance(node.args[1], (int, float)):
+                        params["scalar"] = float(node.args[1])
+
+            elif ggml_op == "LOGICAL_AND":
+                if len(node.args) >= 2:
+                    a_ref = name_map.get(node.args[0].name) if isinstance(node.args[0], fx.Node) else None
+                    b_ref = name_map.get(node.args[1].name) if isinstance(node.args[1], fx.Node) else None
+                    input_refs = [r for r in [a_ref, b_ref] if r]
+
+            elif ggml_op == "SCALAR_CONST":
+                # aten.scalar_tensor(value, ...)
+                input_refs = []
+                if len(node.args) >= 1 and isinstance(node.args[0], (int, float)):
+                    params["scalar"] = float(node.args[0])
+                elif "value" in node.kwargs and isinstance(node.kwargs["value"], (int, float)):
+                    params["scalar"] = float(node.kwargs["value"])
+                else:
+                    params["scalar"] = 0.0
+
+            elif ggml_op == "SLICE":
+                # Handles:
+                # - aten.slice.Tensor(input, dim, start, end, step)
+                # - aten.narrow(input, dim, start, length)
+                params.pop("shape", None)
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    src_ref = name_map.get(node.args[0].name)
+                    input_refs = [src_ref] if src_ref else []
+                else:
+                    input_refs = []
+
+                if "narrow" in target_name:
+                    if len(node.args) >= 2 and isinstance(node.args[1], int):
+                        params["dim"] = node.args[1]
+                    if len(node.args) >= 3 and isinstance(node.args[2], int):
+                        params["start"] = node.args[2]
+                    if len(node.args) >= 4 and isinstance(node.args[3], int):
+                        params["length"] = node.args[3]
+                    if "dim" in node.kwargs and isinstance(node.kwargs["dim"], int):
+                        params["dim"] = node.kwargs["dim"]
+                    if "start" in node.kwargs and isinstance(node.kwargs["start"], int):
+                        params["start"] = node.kwargs["start"]
+                    if "length" in node.kwargs and isinstance(node.kwargs["length"], int):
+                        params["length"] = node.kwargs["length"]
+                else:
+                    if len(node.args) >= 2 and isinstance(node.args[1], int):
+                        params["dim"] = node.args[1]
+                    if len(node.args) >= 3 and isinstance(node.args[2], int):
+                        params["start"] = node.args[2]
+                    if len(node.args) >= 4 and isinstance(node.args[3], int):
+                        params["end"] = node.args[3]
+                    if len(node.args) >= 5 and isinstance(node.args[4], int):
+                        params["step"] = node.args[4]
+                    if "dim" in node.kwargs and isinstance(node.kwargs["dim"], int):
+                        params["dim"] = node.kwargs["dim"]
+                    if "start" in node.kwargs and isinstance(node.kwargs["start"], int):
+                        params["start"] = node.kwargs["start"]
+                    if "end" in node.kwargs and isinstance(node.kwargs["end"], int):
+                        params["end"] = node.kwargs["end"]
+                    if "step" in node.kwargs and isinstance(node.kwargs["step"], int):
+                        params["step"] = node.kwargs["step"]
+
+            elif ggml_op == "SLICE_BACKWARD":
+                # slice_backward(grad, input_sizes, dim, start, end, step)
+                input_refs = []
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    grad_ref = name_map.get(node.args[0].name)
+                    if grad_ref:
+                        input_refs = [grad_ref]
+                params.pop("shape", None)
+                if len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
+                    params["input_shape"] = [_to_runtime_dim(d) for d in node.args[1]]
+                if len(node.args) >= 3 and isinstance(node.args[2], int):
+                    params["dim"] = node.args[2]
+                if len(node.args) >= 4 and isinstance(node.args[3], int):
+                    params["start"] = node.args[3]
+                if len(node.args) >= 5 and isinstance(node.args[4], int):
+                    params["end"] = node.args[4]
+                if len(node.args) >= 6 and isinstance(node.args[5], int):
+                    params["step"] = node.args[5]
+
+            elif ggml_op == "SELECT_BACKWARD":
+                # select_backward(grad, input_sizes, dim, index)
+                input_refs = []
+                if len(node.args) >= 1 and isinstance(node.args[0], fx.Node):
+                    grad_ref = name_map.get(node.args[0].name)
+                    if grad_ref:
+                        input_refs = [grad_ref]
+                params.pop("shape", None)
+                if len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
+                    params["input_shape"] = [_to_runtime_dim(d) for d in node.args[1]]
+                if len(node.args) >= 3 and isinstance(node.args[2], int):
+                    params["dim"] = node.args[2]
+                if len(node.args) >= 4 and isinstance(node.args[3], int):
+                    params["index"] = node.args[3]
 
             elif ggml_op == "FLASH_ATTN_EXT":
                 # scaled_dot_product_attention: q, k, v, attn_mask, dropout_p, is_causal, scale
@@ -1607,6 +1844,7 @@ def export_torch_model(
     input_dtypes: Dict[str, str] = None,
     dynamic_shapes: Optional[Any] = None,
     strict: bool = False,
+    decompose_5d_attention: bool = True,
 ) -> Tuple[GGMLGraph, Dict[str, torch.Tensor]]:
     """Export a PyTorch module via torch.export to GIR.
 
@@ -1636,6 +1874,25 @@ def export_torch_model(
         )
 
     print(f"Export succeeded! Graph has {len(list(exported.graph_module.graph.nodes))} nodes")
+
+    def _is_fake_like_tensor(t: Any) -> bool:
+        return isinstance(t, torch.Tensor) and t.__class__.__name__ != "Tensor"
+
+    def _capture_saved_tensors_from_run() -> List[torch.Tensor]:
+        saved: List[torch.Tensor] = []
+
+        def _pack(x):
+            if isinstance(x, torch.Tensor):
+                saved.append(x.detach().cpu().clone())
+            return x
+
+        def _unpack(x):
+            return x
+
+        with torch.autograd.graph.saved_tensors_hooks(_pack, _unpack):
+            with torch.enable_grad():
+                _ = module(*example_inputs)
+        return saved
 
     def _flatten_dynamic_specs(spec: Any) -> List[Any]:
         # Keep dict leaves intact; only recurse list/tuple containers.
@@ -1671,12 +1928,59 @@ def export_torch_model(
         weight_name = name.replace(".", "_")
         weights[weight_name] = tensor.clone()
 
+    # If torch.export produced FakeTensor lifted constants (common with
+    # non-strict export of forward+autodiff graphs), materialize concrete values
+    # from one eager reference run via saved_tensors_hooks.
+    lifted_constant_replacements: Dict[str, torch.Tensor] = {}
+    if hasattr(exported, "constants") and exported.constants:
+        fake_constant_count = sum(
+            1 for t in exported.constants.values() if _is_fake_like_tensor(t)
+        )
+        if fake_constant_count > 0:
+            print(
+                f"Detected {fake_constant_count} FakeTensor lifted constants; "
+                "capturing saved tensors for materialization..."
+            )
+            saved_tensors = _capture_saved_tensors_from_run()
+            buckets: Dict[Tuple[torch.dtype, Tuple[int, ...]], deque] = defaultdict(deque)
+            for t in saved_tensors:
+                buckets[(t.dtype, tuple(int(d) for d in t.shape))].append(t)
+
+            lifted_names: List[str]
+            if (
+                hasattr(exported, "graph_signature")
+                and hasattr(exported.graph_signature, "lifted_tensor_constants")
+            ):
+                lifted_names = list(exported.graph_signature.lifted_tensor_constants)
+            else:
+                lifted_names = list(exported.constants.keys())
+
+            missing = 0
+            for name in lifted_names:
+                t = exported.constants.get(name)
+                if not _is_fake_like_tensor(t):
+                    continue
+                key = (t.dtype, tuple(int(d) for d in t.shape))
+                if buckets[key]:
+                    lifted_constant_replacements[name] = buckets[key].popleft().clone()
+                else:
+                    missing += 1
+
+            if missing > 0:
+                print(
+                    f"Warning: failed to materialize {missing} FakeTensor lifted constants; "
+                    "remaining constants may be invalid."
+                )
+
     # Also get constants (prefixed with "c_")
     if hasattr(exported, 'constants'):
         for name, tensor in exported.constants.items():
             if isinstance(tensor, torch.Tensor):
                 weight_name = name.replace(".", "_")
-                weights[weight_name] = tensor.clone()
+                if name in lifted_constant_replacements:
+                    weights[weight_name] = lifted_constant_replacements[name].clone()
+                else:
+                    weights[weight_name] = tensor.clone()
 
     print(f"Extracted {len(weights)} weights from state_dict")
 
@@ -1693,8 +1997,10 @@ def export_torch_model(
     # Merge any additional weights found during conversion
     weights.update(extra_weights)
 
-    # Decompose 5D attention patterns into 4D-compatible operations
-    gir_graph = decompose_5d_attention_pattern(gir_graph)
+    # Optional: decompose some 5D attention patterns to 4D forms.
+    # Keep this off when preserving symbolic dimensions is more important.
+    if decompose_5d_attention:
+        gir_graph = decompose_5d_attention_pattern(gir_graph)
 
     # Save graph (if output path provided)
     if output_path is not None:
