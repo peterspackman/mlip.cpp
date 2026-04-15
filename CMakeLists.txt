@@ -36,6 +36,7 @@ option(MLIPCPP_USE_SYCL "Enable SYCL backend via ggml (Intel)" OFF)
 option(MLIPCPP_USE_CANN "Enable CANN backend via ggml (Huawei Ascend)" OFF)
 option(MLIPCPP_USE_BLAS "Enable BLAS acceleration via ggml" OFF)
 option(MLIPCPP_USE_SYSTEM_FMT "Use system-installed fmtlib instead of bundled" OFF)
+option(MLIPCPP_WASM_ASYNCIFY "Use ASYNCIFY instead of JSPI for async WebGPU calls in WASM builds" OFF)
 
 # WASM-specific settings
 if(EMSCRIPTEN)
@@ -44,7 +45,7 @@ if(EMSCRIPTEN)
     set(MLIPCPP_BUILD_TESTS OFF)
     set(MLIPCPP_BUILD_PYTHON OFF)
     set(MLIPCPP_BUILD_FORTRAN OFF)
-    # Disable all GPU backends for WASM
+    # Disable native GPU backends for WASM (WebGPU is the only option)
     set(MLIPCPP_USE_CUDA OFF)
     set(MLIPCPP_USE_HIP OFF)
     set(MLIPCPP_USE_METAL OFF)
@@ -52,6 +53,7 @@ if(EMSCRIPTEN)
     set(MLIPCPP_USE_SYCL OFF)
     set(MLIPCPP_USE_CANN OFF)
     set(MLIPCPP_USE_BLAS OFF)
+    # MLIPCPP_USE_WEBGPU stays as the user set it (default OFF).
     # Tell GGML we're building for WASM so it uses SIMD-optimized kernels
     # (Emscripten defaults CMAKE_SYSTEM_PROCESSOR to x86, not wasm)
     set(CMAKE_SYSTEM_PROCESSOR "wasm32" CACHE STRING "" FORCE)
@@ -125,6 +127,14 @@ if(MLIPCPP_USE_VULKAN)
 endif()
 if(MLIPCPP_USE_WEBGPU)
     set(GGML_WEBGPU ON CACHE BOOL "" FORCE)
+    if(EMSCRIPTEN)
+        # Default to JSPI; opt in to ASYNCIFY via MLIPCPP_WASM_ASYNCIFY=ON.
+        if(MLIPCPP_WASM_ASYNCIFY)
+            set(GGML_WEBGPU_JSPI OFF CACHE BOOL "" FORCE)
+        else()
+            set(GGML_WEBGPU_JSPI ON CACHE BOOL "" FORCE)
+        endif()
+    endif()
 endif()
 if(MLIPCPP_USE_SYCL)
     set(GGML_SYCL ON CACHE BOOL "" FORCE)
@@ -144,7 +154,6 @@ if(EMSCRIPTEN)
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
     set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
     set(GGML_BLAS OFF CACHE BOOL "" FORCE)
-    # WebGPU on web is opt-in; the user must also pass MLIPCPP_USE_WEBGPU=ON
 endif()
 
 if(MLIPCPP_GGML_SOURCE_DIR)
@@ -329,24 +338,34 @@ if(EMSCRIPTEN)
     target_link_libraries(mlipcpp_wasm PRIVATE mlipcpp)
     target_include_directories(mlipcpp_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-    # Emscripten-specific link flags
+    set(MLIPCPP_WASM_LINK_FLAGS
+        "-s WASM=1 "
+        "-s MODULARIZE=1 "
+        "-s EXPORT_ES6=1 "
+        "-s EXPORT_NAME='createMlipcpp' "
+        "-s ALLOW_MEMORY_GROWTH=1 "
+        "-s MAXIMUM_MEMORY=4GB "
+        "-s STACK_SIZE=1MB "
+        "-s SINGLE_FILE=1 "
+        "-s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall'] "
+        "-s FORCE_FILESYSTEM=1 "
+        "--bind "
+        "-O3 "
+    )
+
+    # When WebGPU is enabled, ggml-webgpu already propagates -sJSPI or
+    # -sASYNCIFY via INTERFACE link options. Add a larger async stack for
+    # ASYNCIFY; JSPI doesn't need it.
+    if(MLIPCPP_USE_WEBGPU AND MLIPCPP_WASM_ASYNCIFY)
+        list(APPEND MLIPCPP_WASM_LINK_FLAGS "-s ASYNCIFY_STACK_SIZE=65536 ")
+    endif()
+
+    string(REPLACE ";" "" MLIPCPP_WASM_LINK_FLAGS "${MLIPCPP_WASM_LINK_FLAGS}")
+
     set_target_properties(mlipcpp_wasm PROPERTIES
         SUFFIX ".js"
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-        LINK_FLAGS "\
-            -s WASM=1 \
-            -s MODULARIZE=1 \
-            -s EXPORT_ES6=1 \
-            -s EXPORT_NAME='createMlipcpp' \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s MAXIMUM_MEMORY=4GB \
-            -s STACK_SIZE=1MB \
-            -s SINGLE_FILE=1 \
-            -s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall'] \
-            -s FORCE_FILESYSTEM=1 \
-            --bind \
-            -O3 \
-        "
+        LINK_FLAGS "${MLIPCPP_WASM_LINK_FLAGS}"
     )
 
     # Install WASM output
