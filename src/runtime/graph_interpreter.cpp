@@ -177,16 +177,18 @@ void GraphInterpreter::set_input(const std::string &name, ggml_tensor *tensor) {
 }
 
 void GraphInterpreter::init_constants() {
-  // Set constant values after graph allocation
+  // Set constant values after graph allocation. Use ggml_backend_tensor_set
+  // so this works for non-CPU backends (Metal, WebGPU, ...) where tensor->data
+  // is a backend-private handle rather than a CPU-mappable pointer.
+  std::vector<float> staging;
   for (const auto &pc : pending_constants_) {
-    if (pc.tensor && pc.tensor->data) {
-      // Fill ALL elements of the tensor with the constant value
-      float *data = static_cast<float *>(pc.tensor->data);
-      size_t n_elements = ggml_nelements(pc.tensor);
-      for (size_t i = 0; i < n_elements; i++) {
-        data[i] = pc.value;
-      }
+    if (!pc.tensor || !pc.tensor->buffer) {
+      continue;
     }
+    size_t n_elements = ggml_nelements(pc.tensor);
+    staging.assign(n_elements, pc.value);
+    ggml_backend_tensor_set(pc.tensor, staging.data(), 0,
+                            n_elements * sizeof(float));
   }
 
   // Constants are context-owned; clear pointers after initialization to avoid

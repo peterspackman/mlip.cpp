@@ -16,6 +16,7 @@ enum class BackendPreference {
   HIP,    // AMD HIP/ROCm GPU
   Metal,  // Apple Metal GPU (macOS/iOS)
   Vulkan, // Vulkan GPU (cross-platform)
+  WebGPU, // WebGPU (Dawn native or browser)
   SYCL,   // Intel SYCL (oneAPI)
   CANN,   // Huawei Ascend NPU
 };
@@ -81,8 +82,9 @@ private:
 
 // Convenience function to get preference name
 inline const char *backend_preference_name(BackendPreference pref) {
-  static constexpr const char *names[] = {"auto",  "cpu",    "cuda", "hip",
-                                          "metal", "vulkan", "sycl", "cann"};
+  static constexpr const char *names[] = {"auto",   "cpu",    "cuda", "hip",
+                                          "metal",  "vulkan", "webgpu",
+                                          "sycl",   "cann"};
   return names[static_cast<size_t>(pref)];
 }
 
@@ -100,6 +102,8 @@ inline BackendPreference parse_backend_preference(std::string_view name) {
     return BackendPreference::Metal;
   if (name == "vulkan")
     return BackendPreference::Vulkan;
+  if (name == "webgpu")
+    return BackendPreference::WebGPU;
   if (name == "sycl")
     return BackendPreference::SYCL;
   if (name == "cann")

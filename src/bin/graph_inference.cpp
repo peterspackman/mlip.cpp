@@ -23,6 +23,8 @@
 #include <ggml.h>
 #include <nlohmann/json.hpp>
 
+#include <unordered_map>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -600,12 +602,13 @@ std::vector<float> scatter_forces(
 
 void print_usage(const char *prog) {
   std::cerr << "Usage: " << prog
-            << " <model> <xyz_file> [--forces] [--debug]\n\n";
+            << " <model> <xyz_file> [--forces] [--debug] [--backend <name>]\n\n";
   std::cerr << "Arguments:\n";
   std::cerr << "  model     .gguf file or export directory\n";
   std::cerr << "  xyz_file  Input structure in XYZ format\n";
   std::cerr << "  --forces  Compute forces via backward pass (F = -dE/dr)\n";
   std::cerr << "  --debug   Dump inputs and print intermediate tensor values\n";
+  std::cerr << "  --backend cpu|metal|webgpu|cuda|... (default: cpu)\n";
   std::cerr << "\nExample:\n";
   std::cerr << "  " << prog << " pet-auto.gguf geometries/water.xyz\n";
   std::cerr << "  " << prog
@@ -624,6 +627,7 @@ int main(int argc, char *argv[]) {
   const std::string xyz_path = argv[2];
   bool debug = false;
   bool compute_forces = false;
+  std::string backend_name = "cpu";
 
   for (int i = 3; i < argc; i++) {
     std::string arg = argv[i];
@@ -631,7 +635,9 @@ int main(int argc, char *argv[]) {
       debug = true;
     else if (arg == "--forces")
       compute_forces = true;
-    else {
+    else if (arg == "--backend" && i + 1 < argc) {
+      backend_name = argv[++i];
+    } else {
       std::cerr << "Unknown option: " << arg << "\n";
       print_usage(argv[0]);
       return 1;
@@ -639,10 +645,55 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    // Create backend
-    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    // Create backend. CPU is default; for any other name we look up the GPU
+    // device of that backend and use it as the single compute backend.
+    ggml_backend_t cpu_backend = nullptr;
+    if (backend_name == "cpu") {
+      cpu_backend = ggml_backend_cpu_init();
+    } else {
+      // Init each non-CPU device and pick one whose backend name matches.
+      // Aliases: user-friendly name → ggml backend name substrings to accept.
+      static const std::unordered_map<std::string, std::vector<std::string>> aliases = {
+        {"metal",  {"metal", "mtl"}},
+        {"webgpu", {"webgpu"}},
+        {"cuda",   {"cuda"}},
+        {"hip",    {"hip", "rocm"}},
+        {"vulkan", {"vulkan"}},
+        {"sycl",   {"sycl"}},
+        {"cann",   {"cann"}},
+      };
+      std::string user = backend_name;
+      std::transform(user.begin(), user.end(), user.begin(), ::tolower);
+      auto needles = aliases.count(user) ? aliases.at(user)
+                                         : std::vector<std::string>{user};
+      auto matches = [&](const char *n) {
+        std::string s(n);
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        for (const auto &q : needles) {
+          if (s.find(q) != std::string::npos) return true;
+        }
+        return false;
+      };
+      size_t n_dev = ggml_backend_dev_count();
+      for (size_t i = 0; i < n_dev && !cpu_backend; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+        ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+        if (!b) continue;
+        if (matches(ggml_backend_name(b)) || matches(ggml_backend_dev_name(dev))) {
+          cpu_backend = b;
+        } else {
+          ggml_backend_free(b);
+        }
+      }
+      if (!cpu_backend) {
+        std::cerr << "Error: backend '" << backend_name << "' not available\n";
+        return 1;
+      }
+      std::cout << "Backend: " << ggml_backend_name(cpu_backend) << "\n";
+    }
     if (!cpu_backend) {
-      std::cerr << "Error: Failed to create CPU backend\n";
+      std::cerr << "Error: Failed to create backend\n";
       return 1;
     }
 

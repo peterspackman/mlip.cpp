@@ -30,6 +30,7 @@ option(MLIPCPP_INSTALL "Generate install target" OFF)
 option(MLIPCPP_USE_CUDA "Enable CUDA backend via ggml" OFF)
 option(MLIPCPP_USE_HIP "Enable HIP/ROCm backend via ggml (AMD)" OFF)
 option(MLIPCPP_USE_METAL "Enable Metal backend via ggml" OFF)
+option(MLIPCPP_USE_WEBGPU "Enable WebGPU backend via ggml (requires Dawn)" OFF)
 option(MLIPCPP_USE_VULKAN "Enable Vulkan backend via ggml" OFF)
 option(MLIPCPP_USE_SYCL "Enable SYCL backend via ggml (Intel)" OFF)
 option(MLIPCPP_USE_CANN "Enable CANN backend via ggml (Huawei Ascend)" OFF)
@@ -122,6 +123,9 @@ endif()
 if(MLIPCPP_USE_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 endif()
+if(MLIPCPP_USE_WEBGPU)
+    set(GGML_WEBGPU ON CACHE BOOL "" FORCE)
+endif()
 if(MLIPCPP_USE_SYCL)
     set(GGML_SYCL ON CACHE BOOL "" FORCE)
 endif()
@@ -140,6 +144,7 @@ if(EMSCRIPTEN)
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
     set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
     set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+    # WebGPU on web is opt-in; the user must also pass MLIPCPP_USE_WEBGPU=ON
 endif()
 
 if(MLIPCPP_GGML_SOURCE_DIR)
@@ -149,7 +154,7 @@ else()
     CPMAddPackage(
         NAME ggml
         GITHUB_REPOSITORY peterspackman/ggml
-        GIT_TAG 25574148
+        GIT_TAG b3db4019
         EXCLUDE_FROM_ALL YES
     )
 endif()

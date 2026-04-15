@@ -82,9 +82,13 @@ BackendProvider::create(BackendPreference pref) {
       return name.find("ROCm") != std::string_view::npos ||
              name.find("HIP") != std::string_view::npos;
     case BackendPreference::Metal:
-      return name.find("Metal") != std::string_view::npos;
+      // Upstream renamed the Metal backend to "MTL" (with device suffixes).
+      return name.find("Metal") != std::string_view::npos ||
+             name.find("MTL")   != std::string_view::npos;
     case BackendPreference::Vulkan:
       return name.find("Vulkan") != std::string_view::npos;
+    case BackendPreference::WebGPU:
+      return name.find("WebGPU") != std::string_view::npos;
     case BackendPreference::SYCL:
       return name.find("SYCL") != std::string_view::npos;
     case BackendPreference::CANN:
