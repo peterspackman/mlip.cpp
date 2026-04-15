@@ -25,9 +25,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build gcc g++ gfortran
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
       - name: Cache CPM packages
         uses: actions/cache@v4
         with:
@@ -56,12 +53,25 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j $(nproc)
 
-        # needed for test running
-      - name: Convert PET-MAD
+      # Pull a pre-exported graph-format GGUF from HuggingFace and place it
+      # where the GraphModel tests look for it (build/tests/gguf/pet-auto.gguf).
+      # Legacy fixed-PET tests skip cleanly when pet-mad.gguf is absent, which
+      # is the desired behaviour here — CI exercises the graph path only.
+      - name: Cache graph GGUF
+        uses: actions/cache@v4
+        with:
+          path: build/tests/gguf/pet-auto.gguf
+          key: gguf-pet-auto-${{ hashFiles('scripts/convert_models.py') }}
+
+      - name: Fetch graph GGUF from HuggingFace
         run: |
-          uv run scripts/convert_pet_mad.py --output pet-mad.gguf
-          rm -f build/tests/pet-mad.gguf
-          cp pet-mad.gguf build/tests/
+          mkdir -p build/tests/gguf
+          if [ ! -s build/tests/gguf/pet-auto.gguf ]; then
+            curl -fL --retry 3 \
+              -o build/tests/gguf/pet-auto.gguf \
+              https://huggingface.co/peterspackman/mlip-gguf/resolve/main/pet-mad-xs.gguf
+          fi
+          ls -la build/tests/gguf/
 
       - name: Run tests
         working-directory: build
