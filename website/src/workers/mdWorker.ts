@@ -249,10 +249,10 @@ async function handleInit(data: { modelBuffer?: ArrayBuffer }): Promise<void> {
     state.module = await createMlipcpp()
 
     if (data.modelBuffer) {
-      state.model = state.module.Model.loadFromBuffer(data.modelBuffer)
+      state.model = await state.module.Model.loadFromBuffer(data.modelBuffer)
     }
 
-    self.postMessage({ type: 'initialized', version: state.module.getVersion() })
+    self.postMessage({ type: 'initialized', version: await state.module.getVersion() })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Initialization failed: ${err.message}` })
   }
@@ -265,30 +265,31 @@ async function handleLoadModel(data: { buffer: ArrayBuffer }): Promise<void> {
   }
 
   try {
-    state.model = state.module.Model.loadFromBuffer(data.buffer)
+    state.model = await state.module.Model.loadFromBuffer(data.buffer)
     self.postMessage({
       type: 'modelLoaded',
-      modelType: state.model.modelType(),
-      cutoff: state.model.cutoff(),
+      modelType: await state.model.modelType(),
+      cutoff: await state.model.cutoff(),
     })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Failed to load model: ${err.message}` })
   }
 }
 
-function handleSetSystem(data: { xyz: string }): void {
+async function handleSetSystem(data: { xyz: string }): Promise<void> {
   if (!state.module) {
     self.postMessage({ type: 'error', message: 'Module not initialized' })
     return
   }
 
   try {
-    state.system = state.module.AtomicSystem.fromXyzString(data.xyz)
-    state.numAtoms = state.system.numAtoms()
-    state.isPeriodic = state.system.isPeriodic()
-    state.positions = new Float64Array(state.system.getPositions())
-    state.atomicNumbers = new Int32Array(state.system.getAtomicNumbers())
-    state.cell = state.system.getCell() ? new Float64Array(state.system.getCell()!) : null
+    state.system = await state.module.AtomicSystem.fromXyzString(data.xyz)
+    state.numAtoms = await state.system.numAtoms()
+    state.isPeriodic = await state.system.isPeriodic()
+    state.positions = new Float64Array(await state.system.getPositions())
+    state.atomicNumbers = new Int32Array(await state.system.getAtomicNumbers())
+    const cellArr = await state.system.getCell()
+    state.cell = cellArr ? new Float64Array(cellArr) : null
 
     // Set up masses
     state.masses = new Float64Array(state.numAtoms)
@@ -323,7 +324,7 @@ function handleSetSystem(data: { xyz: string }): void {
   }
 }
 
-function handlePredict(): void {
+async function handlePredict(): Promise<void> {
   if (!state.module || !state.model || !state.system) {
     self.postMessage({ type: 'error', message: 'System or model not ready' })
     return
@@ -331,7 +332,7 @@ function handlePredict(): void {
 
   try {
     // Use NC forces for faster prediction (non-conservative forces from forward pass)
-    const result = state.model.predictWithOptions(state.system, true)
+    const result = await state.model.predictWithOptions(state.system, true)
     self.postMessage({
       type: 'prediction',
       energy: result.energy,
@@ -373,7 +374,7 @@ let fireStress: Float64Array | null = null
 let fireCellForce: Float64Array | null = null
 
 // Reset FIRE optimizer state and initialize velocities along force direction
-function resetFIRE(): void {
+async function resetFIRE(): Promise<void> {
   state.fireAlpha = FIRE_ALPHA_START
   state.fireNpos = 0
   state.fireDt = 0.1  // Start with small timestep
@@ -394,13 +395,13 @@ function resetFIRE(): void {
   // Initialize velocities along force direction for faster startup
   if (state.module && state.model && state.positions && state.velocities && state.masses) {
     // Get initial forces
-    const system = state.module.AtomicSystem.create(
+    const system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
       state.isPeriodic
     )
-    const result = state.model.predictWithOptions(system, true)
+    const result = await state.model.predictWithOptions(system, true)
     const forces = new Float64Array(result.forces)
 
     // Calculate force magnitude
@@ -493,7 +494,7 @@ function calculateVolume(cell: Float64Array): number {
 // Reference: Bitzek et al., PRL 97, 170201 (2006)
 // Extended to optimize cell using stress tensor for periodic systems
 // Uses cached forces for single prediction per step (like MD)
-function runFIREStep(): boolean {
+async function runFIREStep(): Promise<boolean> {
   if (!state.module || !state.model || !state.positions || !state.velocities || !state.masses) {
     return true  // converged = done
   }
@@ -505,13 +506,13 @@ function runFIREStep(): boolean {
 
     // If no cached forces, compute initial forces
     if (!fireForces) {
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, true)
       fireForces = new Float64Array(result.forces)
       fireStress = result.stress ? new Float64Array(result.stress) : null
       if (optimizingCell && fireStress && state.cell) {
@@ -535,13 +536,13 @@ function runFIREStep(): boolean {
 
     if (converged || state.optStep >= state.maxOptSteps) {
       // Get final energy
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, true)
 
       self.postMessage({
         type: 'optStep',
@@ -640,13 +641,13 @@ function runFIREStep(): boolean {
     }
 
     // Get new forces (single prediction per step)
-    state.system = state.module.AtomicSystem.create(
+    state.system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
       state.isPeriodic
     )
-    const resultNew = state.model.predictWithOptions(state.system, true)
+    const resultNew = await state.model.predictWithOptions(state.system, true)
     const forcesNew = new Float64Array(resultNew.forces)
     const stressNew = resultNew.stress ? new Float64Array(resultNew.stress) : null
 
@@ -702,7 +703,7 @@ function runFIREStep(): boolean {
   }
 }
 
-function runMDStep(): void {
+async function runMDStep(): Promise<void> {
   if (!state.module || !state.model || !state.positions || !state.velocities || !state.masses) {
     return
   }
@@ -712,13 +713,13 @@ function runMDStep(): void {
 
     // If we don't have cached forces, compute them first
     if (!state.forces) {
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, true)
       state.forces = new Float64Array(result.forces)
     }
 
@@ -739,7 +740,7 @@ function runMDStep(): void {
     const t1 = performance.now()
 
     // Get forces at new positions (single prediction per step)
-    state.system = state.module.AtomicSystem.create(
+    state.system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
@@ -747,7 +748,7 @@ function runMDStep(): void {
     )
     const t2 = performance.now()
 
-    const result = state.model.predictWithOptions(state.system, true)
+    const result = await state.model.predictWithOptions(state.system, true)
     const t3 = performance.now()
 
     const forcesNew = new Float64Array(result.forces)
@@ -811,7 +812,7 @@ function rattlePositions(amount: number): void {
   }
 }
 
-function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): void {
+async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): Promise<void> {
   if (state.isRunning) return
 
   // Update mode if provided
@@ -823,7 +824,7 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
 
   if (state.mode === 'optimize') {
     // Reset FIRE state for new optimization
-    resetFIRE()
+    await resetFIRE()
 
     // Apply rattle if requested
     if (data.rattleAmount && data.rattleAmount > 0) {
@@ -831,9 +832,9 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
     }
 
     // Run optimization steps as fast as possible
-    const runOptLoop = () => {
+    const runOptLoop = async () => {
       if (!state.isRunning) return
-      const done = runFIREStep()
+      const done = await runFIREStep()
       if (done) {
         handleStop()
       } else {
@@ -846,10 +847,10 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
     const stepsPerFrame = data.stepsPerFrame || 1
 
     // Run MD steps as fast as possible
-    const runMDLoop = () => {
+    const runMDLoop = async () => {
       if (!state.isRunning) return
       for (let i = 0; i < stepsPerFrame; i++) {
-        runMDStep()
+        await runMDStep()
       }
       mdTimeout = setTimeout(runMDLoop, 0)
     }
@@ -868,8 +869,8 @@ function handleStop(): void {
   self.postMessage({ type: 'stopped' })
 }
 
-function handleStep(): void {
-  runMDStep()
+async function handleStep(): Promise<void> {
+  await runMDStep()
 }
 
 function handleRattle(data: { amount: number }): void {
@@ -899,22 +900,22 @@ self.onmessage = async (e: MessageEvent) => {
       await handleLoadModel(data)
       break
     case 'setSystem':
-      handleSetSystem(data)
+      await handleSetSystem(data)
       break
     case 'predict':
-      handlePredict()
+      await handlePredict()
       break
     case 'setParameters':
       handleSetParameters(data)
       break
     case 'start':
-      handleStart(data)
+      await handleStart(data)
       break
     case 'stop':
       handleStop()
       break
     case 'step':
-      handleStep()
+      await handleStep()
       break
     case 'rattle':
       handleRattle(data)
