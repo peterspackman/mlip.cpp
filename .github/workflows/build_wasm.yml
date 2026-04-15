@@ -54,7 +54,8 @@ jobs:
       - name: Setup Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: '3.1.69'
+          # 4.0.16 matches website.yml — emdawnwebgpu only ships in 4.x.
+          version: '4.0.16'
           actions-cache-folder: 'emsdk-cache'
 
       - name: Cache CPM Dependencies
@@ -65,10 +66,10 @@ jobs:
           restore-keys: |
             wasm-cpm-${{ runner.os }}-
 
-      - name: Build WASM module
+      - name: Build WASM module (cpu + gpu variants)
         working-directory: packages/mlip.js
         run: |
-          rm -rf ../../wasm/CMakeCache.txt ../../wasm/CMakeFiles
+          rm -rf ../../wasm-cpu ../../wasm-gpu
           npm run build:wasm
 
       - name: Install package dependencies
