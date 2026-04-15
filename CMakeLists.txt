@@ -154,7 +154,7 @@ else()
     CPMAddPackage(
         NAME ggml
         GITHUB_REPOSITORY peterspackman/ggml
-        GIT_TAG f8d3370d
+        GIT_TAG 833b864d
         EXCLUDE_FROM_ALL YES
     )
 endif()
