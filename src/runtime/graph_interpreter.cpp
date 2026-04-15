@@ -1,5 +1,6 @@
 #include "graph_interpreter.h"
 
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
