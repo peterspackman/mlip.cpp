@@ -139,6 +139,20 @@ public:
     PredictorWrapper() = default;
     PredictorWrapper(std::shared_ptr<mlipcpp::Predictor> p) : predictor_(std::move(p)) {}
 
+    // Map user-facing backend name strings to the public Backend enum.
+    static mlipcpp::Backend parseBackend(const std::string& name) {
+        if (name.empty() || name == "auto") return mlipcpp::Backend::Auto;
+        if (name == "cpu")    return mlipcpp::Backend::CPU;
+        if (name == "webgpu" || name == "wgpu") return mlipcpp::Backend::WebGPU;
+        if (name == "metal" || name == "mtl")   return mlipcpp::Backend::Metal;
+        if (name == "cuda")   return mlipcpp::Backend::CUDA;
+        if (name == "hip" || name == "rocm")    return mlipcpp::Backend::HIP;
+        if (name == "vulkan") return mlipcpp::Backend::Vulkan;
+        if (name == "sycl")   return mlipcpp::Backend::SYCL;
+        if (name == "cann")   return mlipcpp::Backend::CANN;
+        return mlipcpp::Backend::Auto;
+    }
+
     // Load model from file path (Emscripten VFS)
     static PredictorWrapper load(const std::string& path) {
         return PredictorWrapper(std::make_shared<mlipcpp::Predictor>(path));
@@ -146,6 +160,12 @@ public:
 
     // Load model from ArrayBuffer
     static PredictorWrapper loadFromBuffer(const val& buffer) {
+        return loadFromBufferWithBackend(buffer, std::string("auto"));
+    }
+
+    static PredictorWrapper loadFromBufferWithBackend(const val& buffer,
+                                                      const std::string& backend) {
+        mlipcpp::set_backend(parseBackend(backend));
         // Get data from ArrayBuffer
         val uint8Array = val::global("Uint8Array").new_(buffer);
         const size_t length = uint8Array["length"].as<size_t>();
@@ -258,6 +278,14 @@ std::string getVersion() {
     return mlipcpp::version();
 }
 
+std::string getBackendName() {
+    return std::string(mlipcpp::get_backend_name());
+}
+
+void setBackend(const std::string& name) {
+    mlipcpp::set_backend(PredictorWrapper::parseBackend(name));
+}
+
 // Emscripten bindings
 EMSCRIPTEN_BINDINGS(mlipcpp) {
     // AtomicSystem wrapper
@@ -276,6 +304,7 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .constructor<>()
         .class_function("load", &PredictorWrapper::load)
         .class_function("loadFromBuffer", &PredictorWrapper::loadFromBuffer)
+        .class_function("loadFromBufferWithBackend", &PredictorWrapper::loadFromBufferWithBackend)
         .function("modelType", &PredictorWrapper::modelType)
         .function("cutoff", &PredictorWrapper::cutoff)
         .function("predictEnergy", &PredictorWrapper::predictEnergy)
@@ -285,4 +314,6 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
 
     // Utility functions
     function("getVersion", &getVersion);
+    function("getBackendName", &getBackendName);
+    function("setBackend", &setBackend);
 }

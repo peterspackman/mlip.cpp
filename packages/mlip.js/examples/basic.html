@@ -44,6 +44,16 @@
         <input type="file" id="modelFile" accept=".gguf">
     </div>
 
+    <div style="margin: 10px 0;">
+        <label for="backendSelect">Backend:</label>
+        <select id="backendSelect">
+            <option value="auto">auto</option>
+            <option value="cpu">cpu</option>
+            <option value="webgpu">webgpu</option>
+        </select>
+        <span id="webgpuStatus" style="margin-left:12px; font-size:0.9em; color:#666;"></span>
+    </div>
+
     <div style="margin: 15px 0;">
         <button id="predictWater" disabled>Predict Water Energy</button>
         <button id="predictSilicon" disabled>Predict Silicon Energy</button>
@@ -77,9 +87,34 @@
         // Initialize mlip.js
         async function init() {
             try {
+                // Check WebGPU availability in the browser
+                const webgpuStatus = document.getElementById('webgpuStatus');
+                if (navigator.gpu) {
+                    try {
+                        const adapter = await navigator.gpu.requestAdapter();
+                        if (adapter) {
+                            webgpuStatus.textContent = '✓ navigator.gpu adapter available';
+                            webgpuStatus.style.color = '#080';
+                        } else {
+                            webgpuStatus.textContent = '✗ no WebGPU adapter';
+                            webgpuStatus.style.color = '#a00';
+                        }
+                    } catch (e) {
+                        webgpuStatus.textContent = '✗ adapter error: ' + e.message;
+                        webgpuStatus.style.color = '#a00';
+                    }
+                } else {
+                    webgpuStatus.textContent = '✗ navigator.gpu not present';
+                    webgpuStatus.style.color = '#a00';
+                }
+
                 Module = await createMlip();
-                status.textContent = `mlip.js loaded (version ${Module.getVersion()}). Please load a model file.`;
-                log(`mlip.js version: ${Module.getVersion()}`);
+                const ver = await Module.getVersion();
+                status.textContent = `mlip.js loaded (version ${ver}). Please load a model file.`;
+                log(`mlip.js version: ${ver}`);
+                if (Module.getBackendName) {
+                    log(`Initial backend: ${await Module.getBackendName()}`);
+                }
             } catch (err) {
                 status.textContent = 'Failed to load mlip.js: ' + err.message;
                 console.error(err);
@@ -96,11 +131,17 @@
 
             try {
                 const buffer = await file.arrayBuffer();
-                model = Module.Model.loadFromBuffer(buffer);
+                const backend = document.getElementById('backendSelect').value;
+                if (Module.Model.loadFromBufferWithBackend) {
+                    model = await Module.Model.loadFromBufferWithBackend(buffer, backend);
+                } else {
+                    model = await Module.Model.loadFromBuffer(buffer);
+                }
 
                 log(`Model loaded: ${file.name}`);
-                log(`  Type: ${model.modelType()}`);
-                log(`  Cutoff: ${model.cutoff().toFixed(2)} Å`);
+                log(`  Backend: ${Module.getBackendName ? await Module.getBackendName() : '(unknown)'}`);
+                log(`  Type: ${await model.modelType()}`);
+                log(`  Cutoff: ${(await model.cutoff()).toFixed(2)} Å`);
                 log('');
 
                 status.textContent = 'Model loaded! Click a button to predict.';
@@ -114,7 +155,7 @@
         });
 
         // Predict water molecule
-        predictWaterBtn.addEventListener('click', () => {
+        predictWaterBtn.addEventListener('click', async () => {
             if (!model) return;
 
             clearOutput();
@@ -128,13 +169,13 @@
             ]);
             const atomicNumbers = new Int32Array([8, 1, 1]);
 
-            const water = Module.AtomicSystem.create(positions, atomicNumbers, null, false);
-            log(`Atoms: ${water.numAtoms()}`);
-            log(`Periodic: ${water.isPeriodic()}`);
+            const water = await Module.AtomicSystem.create(positions, atomicNumbers, null, false);
+            log(`Atoms: ${await water.numAtoms()}`);
+            log(`Periodic: ${await water.isPeriodic()}`);
             log('');
 
             const startTime = performance.now();
-            const result = model.predict(water);
+            const result = await model.predict(water);
             const elapsed = performance.now() - startTime;
 
             log(`Energy: ${result.energy.toFixed(6)} eV`);
@@ -152,7 +193,7 @@
         });
 
         // Predict silicon crystal
-        predictSiliconBtn.addEventListener('click', () => {
+        predictSiliconBtn.addEventListener('click', async () => {
             if (!model) return;
 
             clearOutput();
@@ -173,15 +214,27 @@
                 0, 0, a
             ]);
 
-            const silicon = Module.AtomicSystem.create(positions, atomicNumbers, cell, true);
-            log(`Atoms: ${silicon.numAtoms()}`);
-            log(`Periodic: ${silicon.isPeriodic()}`);
+            const silicon = await Module.AtomicSystem.create(positions, atomicNumbers, cell, true);
+            log(`Atoms: ${await silicon.numAtoms()}`);
+            log(`Periodic: ${await silicon.isPeriodic()}`);
             log(`Cell: ${a.toFixed(2)} × ${a.toFixed(2)} × ${a.toFixed(2)} Å`);
             log('');
 
             const startTime = performance.now();
-            const result = model.predict(silicon);
+            let result;
+            try {
+                result = await model.predict(silicon);
+            } catch (e) {
+                log('predict threw: ' + (e.message || e));
+                console.error('silicon predict error', e);
+                return;
+            }
             const elapsed = performance.now() - startTime;
+            console.log('silicon result', result);
+            if (!result || typeof result.energy !== 'number') {
+                log('Unexpected result shape: ' + JSON.stringify(result));
+                return;
+            }
 
             log(`Energy: ${result.energy.toFixed(6)} eV`);
             log(`Energy/atom: ${(result.energy/2).toFixed(6)} eV`);

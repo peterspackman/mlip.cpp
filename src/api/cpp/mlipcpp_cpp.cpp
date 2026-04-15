@@ -44,6 +44,8 @@ static BackendPreference to_internal(Backend b) {
     return BackendPreference::Metal;
   case Backend::Vulkan:
     return BackendPreference::Vulkan;
+  case Backend::WebGPU:
+    return BackendPreference::WebGPU;
   case Backend::SYCL:
     return BackendPreference::SYCL;
   case Backend::CANN:
