@@ -36,7 +36,10 @@ jobs:
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: '3.1.50'
+          # 3.1.69+ ships the emdawnwebgpu port needed by ggml's WebGPU
+          # backend; 3.1.50 is too old and fails with
+          # "unknown argument: '--use-port=emdawnwebgpu'".
+          version: '3.1.69'
 
       - name: Cache CPM packages
         uses: actions/cache@v4
