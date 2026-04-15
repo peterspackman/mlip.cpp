@@ -57,7 +57,11 @@ jobs:
 
       - name: Build WASM
         run: |
-          ./scripts/build_wasm.sh
+          # --webgpu: ship the WebGPU backend so the website's backend picker
+          #           can actually use it on Chrome.
+          # --asyncify: JSPI isn't stable on Firefox yet; ASYNCIFY works on
+          #             every browser at the cost of ~30% WASM runtime overhead.
+          ./scripts/build_wasm.sh --webgpu --asyncify
         env:
           CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm_cache
 
