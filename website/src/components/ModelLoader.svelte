@@ -70,6 +70,7 @@
     Backend
     <select
       bind:value={store.backendChoice}
+      onchange={() => { if (store.modelStatus === 'ready') store.switchBackend() }}
       disabled={store.modelStatus === 'loading' || store.isRunning}
     >
       <option value="auto">auto</option>

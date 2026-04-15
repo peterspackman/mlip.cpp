@@ -70,6 +70,7 @@ const STREAM_TYPES = new Set(['mdStep', 'optStep', 'rattled', 'started', 'stoppe
 const RESPONSE_FOR: Record<string, string> = {
   init: 'initialized',
   loadModel: 'modelLoaded',
+  setBackend: 'backendSet',
   setSystem: 'systemSet',
   predict: 'prediction',
   setParameters: 'parametersSet',
@@ -175,6 +176,10 @@ export class Simulation {
 
   async loadModel(buffer: ArrayBuffer, backend: Backend = 'auto'): Promise<ModelInfo> {
     return this.request('loadModel', { buffer, backend }, [buffer])
+  }
+
+  async setBackend(backend: Backend): Promise<{ backend: string }> {
+    return this.request('setBackend', { backend })
   }
 
   async setSystem(xyz: string): Promise<SystemInfo> {

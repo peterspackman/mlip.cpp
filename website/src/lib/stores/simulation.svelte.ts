@@ -171,6 +171,24 @@ export class SimulationStore {
     }
   }
 
+  // Swap the currently loaded model onto a different backend. Called by the
+  // UI when the user flips the backend selector after a model is already
+  // loaded — the worker re-instantiates using its cached GGUF bytes.
+  async switchBackend() {
+    if (this.modelStatus !== 'ready') return
+    this.modelStatus = 'loading'
+    this.modelError = ''
+    if (this.isRunning) this.sim.stop()
+    try {
+      const info = await this.sim.setBackend(this.backendChoice)
+      if (info.backend) this.activeBackend = info.backend
+      this.modelStatus = 'ready'
+    } catch (err: any) {
+      this.modelStatus = 'error'
+      this.modelError = err?.message ?? String(err)
+    }
+  }
+
   async setStructure(xyz: string, lattice: Lattice | null) {
     // Invalidate any vib analysis we have for the previous structure.
     this.clearVibrations()
@@ -398,8 +416,20 @@ export class SimulationStore {
 }
 
 function defaultBackend(): Backend {
-  if (typeof navigator !== 'undefined' && /Firefox/i.test(navigator.userAgent)) {
-    return 'cpu'
-  }
+  if (typeof navigator === 'undefined') return 'auto'
+  // No WebGPU API exposed → CPU. Covers Firefox (no WebGPU by default) and
+  // older Safari. `navigator.gpu` is only present on the main thread in
+  // Safari, but defaultBackend runs there so this check is meaningful.
+  if (!('gpu' in navigator)) return 'cpu'
+  const ua = navigator.userAgent
+  // Firefox exposes navigator.gpu (behind or partially enabled in recent
+  // versions) but returns a stub/software adapter that's slower than CPU
+  // and still triggers the full ASYNCIFY suspend/rewind path. Stay on CPU.
+  if (/Firefox/i.test(ua)) return 'cpu'
+  // Safari's WebGPU in Web Workers is unreliable / absent, and our WASM
+  // module runs inside a Worker. Default Safari to CPU; the user can still
+  // flip the toggle manually if a future Safari fixes this.
+  const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|Android/i.test(ua)
+  if (isSafari) return 'cpu'
   return 'auto'
 }

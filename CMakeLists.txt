@@ -148,7 +148,12 @@ endif()
 
 # WASM-specific ggml configuration
 if(EMSCRIPTEN)
-    set(GGML_WASM_SINGLE_FILE ON CACHE BOOL "" FORCE)
+    # SINGLE_FILE=ON embeds the .wasm as base64 inside the .js, which blocks
+    # streaming compilation (WebAssembly.instantiateStreaming). Firefox needs
+    # streaming to tier up to its optimizing compiler — without it, compute
+    # stays stuck in baseline and is ~30x slower than Chrome. Shipping as a
+    # separate .wasm fixes this.
+    set(GGML_WASM_SINGLE_FILE OFF CACHE BOOL "" FORCE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     set(GGML_METAL OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
@@ -346,7 +351,6 @@ if(EMSCRIPTEN)
         "-s ALLOW_MEMORY_GROWTH=1 "
         "-s MAXIMUM_MEMORY=4GB "
         "-s STACK_SIZE=1MB "
-        "-s SINGLE_FILE=1 "
         "-s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall'] "
         "-s FORCE_FILESYSTEM=1 "
         "--bind "
@@ -357,6 +361,12 @@ if(EMSCRIPTEN)
     # -sASYNCIFY via INTERFACE link options. Add a larger async stack for
     # ASYNCIFY; JSPI doesn't need it.
     if(MLIPCPP_USE_WEBGPU AND MLIPCPP_WASM_ASYNCIFY)
+        # NOTE: ASYNCIFY_IGNORE_INDIRECT=1 would narrow the transform nicely
+        # (ggml's backend iface dispatch is indirect), but it breaks at
+        # runtime with "indirect call to null" — some indirect call reaches
+        # a function that legitimately needs to suspend (likely inside
+        # emdawnwebgpu's callback plumbing). Leave it off until we can
+        # enumerate those with ASYNCIFY_ADD.
         list(APPEND MLIPCPP_WASM_LINK_FLAGS "-s ASYNCIFY_STACK_SIZE=65536 ")
     endif()
 

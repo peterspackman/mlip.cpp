@@ -48,6 +48,10 @@ jobs:
           restore-keys: |
             cpm-wasm-
 
+      - name: Install mlip.js deps
+        working-directory: packages/mlip.js
+        run: npm install
+
       # Cache the bundled GGUF across runs so we don't re-download from HF on
       # every build. Keyed on the URL + filename so a model bump in
       # package.json invalidates the cache automatically.
@@ -57,21 +61,15 @@ jobs:
           path: website/public/pet-mad-xs.gguf
           key: gguf-pet-mad-xs-${{ hashFiles('website/package.json') }}
 
-      - name: Build WASM
-        run: |
-          # --webgpu: ship the WebGPU backend so the website's backend picker
-          #           can actually use it on Chrome.
-          # --asyncify: JSPI isn't stable on Firefox yet; ASYNCIFY works on
-          #             every browser at the cost of ~30% WASM runtime overhead.
-          ./scripts/build_wasm.sh --webgpu --asyncify
+      - name: Build WASM (both variants)
+        working-directory: packages/mlip.js
+        # Two binaries shipped side-by-side:
+        #   cpu: no WebGPU, no ASYNCIFY — fast on Firefox/Safari
+        #   gpu: WebGPU + ASYNCIFY — Chrome path (ASYNCIFY kills Firefox perf)
+        # The loader picks the right variant based on the user's backend choice.
+        run: npm run build
         env:
           CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm_cache
-
-      - name: Build mlip.js package
-        working-directory: packages/mlip.js
-        run: |
-          npm install
-          node scripts/build.js
 
       - name: Install website dependencies
         working-directory: website

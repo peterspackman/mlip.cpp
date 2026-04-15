@@ -39,12 +39,16 @@ scripts/stress_ase_optimizer_segfault.py
 
 # WASM build output
 wasm/
+wasm-cpu/
+wasm-gpu/
 
 # Node.js / npm
 node_modules/
 *.tgz
 packages/mlip.js/dist/
 packages/mlip.js/src/mlipcpp_wasm.js
+packages/mlip.js/src/cpu/
+packages/mlip.js/src/gpu/
 
 # Website build output
 website/dist/

@@ -12,8 +12,17 @@
       "browser": "./dist/index.browser.js",
       "default": "./dist/index.browser.js"
     },
-    "./wasm": {
-      "default": "./dist/mlipcpp_wasm.wasm"
+    "./cpu": {
+      "default": "./dist/cpu/mlipcpp_wasm.js"
+    },
+    "./gpu": {
+      "default": "./dist/gpu/mlipcpp_wasm.js"
+    },
+    "./cpu-wasm": {
+      "default": "./dist/cpu/mlipcpp_wasm.wasm"
+    },
+    "./gpu-wasm": {
+      "default": "./dist/gpu/mlipcpp_wasm.wasm"
     }
   },
   "files": [
@@ -24,9 +33,11 @@
   ],
   "scripts": {
     "build": "npm run build:wasm && npm run build:wrapper",
-    "build:wasm": "cd ../.. && ./scripts/build_wasm.sh",
+    "build:wasm": "npm run build:wasm:cpu && npm run build:wasm:gpu",
+    "build:wasm:cpu": "cd ../.. && BUILD_DIR=wasm-cpu ./scripts/build_wasm.sh",
+    "build:wasm:gpu": "cd ../.. && BUILD_DIR=wasm-gpu ./scripts/build_wasm.sh --webgpu --asyncify",
     "build:wrapper": "node scripts/build.js",
-    "clean": "rm -rf dist src/mlipcpp_wasm.js src/mlipcpp_wasm.wasm",
+    "clean": "rm -rf dist src/mlipcpp_wasm*.js src/mlipcpp_wasm*.wasm src/cpu src/gpu",
     "rebuild": "npm run clean && npm run build",
     "prepublishOnly": "npm run build"
   },

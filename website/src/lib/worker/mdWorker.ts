@@ -13,6 +13,10 @@
 
 import createMlipcpp from '@peterspackman/mlip.js'
 import type { MlipcppModule, Model, AtomicSystem } from '@peterspackman/mlip.js'
+// Grab both variant WASM URLs so Vite bundles them as static assets. The
+// loader picks one at runtime based on the user's backend choice.
+import cpuWasmUrl from '@peterspackman/mlip.js/cpu-wasm?url'
+import gpuWasmUrl from '@peterspackman/mlip.js/gpu-wasm?url'
 
 interface WorkerState {
   module: MlipcppModule | null
@@ -340,37 +344,78 @@ function removeCOMVelocity(
   }
 }
 
+// Instantiate the WASM module for the chosen backend. The CPU and GPU
+// variants are completely separate binaries (different compile flags), so
+// swapping backends means throwing away the old module entirely.
+async function instantiateModule(backend: 'cpu' | 'webgpu' | 'auto'): Promise<MlipcppModule> {
+  return (createMlipcpp as any)({
+    backend,
+    cpuWasmUrl,
+    gpuWasmUrl,
+  }) as Promise<MlipcppModule>
+}
+
 // Message handlers
-async function handleInit(data: { modelBuffer?: ArrayBuffer }): Promise<void> {
+async function handleInit(_data: { modelBuffer?: ArrayBuffer }): Promise<void> {
   try {
-    state.module = await createMlipcpp()
-
-    if (data.modelBuffer) {
-      state.model = await state.module.Model.loadFromBuffer(data.modelBuffer)
-    }
-
-    self.postMessage({ type: 'initialized', version: await state.module.getVersion() })
+    // Defer actual WASM instantiation to loadModel, where the backend is
+    // known. Replying 'initialized' here just signals "worker is alive".
+    self.postMessage({ type: 'initialized', version: '' })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Initialization failed: ${err.message}` })
   }
 }
 
-async function handleLoadModel(data: { buffer: ArrayBuffer, backend?: string }): Promise<void> {
-  if (!state.module) {
-    self.postMessage({ type: 'error', message: 'Module not initialized' })
-    return
+// Track which variant ('cpu' | 'gpu') is currently instantiated so we can
+// detect backend changes and rebuild the module when needed.
+let loadedVariant: 'cpu' | 'gpu' | null = null
+// Cached copy of the last-loaded GGUF bytes so we can re-instantiate the
+// model when the user flips the backend selector, without needing the main
+// thread to re-post the buffer (which was already transferred).
+let cachedModelBuffer: ArrayBuffer | null = null
+
+async function ensureModuleForBackend(requested: 'cpu' | 'webgpu' | 'auto'): Promise<'cpu' | 'webgpu'> {
+  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator
+  // Resolve 'auto' to a concrete variant so we can compare against what's loaded.
+  const desired: 'cpu' | 'webgpu' = (requested === 'webgpu' || (requested === 'auto' && hasWebGPU)) ? 'webgpu' : 'cpu'
+  const desiredVariant: 'cpu' | 'gpu' = desired === 'webgpu' ? 'gpu' : 'cpu'
+
+  if (state.module && loadedVariant === desiredVariant) return desired
+
+  // Tear down any existing module (and its buffers) before loading a new variant.
+  if (state.model && typeof (state.model as any).delete === 'function') {
+    try { (state.model as any).delete() } catch { /* ignore */ }
   }
+  state.model = null
+  if (state.system && typeof (state.system as any).delete === 'function') {
+    try { (state.system as any).delete() } catch { /* ignore */ }
+  }
+  state.system = null
+  state.forces = null
+  state.initialTotalEnergy = null
+  state.module = null
+  loadedVariant = null
 
+  state.module = await instantiateModule(desired)
+  loadedVariant = desiredVariant
+  return desired
+}
+
+async function handleLoadModel(data: { buffer: ArrayBuffer, backend?: string }): Promise<void> {
   try {
-    const backend = data.backend || 'auto'
+    const requested = (data.backend || 'auto') as 'cpu' | 'webgpu' | 'auto'
 
-    // Release any previously loaded model + its associated system BEFORE we
-    // create a new Predictor. Embind smart pointers are reclaimed by JS GC
-    // lazily, so without this the old Predictor's WebGPU device / tensor
-    // buffers can still be alive when the new one is initialized — which
-    // makes the second Predictor's load write into overlapping storage
-    // buffer ranges and trip `silu_back_f32` aliasing errors inside
-    // ggml-webgpu.
+    let backend: 'cpu' | 'webgpu' = 'cpu'
+    try {
+      backend = await ensureModuleForBackend(requested)
+    } catch (gpuErr: any) {
+      if (requested === 'cpu') throw gpuErr
+      console.warn(`[mlip.cpp] GPU variant failed to load (${gpuErr?.message ?? 'unknown'}); falling back to CPU.`)
+      backend = await ensureModuleForBackend('cpu')
+    }
+
+    // Release any stale model/system left over from a prior load with the
+    // same variant (ensureModuleForBackend only clears them on variant swap).
     if (state.model && typeof (state.model as any).delete === 'function') {
       try { (state.model as any).delete() } catch { /* ignore */ }
     }
@@ -382,16 +427,49 @@ async function handleLoadModel(data: { buffer: ArrayBuffer, backend?: string }):
     state.forces = null
     state.initialTotalEnergy = null
 
-    state.model = await state.module.Model.loadFromBufferWithBackend(data.buffer, backend)
+    const mod = state.module!
+    try {
+      state.model = await mod.Model.loadFromBufferWithBackend(data.buffer, backend)
+    } catch (gpuErr: any) {
+      if (backend === 'cpu') throw gpuErr
+      console.warn(`[mlip.cpp] WebGPU init failed at model load (${gpuErr?.message ?? 'unknown'}); falling back to CPU.`)
+      backend = await ensureModuleForBackend('cpu')
+      state.model = await state.module!.Model.loadFromBufferWithBackend(data.buffer, 'cpu')
+    }
+    // Keep the raw bytes so a backend flip can reload without another postMessage.
+    // loadFromBufferWithBackend copies into the model's own memory, so the
+    // original ArrayBuffer is safe to retain.
+    cachedModelBuffer = data.buffer
+
     self.postMessage({
       type: 'modelLoaded',
       modelType: await state.model.modelType(),
       cutoff: await state.model.cutoff(),
-      backend: await state.module.getBackendName(),
+      backend: await state.module!.getBackendName(),
     })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Failed to load model: ${err.message}` })
   }
+}
+
+// Re-instantiate the currently loaded model on the requested backend.
+// The main thread calls this when the backend selector changes but the user
+// hasn't dropped a new .gguf. Reuses the cached model bytes from the last
+// successful loadModel call.
+async function handleSetBackend(data: { backend?: string }): Promise<void> {
+  if (!cachedModelBuffer) {
+    // Nothing loaded yet — the next loadModel will use the new backend.
+    self.postMessage({ type: 'backendSet', backend: '' })
+    return
+  }
+  if (state.isRunning) handleStop()
+  await handleLoadModel({ buffer: cachedModelBuffer, backend: data.backend })
+  // handleLoadModel posts 'modelLoaded'; relay a dedicated reply too so the
+  // main-thread RPC completes cleanly.
+  self.postMessage({
+    type: 'backendSet',
+    backend: state.module ? await state.module.getBackendName() : '',
+  })
 }
 
 async function handleSetSystem(data: { xyz: string }): Promise<void> {
@@ -1337,6 +1415,9 @@ self.onmessage = async (e: MessageEvent) => {
       break
     case 'loadModel':
       await handleLoadModel(data)
+      break
+    case 'setBackend':
+      await handleSetBackend(data)
       break
     case 'setSystem':
       await handleSetSystem(data)

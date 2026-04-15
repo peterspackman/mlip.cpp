@@ -8,7 +8,7 @@ set -e
 #   --webgpu     Enable WebGPU backend via emdawnwebgpu
 #   --asyncify   Use ASYNCIFY instead of JSPI (broader browser compat, slower)
 
-BUILD_DIR="wasm"
+BUILD_DIR="${BUILD_DIR:-wasm}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 USE_WEBGPU=OFF
 USE_ASYNCIFY=OFF

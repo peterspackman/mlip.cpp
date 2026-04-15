@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Build script for mlip.js - copies WASM artifacts and creates wrapper modules
+// Build script for mlip.js — collects both CPU and GPU WASM variants and
+// emits the package's dist/ layout + a smart loader that picks the variant
+// at runtime based on the requested backend.
 
 import fs from 'fs';
 import path from 'path';
@@ -7,53 +9,103 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
-const wasmBuildDir = path.resolve(rootDir, '../../wasm/bin');
+const repoRoot = path.resolve(rootDir, '../..');
 const distDir = path.resolve(rootDir, 'dist');
 const srcDir = path.resolve(rootDir, 'src');
 
-// Ensure directories exist
+const variants = [
+    { name: 'cpu', buildDir: path.join(repoRoot, 'wasm-cpu', 'bin') },
+    { name: 'gpu', buildDir: path.join(repoRoot, 'wasm-gpu', 'bin') },
+];
+
 fs.mkdirSync(distDir, { recursive: true });
 fs.mkdirSync(srcDir, { recursive: true });
 
-// Check if WASM build exists
-const wasmJsPath = path.join(wasmBuildDir, 'mlipcpp_wasm.js');
-if (!fs.existsSync(wasmJsPath)) {
-    console.error('Error: WASM build not found at', wasmJsPath);
-    console.error('Run "npm run build:wasm" first');
+console.log('Building mlip.js distribution...');
+
+let copied = 0;
+for (const v of variants) {
+    const jsPath = path.join(v.buildDir, 'mlipcpp_wasm.js');
+    const wasmPath = path.join(v.buildDir, 'mlipcpp_wasm.wasm');
+    if (!fs.existsSync(jsPath)) {
+        console.warn(`  [warn] ${v.name} build missing (${jsPath}) — skipping this variant`);
+        continue;
+    }
+
+    const distVariantDir = path.join(distDir, v.name);
+    const srcVariantDir = path.join(srcDir, v.name);
+    fs.mkdirSync(distVariantDir, { recursive: true });
+    fs.mkdirSync(srcVariantDir, { recursive: true });
+
+    fs.copyFileSync(jsPath, path.join(distVariantDir, 'mlipcpp_wasm.js'));
+    fs.copyFileSync(jsPath, path.join(srcVariantDir, 'mlipcpp_wasm.js'));
+    if (fs.existsSync(wasmPath)) {
+        fs.copyFileSync(wasmPath, path.join(distVariantDir, 'mlipcpp_wasm.wasm'));
+        fs.copyFileSync(wasmPath, path.join(srcVariantDir, 'mlipcpp_wasm.wasm'));
+    }
+    console.log(`  Copied ${v.name} variant to dist/${v.name}/ and src/${v.name}/`);
+    copied += 1;
+}
+
+if (copied === 0) {
+    console.error('Error: no WASM variants found. Run "npm run build:wasm" first.');
     process.exit(1);
 }
 
-console.log('Building mlip.js distribution...');
+// Smart loader: caller passes { backend, cpuWasmUrl?, gpuWasmUrl? }. We
+// dynamic-import the right Emscripten module and feed it locateFile so the
+// bundler's hashed .wasm URL is used. Dynamic imports let the bundler split
+// the two variants into separate chunks — only the chosen one is fetched.
+const browserWrapper = `// mlip.js — browser entry with variant-aware loader.
+//
+// Usage in a bundler (Vite / webpack / Rollup):
+//   import createMlipcpp from '@peterspackman/mlip.js'
+//   import cpuWasmUrl from '@peterspackman/mlip.js/cpu-wasm?url'
+//   import gpuWasmUrl from '@peterspackman/mlip.js/gpu-wasm?url'  // optional
+//   const mod = await createMlipcpp({ backend: 'auto', cpuWasmUrl, gpuWasmUrl })
+//
+// \`backend\`: 'cpu' | 'webgpu' | 'auto' (default 'auto').
+//   - 'cpu'   → always load the CPU-only build (no ASYNCIFY, no WebGPU).
+//   - 'webgpu'→ always load the GPU build (WebGPU + ASYNCIFY).
+//   - 'auto'  → load GPU build if navigator.gpu is present, else CPU.
+//
+// The two WASM URL options are plumbed to Emscripten's \`locateFile\`. If
+// omitted, Emscripten's default (import.meta.url-relative resolution) is used,
+// which works outside of bundlers.
+export default async function createMlipcpp(options = {}) {
+    const { backend = 'auto', cpuWasmUrl, gpuWasmUrl, ...rest } = options;
 
-// Copy WASM JS module to src for development
-fs.copyFileSync(wasmJsPath, path.join(srcDir, 'mlipcpp_wasm.js'));
-console.log('  Copied mlipcpp_wasm.js to src/');
+    const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    const wantGpu = backend === 'webgpu' || (backend === 'auto' && hasWebGPU);
 
-// Copy to dist (already ES6 module from Emscripten build)
-fs.copyFileSync(wasmJsPath, path.join(distDir, 'mlipcpp_wasm.js'));
-console.log('  Copied mlipcpp_wasm.js to dist/');
+    if (wantGpu) {
+        const mod = await import('./gpu/mlipcpp_wasm.js');
+        return mod.default({
+            ...rest,
+            ...(gpuWasmUrl ? { locateFile: (p) => p.endsWith('.wasm') ? gpuWasmUrl : p } : {}),
+        });
+    }
 
-// Create browser wrapper
-const browserWrapper = `// mlip.js - Browser entry point
-import createMlipcpp from './mlipcpp_wasm.js';
-
-export default createMlipcpp;
-export { createMlipcpp };
+    const mod = await import('./cpu/mlipcpp_wasm.js');
+    return mod.default({
+        ...rest,
+        ...(cpuWasmUrl ? { locateFile: (p) => p.endsWith('.wasm') ? cpuWasmUrl : p } : {}),
+    });
+}
 `;
 fs.writeFileSync(path.join(distDir, 'index.browser.js'), browserWrapper);
 console.log('  Created index.browser.js');
 
-// Create Node.js wrapper
-const nodeWrapper = `// mlip.js - Node.js entry point
+// Node entry: use the CPU variant (no WebGPU in Node anyway).
+const nodeWrapper = `// mlip.js — Node.js entry point (CPU variant).
 import { createRequire } from 'module';
-import { fileURLToPath } from 'url';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Load the Emscripten module
-const createModule = require('./mlipcpp_wasm.js');
+const createModule = require('./cpu/mlipcpp_wasm.js');
 
 export default createModule;
 export { createModule };
@@ -61,32 +113,35 @@ export { createModule };
 fs.writeFileSync(path.join(distDir, 'index-node.js'), nodeWrapper);
 console.log('  Created index-node.js');
 
-// Create main entry point
-const mainWrapper = `// mlip.js - Main entry point (auto-detects environment)
+const mainWrapper = `// mlip.js — main entry (auto-detects environment).
 let createModule;
-
-if (typeof window !== 'undefined') {
-    // Browser environment
+if (typeof window !== 'undefined' || typeof self !== 'undefined') {
     createModule = (await import('./index.browser.js')).default;
 } else {
-    // Node.js environment
     createModule = (await import('./index-node.js')).default;
 }
-
 export default createModule;
 export { createModule };
 `;
 fs.writeFileSync(path.join(distDir, 'index.js'), mainWrapper);
 console.log('  Created index.js');
 
-// Create TypeScript definitions
 const typeDefs = `// Type definitions for mlip.js
 
-export interface Vec3 {
-    x: number;
-    y: number;
-    z: number;
+export type Backend = 'cpu' | 'webgpu' | 'auto';
+
+export interface CreateOptions {
+    /** Which variant to load. Default: 'auto'. */
+    backend?: Backend;
+    /** URL of the CPU variant's .wasm file (use Vite \`?url\` import). */
+    cpuWasmUrl?: string;
+    /** URL of the GPU variant's .wasm file. */
+    gpuWasmUrl?: string;
+    /** Any additional Emscripten Module options. */
+    [key: string]: unknown;
 }
+
+export interface Vec3 { x: number; y: number; z: number; }
 
 export interface PredictionResult {
     energy: number;
@@ -135,7 +190,7 @@ export interface MlipcppModule {
     setBackend(name: string): void;
 }
 
-declare function createMlipcpp(): Promise<MlipcppModule>;
+declare function createMlipcpp(options?: CreateOptions): Promise<MlipcppModule>;
 
 export default createMlipcpp;
 export { createMlipcpp };
