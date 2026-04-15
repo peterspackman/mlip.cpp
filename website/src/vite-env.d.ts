@@ -1,3 +1,4 @@
+/// <reference types="svelte" />
 /// <reference types="vite/client" />
 
 declare module '*.css' {
@@ -10,10 +11,12 @@ declare module 'ngl' {
     constructor(element: HTMLElement, params?: Record<string, any>)
     loadFile(file: string | Blob | File, params?: Record<string, any>): Promise<any>
     removeAllComponents(): void
+    removeComponent(component: any): void
     autoView(duration?: number): void
     handleResize(): void
     setParameters(params: Record<string, any>): void
     dispose(): void
+    viewer: any
   }
   export class Shape {
     constructor(name: string)

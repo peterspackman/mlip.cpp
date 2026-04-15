@@ -35,6 +35,7 @@ enum class Backend {
   HIP,    ///< AMD HIP/ROCm GPU
   Metal,  ///< Apple Metal GPU (macOS/iOS)
   Vulkan, ///< Vulkan GPU (cross-platform)
+  WebGPU, ///< WebGPU (Dawn native or browser)
   SYCL,   ///< Intel SYCL (oneAPI)
   CANN,   ///< Huawei Ascend NPU
 };

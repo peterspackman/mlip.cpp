@@ -10,6 +10,7 @@
 #include "mlipcpp/model.h"
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
+#include "runtime/graph_model.h"
 #include <mutex>
 
 namespace mlipcpp {
@@ -43,6 +44,8 @@ static BackendPreference to_internal(Backend b) {
     return BackendPreference::Metal;
   case Backend::Vulkan:
     return BackendPreference::Vulkan;
+  case Backend::WebGPU:
+    return BackendPreference::WebGPU;
   case Backend::SYCL:
     return BackendPreference::SYCL;
   case Backend::CANN:
@@ -108,6 +111,16 @@ struct Predictor::Impl {
 
       model_type_str = "PET";
       model = std::move(pet_model);
+    } else if (arch == "pet-graph") {
+      auto graph_model = std::make_unique<runtime::GraphModel>();
+      graph_model->set_backend_preference(to_internal(options.backend));
+
+      if (!graph_model->load_from_gguf(path)) {
+        throw std::runtime_error("Failed to load graph model from: " + path);
+      }
+
+      model_type_str = "PET-Graph";
+      model = std::move(graph_model);
     } else {
       throw std::runtime_error("Unsupported model architecture: " + arch);
     }
@@ -131,25 +144,35 @@ struct Predictor::Impl {
     // Use predict_batch for NC forces support
     auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
     if (pet_model) {
+      const bool compute_grad =
+          (options.compute_forces || options.compute_stress) &&
+          !options.use_nc_forces;
       auto internal_results = pet_model->predict_batch(
           {system},
-          options.compute_forces && !options.use_nc_forces,  // gradient-based forces
-          options.use_nc_forces  // NC forces from forward pass
+          compute_grad, // gradient-based outputs
+          options.use_nc_forces // NC outputs from forward pass
       );
       auto &internal_result = internal_results[0];
 
       Result result;
       result.energy = internal_result.energy;
-      if (internal_result.has_forces) {
+      if (options.compute_forces && internal_result.has_forces) {
         result.forces = std::move(internal_result.forces);
       }
-      if (internal_result.has_stress) {
+      if (options.compute_stress && internal_result.has_stress) {
         result.stress = std::move(internal_result.stress);
       }
       return result;
     } else {
       // Fallback for non-PET models
-      return predict_impl(system, options.compute_forces);
+      auto result = predict_impl(system, options.compute_forces || options.compute_stress);
+      if (!options.compute_forces) {
+        result.forces.clear();
+      }
+      if (!options.compute_stress) {
+        result.stress.clear();
+      }
+      return result;
     }
   }
 };

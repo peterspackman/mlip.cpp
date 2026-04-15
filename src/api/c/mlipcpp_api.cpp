@@ -12,10 +12,12 @@
 
 #include "mlipcpp/mlipcpp.h"
 #include "core/backend.h"
+#include "core/gguf_loader.h"
 #include "core/log.h"
 #include "mlipcpp/model.h"
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
+#include "runtime/graph_model.h"
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -26,10 +28,13 @@
 /**
  * @brief Internal model implementation
  *
- * Wraps the C++ PETModel and stores the last result for zero-copy access.
+ * Wraps the C++ Model interface and stores the last result for zero-copy access.
+ * Model creation is deferred until load time so we can read the architecture
+ * from the GGUF file and create the appropriate model type.
  */
 struct mlipcpp_model_impl {
-  std::unique_ptr<mlipcpp::pet::PETModel> model;
+  std::unique_ptr<mlipcpp::Model> model;
+  mlipcpp_model_options_t options;
   mlipcpp::ModelResult last_result;
   bool weights_loaded = false;
   int32_t last_n_atoms = 0; // Track atoms in last result
@@ -224,28 +229,14 @@ mlipcpp_model_t mlipcpp_model_create(const mlipcpp_model_options_t *options) {
       options = &default_opts;
     }
 
-    // Create internal model structure
+    // Create internal model structure (model creation deferred to load time)
     auto impl = std::make_unique<mlipcpp_model_impl>();
-
-    // Create PETModel with default hypers (will be overridden by GGUF)
-    mlipcpp::pet::PETHypers hypers;
-    impl->model = std::make_unique<mlipcpp::pet::PETModel>(hypers);
+    impl->options = *options;
 
     // Update global backend preference if specified in options
     auto backend_pref = to_backend_preference(options->backend);
     if (backend_pref != mlipcpp::BackendPreference::Auto) {
       mlipcpp_set_backend(options->backend);
-    }
-
-    // Set backend provider (uses global shared backend)
-    impl->model->set_backend(get_global_backend());
-
-    // Set compute precision
-    impl->model->set_precision(to_compute_precision(options->precision));
-
-    // Override cutoff if requested
-    if (options->cutoff_override > 0.0f) {
-      impl->model->set_cutoff(options->cutoff_override);
     }
 
     clear_error();
@@ -270,10 +261,46 @@ mlipcpp_error_t mlipcpp_model_load(mlipcpp_model_t model, const char *path) {
   }
 
   try {
-    bool success = model->model->load_from_gguf(path);
-    if (!success) {
-      set_error(std::string("Failed to load model from: ") + path);
-      return MLIPCPP_ERROR_IO;
+    // Read architecture from GGUF to determine which model to create
+    mlipcpp::GGUFLoader loader(path);
+    std::string arch = loader.get_string("general.architecture", "");
+
+    if (arch == "pet") {
+      auto pet_model = std::make_unique<mlipcpp::pet::PETModel>(
+          mlipcpp::pet::PETHypers{});
+
+      // Set backend provider
+      pet_model->set_backend(get_global_backend());
+
+      // Set compute precision
+      pet_model->set_precision(
+          to_compute_precision(model->options.precision));
+
+      // Override cutoff if requested
+      if (model->options.cutoff_override > 0.0f) {
+        pet_model->set_cutoff(model->options.cutoff_override);
+      }
+
+      if (!pet_model->load_from_gguf(path)) {
+        set_error(std::string("Failed to load PET model from: ") + path);
+        return MLIPCPP_ERROR_IO;
+      }
+
+      model->model = std::move(pet_model);
+    } else if (arch == "pet-graph") {
+      auto graph_model = std::make_unique<mlipcpp::runtime::GraphModel>();
+      graph_model->set_backend_preference(
+          to_backend_preference(model->options.backend));
+
+      if (!graph_model->load_from_gguf(path)) {
+        set_error(std::string("Failed to load graph model from: ") + path);
+        return MLIPCPP_ERROR_IO;
+      }
+
+      model->model = std::move(graph_model);
+    } else {
+      set_error(std::string("Unsupported model architecture: ") + arch);
+      return MLIPCPP_ERROR_UNSUPPORTED;
     }
 
     model->weights_loaded = true;
@@ -510,15 +537,28 @@ mlipcpp_error_t mlipcpp_predict_with_options(mlipcpp_model_t model,
     // Run prediction using predict_batch for NC forces support
     auto *pet_model = dynamic_cast<mlipcpp::pet::PETModel *>(model->model.get());
     if (pet_model) {
+      const bool compute_grad =
+          (options->compute_forces || options->compute_stress) &&
+          !options->use_nc_forces;
       auto results = pet_model->predict_batch(
           {cpp_system},
-          options->compute_forces && !options->use_nc_forces,  // gradient-based forces
-          options->use_nc_forces  // NC forces from forward pass
+          compute_grad,            // gradient-based outputs
+          options->use_nc_forces   // NC outputs from forward pass
       );
       model->last_result = std::move(results[0]);
     } else {
       // Fallback for non-PET models
-      model->last_result = model->model->predict(cpp_system, options->compute_forces);
+      model->last_result = model->model->predict(
+          cpp_system, options->compute_forces || options->compute_stress);
+    }
+
+    if (!options->compute_forces) {
+      model->last_result.forces.clear();
+      model->last_result.has_forces = false;
+    }
+    if (!options->compute_stress) {
+      model->last_result.stress.clear();
+      model->last_result.has_stress = false;
     }
     model->last_n_atoms = system->n_atoms;
 

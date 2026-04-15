@@ -1,5 +1,9 @@
 #include "../src/models/pet/pet.h"
+#include "../src/runtime/graph_model.h"
+#include "core/backend.h"
+#include "core/gguf_loader.h"
 #include "core/log.h"
+#include <memory>
 #include "mlipcpp/io.h"
 #include "mlipcpp/model.h"
 #include "mlipcpp/neighbor_list.h"
@@ -75,21 +79,8 @@ int main(int argc, char **argv) {
   bool show_nc_stress = false;  // Show non-conservative stress only
   bool quiet_mode = false;
   bool profile_mode = false;
-  pet::BackendPreference backend_pref = pet::BackendPreference::Auto;
+  BackendPreference backend_pref = BackendPreference::Auto;
   pet::ComputePrecision precision = pet::ComputePrecision::F32;
-
-  // Backend name lookup table
-  static const std::unordered_map<std::string_view, pet::BackendPreference>
-      backend_map = {
-          {"auto", pet::BackendPreference::Auto},
-          {"cpu", pet::BackendPreference::CPU},
-          {"cuda", pet::BackendPreference::CUDA},
-          {"hip", pet::BackendPreference::HIP},
-          {"metal", pet::BackendPreference::Metal},
-          {"vulkan", pet::BackendPreference::Vulkan},
-          {"sycl", pet::BackendPreference::SYCL},
-          {"cann", pet::BackendPreference::CANN},
-      };
 
   static const std::unordered_map<std::string_view, pet::ComputePrecision>
       precision_map = {
@@ -120,12 +111,10 @@ int main(int argc, char **argv) {
     } else if (arg == "--profile") {
       profile_mode = true;
     } else if (arg == "--backend" && i + 1 < argc) {
-      std::string_view backend_str = argv[++i];
-      if (auto it = backend_map.find(backend_str); it != backend_map.end()) {
-        backend_pref = it->second;
-      } else {
-        std::cerr << "Unknown backend: " << backend_str
-                  << " (use: auto, cpu, cuda, hip, metal, vulkan, sycl, cann)\n";
+      try {
+        backend_pref = parse_backend_preference(argv[++i]);
+      } catch (const std::exception &e) {
+        std::cerr << e.what() << "\n";
         return 1;
       }
     } else if (arg == "--precision" && i + 1 < argc) {
@@ -191,54 +180,77 @@ int main(int argc, char **argv) {
   // Load model and run inference
   try {
     log::info("Loading model from {}", model_path);
-    Timer::instance().reset(); // Reset timers before loading and inference
+    Timer::instance().reset();
 
-    // Use PETModel directly for forces/stress support
-    pet::PETHypers hypers;
-    pet::PETModel pet_model(hypers);
-
-    // Set backend preference BEFORE loading (backend is initialized during load)
-    pet_model.set_backend_preference(backend_pref);
-
-    if (!pet_model.load_from_gguf(model_path)) {
-      log::error("Failed to load model from {}", model_path);
-      return 1;
+    // Dispatch by architecture via load_model(); apply PET-only knobs only
+    // when the loaded model is a PETModel.
+    std::unique_ptr<Model> model;
+    {
+      GGUFLoader probe(model_path);
+      std::string arch = probe.get_string("general.architecture", "");
+      if (arch == "pet") {
+        auto pm = std::make_unique<pet::PETModel>(pet::PETHypers{});
+        pm->set_backend_preference(backend_pref);
+        if (!pm->load_from_gguf(model_path)) {
+          log::error("Failed to load PET model");
+          return 1;
+        }
+        model = std::move(pm);
+      } else if (arch == "pet-graph") {
+        auto gm = std::make_unique<runtime::GraphModel>();
+        gm->set_backend_preference(backend_pref);
+        if (!gm->load_from_gguf(model_path)) {
+          log::error("Failed to load graph model");
+          return 1;
+        }
+        model = std::move(gm);
+      } else {
+        log::error("Unsupported architecture: {}", arch);
+        return 1;
+      }
     }
 
-    log::info("Model cutoff from GGUF: {:.2f} A", pet_model.cutoff());
+    log::info("Model cutoff from GGUF: {:.2f} A", model->cutoff());
 
-    // Override cutoff if requested
+    auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
+
     if (cutoff_override > 0.0f) {
-      pet_model.set_cutoff(cutoff_override);
-      log::info("Overriding cutoff to: {:.2f} A", cutoff_override);
+      if (pet_model) {
+        pet_model->set_cutoff(cutoff_override);
+        log::info("Overriding cutoff to: {:.2f} A", cutoff_override);
+      } else {
+        log::warn("--cutoff ignored (not a PET model)");
+      }
     }
 
-    // Log neighbor count using model's cutoff
     {
       NeighborListBuilder nl_builder(
-          NeighborListOptions{pet_model.cutoff(), true, false});
+          NeighborListOptions{model->cutoff(), true, false});
       auto nlist = nl_builder.build(system);
       log::info("Neighbor pairs: {} (avg {:.1f} per atom)", nlist.num_pairs(),
                 static_cast<double>(nlist.num_pairs()) / system.num_atoms());
     }
 
-    static constexpr std::array backend_names = {"auto", "cpu", "cuda", "hip",
-                                                  "metal", "vulkan", "sycl", "cann"};
-    log::info("Backend preference: {}", backend_names[static_cast<size_t>(backend_pref)]);
-
-    // Set compute precision
-    pet_model.set_precision(precision);
-    static constexpr std::array precision_names = {"f32", "f16"};
-    log::info("Precision: {}", precision_names[static_cast<size_t>(precision)]);
-
-    // Set profiling mode
-    pet_model.set_profiling(profile_mode);
+    if (pet_model) {
+      pet_model->set_precision(precision);
+      static constexpr std::array precision_names = {"f32", "f16"};
+      log::info("Precision: {}", precision_names[static_cast<size_t>(precision)]);
+      pet_model->set_profiling(profile_mode);
+    } else if (precision != pet::ComputePrecision::F32 || profile_mode) {
+      log::warn("--precision/--profile ignored (not a PET model)");
+    }
 
     log::info("Running inference...");
-    // Use predict_batch for full control over compute_nc parameter
     bool compute_nc = show_nc_forces || show_nc_stress;
-    auto results = pet_model.predict_batch({system}, compute_forces, compute_nc);
-    auto result = results[0];
+    ModelResult result;
+    if (pet_model) {
+      result = pet_model->predict_batch({system}, compute_forces, compute_nc)[0];
+    } else {
+      if (compute_nc) {
+        log::warn("--nc-forces/--nc-stress ignored (not a PET model)");
+      }
+      result = model->predict(system, compute_forces);
+    }
 
     // Print results
     if (quiet_mode) {

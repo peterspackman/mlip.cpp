@@ -3,8 +3,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <cmath>
+#include <filesystem>
 #include <fmt/core.h>
 #include <vector>
+
+// Fixed-PET GGUFs come from the legacy scripts/convert_pet_mad.py converter.
+// Skip cleanly when that file is absent so CI can run graph-model tests
+// without requiring the legacy toolchain.
+#define SKIP_IF_NO_FIXED_PET_GGUF(path)                                        \
+  do {                                                                        \
+    if (!std::filesystem::exists(path)) {                                     \
+      SKIP("Fixed-PET GGUF " << (path) << " not found — regenerate with "     \
+                                          "convert_pet_mad.py to run this"); \
+    }                                                                         \
+  } while (0)
 
 using namespace mlipcpp;
 using namespace mlipcpp::pet;
@@ -43,7 +55,7 @@ TEST_CASE("PET forces match Python reference (water molecule)",
 
   PETHypers hypers;
   PETModel model(hypers);
-  REQUIRE(model.load_from_gguf("pet-mad.gguf"));
+  SKIP_IF_NO_FIXED_PET_GGUF("pet-mad.gguf"); REQUIRE(model.load_from_gguf("pet-mad.gguf"));
 
   // Run prediction with forces
   auto result = model.predict(system, true);
@@ -100,7 +112,7 @@ TEST_CASE("PET forces match Python reference (Si crystal)", "[pet][gradient]") {
 
   PETHypers hypers;
   PETModel model(hypers);
-  REQUIRE(model.load_from_gguf("pet-mad.gguf"));
+  SKIP_IF_NO_FIXED_PET_GGUF("pet-mad.gguf"); REQUIRE(model.load_from_gguf("pet-mad.gguf"));
 
   // Get analytical forces
   auto result = model.predict(system, true);
@@ -156,7 +168,7 @@ TEST_CASE("PET stress matches Python reference (Si crystal)",
 
   PETHypers hypers;
   PETModel model(hypers);
-  REQUIRE(model.load_from_gguf("pet-mad.gguf"));
+  SKIP_IF_NO_FIXED_PET_GGUF("pet-mad.gguf"); REQUIRE(model.load_from_gguf("pet-mad.gguf"));
 
   // Get forces and stress
   auto result = model.predict(system, true);
@@ -198,7 +210,7 @@ TEST_CASE("PET forces sum to zero (momentum conservation)", "[pet][gradient]") {
 
   PETHypers hypers;
   PETModel model(hypers);
-  REQUIRE(model.load_from_gguf("pet-mad.gguf"));
+  SKIP_IF_NO_FIXED_PET_GGUF("pet-mad.gguf"); REQUIRE(model.load_from_gguf("pet-mad.gguf"));
 
   auto result = model.predict(system, true);
   REQUIRE(result.has_forces);

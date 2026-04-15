@@ -124,12 +124,15 @@ export interface Model {
 export interface ModelStatic {
     load(path: string): Model;
     loadFromBuffer(buffer: ArrayBuffer): Model;
+    loadFromBufferWithBackend(buffer: ArrayBuffer, backend: string): Model;
 }
 
 export interface MlipcppModule {
     AtomicSystem: AtomicSystemStatic;
     Model: ModelStatic;
     getVersion(): string;
+    getBackendName(): string;
+    setBackend(name: string): void;
 }
 
 declare function createMlipcpp(): Promise<MlipcppModule>;

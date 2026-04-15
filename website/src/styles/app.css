@@ -1,0 +1,168 @@
+:root {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --text-primary: #1a1a1a;
+  --text-secondary: #666666;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --border: #e5e5e5;
+  --success: #22c55e;
+  --error: #ef4444;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-primary: #1a1a1a;
+    --bg-secondary: #2d2d2d;
+    --text-primary: #f5f5f5;
+    --text-secondary: #a0a0a0;
+    --accent: #60a5fa;
+    --accent-hover: #3b82f6;
+    --border: #404040;
+  }
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  min-height: 100vh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 1rem;
+  width: 100%;
+}
+
+.header {
+  padding: 1.5rem 0;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+.header h1 {
+  font-size: 2rem;
+  margin: 0;
+  font-weight: 700;
+}
+.subtitle {
+  color: var(--text-secondary);
+  margin: 0.25rem 0 0;
+  font-size: 1rem;
+}
+
+.main {
+  flex: 1;
+  padding: 1rem 0;
+}
+
+/* Desktop: viewer is hero; panels flank it, narrow, scroll internally. */
+.md-layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) 240px;
+  gap: 1rem;
+  align-items: start;
+  height: calc(100vh - 170px);
+  min-height: 560px;
+}
+
+/* Tablet: viewer still hero on top, controls stacked below. */
+@media (max-width: 1100px) {
+  .md-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: 0;
+  }
+  .panel-left, .panel-right {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+}
+
+/* Phone: single column. */
+@media (max-width: 640px) {
+  .panel-left, .panel-right {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+  max-height: 100%;
+}
+
+.center {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Column holding viewer + plot. Width is capped so the 4:3 viewer never
+   exceeds the available vertical space. Both children share this cap, so
+   the plot strip always aligns with the viewer. */
+.viewer-column {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  max-width: calc((100vh - 300px) * 4 / 3);
+  margin: 0 auto;
+  /* Card shrinks to content — no extra grey background filling the column. */
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+.viewer-frame {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  display: flex;
+  min-height: 0;
+  /* On short viewports this would exceed remaining height — shrink instead. */
+  flex-shrink: 1;
+}
+@media (max-width: 1100px) {
+  .viewer-column {
+    max-width: min(800px, 95vw);
+  }
+  .viewer-frame {
+    aspect-ratio: 4 / 3;
+  }
+}
+
+.footer {
+  padding: 1rem 0;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--border);
+}

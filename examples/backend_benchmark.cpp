@@ -8,8 +8,13 @@
  */
 
 #include "../src/models/pet/pet.h"
+#include "../src/runtime/graph_model.h"
+#include "core/backend.h"
+#include "core/gguf_loader.h"
 #include "core/log.h"
+#include "mlipcpp/model.h"
 #include "mlipcpp/system.h"
+#include <memory>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -74,6 +79,7 @@ int main(int argc, char **argv) {
     std::cerr << "  --backend B     Backend: auto, cpu, metal, cuda, etc. (default: auto)\n";
     std::cerr << "  --warmup N      Warmup iterations (default: 2)\n";
     std::cerr << "  --iterations N  Timed iterations (default: 10)\n";
+    std::cerr << "  --max-atoms N   Cap supercell size (default: 1024)\n";
     std::cerr << "  --no-forces     Benchmark energy only (no forces)\n";
     std::cerr << "  --nc-forces     Use non-conservative forces (forward pass only)\n";
     std::cerr << "  --csv           Output CSV format for scripting\n";
@@ -86,21 +92,9 @@ int main(int argc, char **argv) {
   bool compute_forces = true;
   bool compute_nc = false;
   bool csv_output = false;
-  pet::BackendPreference backend_pref = pet::BackendPreference::Auto;
+  int max_atoms = 1024;
+  BackendPreference backend_pref = BackendPreference::Auto;
   std::string backend_name = "auto";
-
-  // Backend name lookup
-  static const std::unordered_map<std::string_view, pet::BackendPreference>
-      backend_map = {
-          {"auto", pet::BackendPreference::Auto},
-          {"cpu", pet::BackendPreference::CPU},
-          {"cuda", pet::BackendPreference::CUDA},
-          {"hip", pet::BackendPreference::HIP},
-          {"metal", pet::BackendPreference::Metal},
-          {"vulkan", pet::BackendPreference::Vulkan},
-          {"sycl", pet::BackendPreference::SYCL},
-          {"cann", pet::BackendPreference::CANN},
-      };
 
   // Parse options
   for (int i = 2; i < argc; ++i) {
@@ -116,45 +110,63 @@ int main(int argc, char **argv) {
       compute_forces = false;  // nc-forces replaces gradient forces
     } else if (arg == "--csv") {
       csv_output = true;
+    } else if (arg == "--max-atoms" && i + 1 < argc) {
+      max_atoms = std::stoi(argv[++i]);
     } else if (arg == "--backend" && i + 1 < argc) {
       backend_name = argv[++i];
-      auto it = backend_map.find(backend_name);
-      if (it != backend_map.end()) {
-        backend_pref = it->second;
-      } else {
-        std::cerr << "Unknown backend: " << backend_name << "\n";
+      try {
+        backend_pref = parse_backend_preference(backend_name);
+      } catch (const std::exception &e) {
+        std::cerr << e.what() << "\n";
         return 1;
       }
     }
   }
 
-  // System sizes to test (nx, ny, nz) -> 2 * nx * ny * nz atoms
-  std::vector<std::array<int, 3>> sizes = {
-      {1, 1, 1},  // 2 atoms
-      {2, 2, 2},  // 16 atoms
-      {4, 4, 2},  // 64 atoms
-      {4, 4, 4},  // 128 atoms
-      {4, 4, 8},  // 256 atoms
-      {4, 8, 8},  // 512 atoms
-      {8, 8, 8},  // 1024 atoms
-      {16, 8, 8},  // 2048 atoms
-      {16, 16, 8},  // 4096 atoms
+  // System sizes to test (nx, ny, nz) -> 2 * nx * ny * nz atoms.
+  // Filtered by --max-atoms.
+  std::vector<std::array<int, 3>> all_sizes = {
+      {1, 1, 1},   {2, 2, 2}, {4, 4, 2},  {4, 4, 4},   {4, 4, 8},
+      {4, 8, 8},   {8, 8, 8}, {16, 8, 8}, {16, 16, 8},
   };
+  std::vector<std::array<int, 3>> sizes;
+  for (const auto &s : all_sizes) {
+    if (2 * s[0] * s[1] * s[2] <= max_atoms) sizes.push_back(s);
+  }
 
-  // Load model once
-  pet::PETHypers hypers;
-  pet::PETModel model(hypers);
-
-  // Set backend preference BEFORE loading (backend is initialized during load)
-  model.set_backend_preference(backend_pref);
-
+  // Load model via architecture dispatch
+  std::unique_ptr<Model> model;
   try {
-    if (!model.load_from_gguf(model_path)) {
-      std::cerr << "Failed to load model: " << model_path << "\n";
+    GGUFLoader probe(model_path);
+    std::string arch = probe.get_string("general.architecture", "");
+    if (arch == "pet") {
+      auto pm = std::make_unique<pet::PETModel>(pet::PETHypers{});
+      pm->set_backend_preference(backend_pref);
+      if (!pm->load_from_gguf(model_path)) {
+        std::cerr << "Failed to load PET model\n";
+        return 1;
+      }
+      model = std::move(pm);
+    } else if (arch == "pet-graph") {
+      auto gm = std::make_unique<runtime::GraphModel>();
+      gm->set_backend_preference(backend_pref);
+      if (!gm->load_from_gguf(model_path)) {
+        std::cerr << "Failed to load graph model\n";
+        return 1;
+      }
+      model = std::move(gm);
+    } else {
+      std::cerr << "Unsupported architecture: " << arch << "\n";
       return 1;
     }
   } catch (const std::exception &e) {
     std::cerr << "Backend error: " << e.what() << "\n";
+    return 1;
+  }
+
+  auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
+  if (compute_nc && !pet_model) {
+    std::cerr << "--nc-forces requires a PET model\n";
     return 1;
   }
 
@@ -187,15 +199,19 @@ int main(int argc, char **argv) {
 
     // Warmup
     for (int i = 0; i < warmup; ++i) {
-      model.predict_batch({system}, compute_forces, compute_nc);
+      if (pet_model) pet_model->predict_batch({system}, compute_forces, compute_nc);
+      else model->predict(system, compute_forces);
     }
 
     // Timed runs
     auto start = std::chrono::high_resolution_clock::now();
     ModelResult last_result;
     for (int i = 0; i < iterations; ++i) {
-      auto results = model.predict_batch({system}, compute_forces, compute_nc);
-      last_result = results[0];
+      if (pet_model) {
+        last_result = pet_model->predict_batch({system}, compute_forces, compute_nc)[0];
+      } else {
+        last_result = model->predict(system, compute_forces);
+      }
     }
     auto end = std::chrono::high_resolution_clock::now();
 

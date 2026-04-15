@@ -1,3 +1,4 @@
+/// <reference lib="webworker" />
 // Web Worker for molecular dynamics simulation
 // Runs mlip.js inference off the main thread
 //
@@ -10,7 +11,8 @@
 // - Time: fs (femtoseconds)
 // - Temperature: K
 
-import createMlipcpp, { MlipcppModule, Model, AtomicSystem } from '@peterspackman/mlip.js'
+import createMlipcpp from '@peterspackman/mlip.js'
+import type { MlipcppModule, Model, AtomicSystem } from '@peterspackman/mlip.js'
 
 interface WorkerState {
   module: MlipcppModule | null
@@ -39,6 +41,17 @@ interface WorkerState {
   stressThreshold: number  // Convergence threshold for stress (eV/A^3)
   optStep: number
   optimizeCell: boolean  // Whether to optimize cell in FIRE
+  thermostat: 'csvr' | 'none'
+  thermostatTau: number  // fs
+  useConservativeForces: boolean  // false = NC forces (faster, non-conservative)
+  initialTotalEnergy: number | null  // baseline for NVE drift diagnostic
+  optimizer: 'lbfgs' | 'fire'
+  lbfgs: {
+    history: { s: Float64Array; y: Float64Array; rho: number }[]
+    currentE: number
+    currentG: Float64Array | null
+    step: number
+  } | null
 }
 
 const state: WorkerState = {
@@ -68,20 +81,39 @@ const state: WorkerState = {
   stressThreshold: 0.01,  // eV/A^3 (~1.6 GPa)
   optStep: 0,
   optimizeCell: true,  // Default to optimizing cell for periodic systems
+  thermostat: 'none',           // NVE by default — honest physics over pretty thermostat
+  thermostatTau: 100,
+  useConservativeForces: true,  // Conservative forces by default so NVE actually conserves
+  initialTotalEnergy: null,
+  optimizer: 'lbfgs',
+  lbfgs: null,
 }
 
-// Atomic masses in amu
+// Standard atomic weights in amu (IUPAC 2021). Covers rows 1-5 plus the common
+// heavier elements seen in MLIP training sets. Unknown Z falls back to carbon
+// with a console warning so missing entries are visible.
 const ATOMIC_MASSES: Record<number, number> = {
-  1: 1.008,   // H
-  6: 12.011,  // C
-  7: 14.007,  // N
-  8: 15.999,  // O
-  9: 18.998,  // F
-  12: 24.305, // Mg
-  14: 28.085, // Si
-  15: 30.974, // P
-  16: 32.065, // S
-  17: 35.453, // Cl
+  1: 1.008, 2: 4.0026,
+  3: 6.94, 4: 9.0122, 5: 10.81, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 10: 20.180,
+  11: 22.990, 12: 24.305, 13: 26.982, 14: 28.085, 15: 30.974, 16: 32.06, 17: 35.45, 18: 39.95,
+  19: 39.098, 20: 40.078, 21: 44.956, 22: 47.867, 23: 50.942, 24: 51.996, 25: 54.938, 26: 55.845,
+  27: 58.933, 28: 58.693, 29: 63.546, 30: 65.38, 31: 69.723, 32: 72.630, 33: 74.922, 34: 78.971,
+  35: 79.904, 36: 83.798,
+  37: 85.468, 38: 87.62, 39: 88.906, 40: 91.224, 41: 92.906, 42: 95.95, 44: 101.07, 45: 102.91,
+  46: 106.42, 47: 107.87, 48: 112.41, 49: 114.82, 50: 118.71, 51: 121.76, 52: 127.60, 53: 126.90, 54: 131.29,
+  55: 132.91, 56: 137.33, 72: 178.49, 73: 180.95, 74: 183.84, 75: 186.21, 76: 190.23, 77: 192.22,
+  78: 195.08, 79: 196.97, 80: 200.59, 81: 204.38, 82: 207.2, 83: 208.98,
+}
+
+const warnedMassZ = new Set<number>()
+function massFor(z: number): number {
+  const m = ATOMIC_MASSES[z]
+  if (m !== undefined) return m
+  if (!warnedMassZ.has(z)) {
+    warnedMassZ.add(z)
+    console.warn(`[mdWorker] No atomic mass for Z=${z}; using 12.011 (carbon). Dynamics will be wrong for this element.`)
+  }
+  return 12.011
 }
 
 // Physical constants
@@ -162,6 +194,15 @@ function initializeVelocities(numAtoms: number, masses: Float64Array, temperatur
     velocities[i * 3 + 2] -= vz
   }
 
+  // Maxwell-Boltzmann sampling has ~sqrt(2/dof) relative variance in T, which
+  // is ~60% for a 3-atom system. Rescale to hit the target T exactly so we
+  // don't start hundreds of K off target and blame the thermostat.
+  const { temp: tInit } = calculateKineticEnergy(velocities, masses, numAtoms)
+  if (tInit > 1e-10) {
+    const scale = Math.sqrt(temperature / tInit)
+    for (let i = 0; i < velocities.length; i++) velocities[i] *= scale
+  }
+
   return velocities
 }
 
@@ -200,19 +241,75 @@ function calculateKineticEnergy(velocities: Float64Array, masses: Float64Array, 
 }
 
 
-// Berendsen thermostat velocity scaling
-function berendsenThermostat(
-  velocities: Float64Array,
-  currentTemp: number,
-  targetTemp: number,
-  tau: number,
-  dt: number
-): void {
-  if (currentTemp < 1e-10) return
-  const lambda = Math.sqrt(1 + (dt / tau) * (targetTemp / currentTemp - 1))
-  for (let i = 0; i < velocities.length; i++) {
-    velocities[i] *= lambda
+// Standard normal sample via Box-Muller. One value per call (the paired
+// sample is recomputed next call — cheap enough for thermostat use).
+function gaussian(): number {
+  const u1 = Math.max(Math.random(), 1e-300)
+  const u2 = Math.random()
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)
+}
+
+// Sum of n independent chi-squared(1) = sum of n squared N(0,1). Exact via
+// Box-Muller for n up to a few hundred (our DOF counts are tiny).
+function sumSquaredGaussians(n: number): number {
+  if (n <= 0) return 0
+  let s = 0
+  // Consume Gaussians in pairs so Box-Muller isn't wasted.
+  for (let i = 0; i < n - 1; i += 2) {
+    const u1 = Math.max(Math.random(), 1e-300)
+    const u2 = Math.random()
+    const r = Math.sqrt(-2 * Math.log(u1))
+    const g1 = r * Math.cos(2 * Math.PI * u2)
+    const g2 = r * Math.sin(2 * Math.PI * u2)
+    s += g1 * g1 + g2 * g2
   }
+  if (n % 2 === 1) {
+    const g = gaussian()
+    s += g * g
+  }
+  return s
+}
+
+// Canonical sampling through velocity rescaling (Bussi, Donadio, Parrinello,
+// JCP 126, 014101 (2007)). Samples the canonical distribution exactly while
+// being as robust and simple as Berendsen. Assumes COM already removed so
+// Nf = 3N - 3.
+function csvrThermostat(
+  velocities: Float64Array,
+  masses: Float64Array,
+  numAtoms: number,
+  targetTemp: number,
+  tau: number,  // fs
+  dt: number    // fs
+): void {
+  const ndeg = Math.max(3 * numAtoms - 3, 1)
+
+  // Current KE in amu·A^2/fs^2 (the native units we work with)
+  let kk = 0
+  for (let i = 0; i < numAtoms; i++) {
+    const m = masses[i]
+    const vx = velocities[i * 3], vy = velocities[i * 3 + 1], vz = velocities[i * 3 + 2]
+    kk += 0.5 * m * (vx * vx + vy * vy + vz * vz)
+  }
+  if (kk <= 0) return
+
+  // Target KE (sigma in Bussi's notation) = 0.5 * Nf * kB * T
+  const sigma = 0.5 * ndeg * KB_AMU_A2_FS2 * targetTemp
+
+  // Exponential decay factor per step. tau <= 0 disables coupling.
+  const factor = tau > 0 ? Math.exp(-dt / tau) : 0
+
+  const rr = gaussian()
+  const s2 = sumSquaredGaussians(ndeg - 1)
+
+  const newKk =
+    kk
+    + (1 - factor) * (sigma * (s2 + rr * rr) / ndeg - kk)
+    + 2 * rr * Math.sqrt(kk * sigma / ndeg * (1 - factor) * factor)
+
+  if (newKk <= 0) return  // extremely rare numerical edge; skip this step
+  const alpha = Math.sqrt(newKk / kk)
+  for (let i = 0; i < velocities.length; i++) velocities[i] *= alpha
 }
 
 // Remove center of mass velocity
@@ -249,57 +346,80 @@ async function handleInit(data: { modelBuffer?: ArrayBuffer }): Promise<void> {
     state.module = await createMlipcpp()
 
     if (data.modelBuffer) {
-      state.model = state.module.Model.loadFromBuffer(data.modelBuffer)
+      state.model = await state.module.Model.loadFromBuffer(data.modelBuffer)
     }
 
-    self.postMessage({ type: 'initialized', version: state.module.getVersion() })
+    self.postMessage({ type: 'initialized', version: await state.module.getVersion() })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Initialization failed: ${err.message}` })
   }
 }
 
-async function handleLoadModel(data: { buffer: ArrayBuffer }): Promise<void> {
+async function handleLoadModel(data: { buffer: ArrayBuffer, backend?: string }): Promise<void> {
   if (!state.module) {
     self.postMessage({ type: 'error', message: 'Module not initialized' })
     return
   }
 
   try {
-    state.model = state.module.Model.loadFromBuffer(data.buffer)
+    const backend = data.backend || 'auto'
+
+    // Release any previously loaded model + its associated system BEFORE we
+    // create a new Predictor. Embind smart pointers are reclaimed by JS GC
+    // lazily, so without this the old Predictor's WebGPU device / tensor
+    // buffers can still be alive when the new one is initialized — which
+    // makes the second Predictor's load write into overlapping storage
+    // buffer ranges and trip `silu_back_f32` aliasing errors inside
+    // ggml-webgpu.
+    if (state.model && typeof (state.model as any).delete === 'function') {
+      try { (state.model as any).delete() } catch { /* ignore */ }
+    }
+    state.model = null
+    if (state.system && typeof (state.system as any).delete === 'function') {
+      try { (state.system as any).delete() } catch { /* ignore */ }
+    }
+    state.system = null
+    state.forces = null
+    state.initialTotalEnergy = null
+
+    state.model = await state.module.Model.loadFromBufferWithBackend(data.buffer, backend)
     self.postMessage({
       type: 'modelLoaded',
-      modelType: state.model.modelType(),
-      cutoff: state.model.cutoff(),
+      modelType: await state.model.modelType(),
+      cutoff: await state.model.cutoff(),
+      backend: await state.module.getBackendName(),
     })
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Failed to load model: ${err.message}` })
   }
 }
 
-function handleSetSystem(data: { xyz: string }): void {
+async function handleSetSystem(data: { xyz: string }): Promise<void> {
   if (!state.module) {
     self.postMessage({ type: 'error', message: 'Module not initialized' })
     return
   }
 
   try {
-    state.system = state.module.AtomicSystem.fromXyzString(data.xyz)
-    state.numAtoms = state.system.numAtoms()
-    state.isPeriodic = state.system.isPeriodic()
-    state.positions = new Float64Array(state.system.getPositions())
-    state.atomicNumbers = new Int32Array(state.system.getAtomicNumbers())
-    state.cell = state.system.getCell() ? new Float64Array(state.system.getCell()!) : null
+    state.system = await state.module.AtomicSystem.fromXyzString(data.xyz)
+    state.numAtoms = await state.system.numAtoms()
+    state.isPeriodic = await state.system.isPeriodic()
+    state.positions = new Float64Array(await state.system.getPositions())
+    state.atomicNumbers = new Int32Array(await state.system.getAtomicNumbers())
+    const cellArr = await state.system.getCell()
+    state.cell = cellArr ? new Float64Array(cellArr) : null
 
     // Set up masses
     state.masses = new Float64Array(state.numAtoms)
     for (let i = 0; i < state.numAtoms; i++) {
       const z = state.atomicNumbers[i]
-      state.masses[i] = ATOMIC_MASSES[z] || 12.0  // Default to carbon mass
+      state.masses[i] = massFor(z)
     }
 
     // Initialize velocities and clear all cached forces/state
     state.velocities = initializeVelocities(state.numAtoms, state.masses, state.temperature)
     state.forces = null
+    state.initialTotalEnergy = null
 
     // Clear FIRE optimizer cache
     fireForces = null
@@ -323,7 +443,7 @@ function handleSetSystem(data: { xyz: string }): void {
   }
 }
 
-function handlePredict(): void {
+async function handlePredict(): Promise<void> {
   if (!state.module || !state.model || !state.system) {
     self.postMessage({ type: 'error', message: 'System or model not ready' })
     return
@@ -331,14 +451,43 @@ function handlePredict(): void {
 
   try {
     // Use NC forces for faster prediction (non-conservative forces from forward pass)
-    const result = state.model.predictWithOptions(state.system, true)
+    const result = await state.model.predictWithOptions(state.system, true)
+    // result.forces is a Float32Array owned by the embind call — copy into a
+    // Float64Array we can transfer, to keep the main thread in double precision.
+    const forcesOut = new Float64Array(result.forces)
     self.postMessage({
       type: 'prediction',
       energy: result.energy,
-      forces: Array.from(result.forces),
-    })
+      forces: forcesOut,
+    }, [forcesOut.buffer])
   } catch (err: any) {
     self.postMessage({ type: 'error', message: `Prediction failed: ${err.message}` })
+  }
+}
+
+// Predict at arbitrary positions without touching the cached MD state. Reuses
+// the loaded species/cell/PBC. Forced to conservative forces because this is
+// used for physically meaningful things (Hessian, scans) where NC wouldn't
+// give a symmetric/reciprocal-compatible result.
+async function handlePredictAt(data: {
+  positions: Float64Array,
+  id?: number,
+}): Promise<void> {
+  try {
+    const result = await predictAtPositions(data.positions)
+    const forcesOut = new Float64Array(result.forces)
+    self.postMessage({
+      type: 'predictAtResult',
+      id: data.id,
+      energy: result.energy,
+      forces: forcesOut,
+    }, [forcesOut.buffer])
+  } catch (err: any) {
+    self.postMessage({
+      type: 'predictAtResult',
+      id: data.id,
+      error: err?.message ?? String(err),
+    })
   }
 }
 
@@ -347,17 +496,266 @@ function handleSetParameters(data: {
   temperature?: number,
   mode?: 'md' | 'optimize',
   maxOptSteps?: number,
-  forceThreshold?: number
+  forceThreshold?: number,
+  thermostat?: 'csvr' | 'none',
+  thermostatTau?: number,
+  useConservativeForces?: boolean,
+  optimizer?: 'lbfgs' | 'fire',
 }): void {
   if (data.dt !== undefined) state.dt = data.dt
   if (data.temperature !== undefined) state.temperature = data.temperature
   if (data.mode !== undefined) state.mode = data.mode
   if (data.maxOptSteps !== undefined) state.maxOptSteps = data.maxOptSteps
   if (data.forceThreshold !== undefined) state.forceThreshold = data.forceThreshold
+  if (data.thermostat !== undefined) state.thermostat = data.thermostat
+  if (data.thermostatTau !== undefined) state.thermostatTau = data.thermostatTau
+  if (data.useConservativeForces !== undefined) {
+    // Changing force type invalidates any cached forces.
+    if (state.useConservativeForces !== data.useConservativeForces) {
+      state.forces = null
+      state.initialTotalEnergy = null
+    }
+    state.useConservativeForces = data.useConservativeForces
+  }
+  if (data.optimizer !== undefined) state.optimizer = data.optimizer
   self.postMessage({ type: 'parametersSet', dt: state.dt, temperature: state.temperature })
 }
 
 let mdTimeout: ReturnType<typeof setTimeout> | null = null
+
+// Shared predict helper — build an AtomicSystem at arbitrary positions and get
+// energy + forces via the currently loaded model. Always conservative (forces
+// must be gradients of the energy for optimization and FD Hessian to make
+// physical sense).
+async function predictAtPositions(
+  positions: Float64Array,
+): Promise<{ energy: number; forces: ArrayLike<number> }> {
+  if (!state.module || !state.model || !state.atomicNumbers) {
+    throw new Error('Module/model/system not ready')
+  }
+  const system = await state.module.AtomicSystem.create(
+    positions,
+    state.atomicNumbers,
+    state.cell,
+    state.isPeriodic,
+  )
+  const result = await state.model.predictWithOptions(system, false)
+  return result
+}
+
+// ========== L-BFGS optimizer ==========
+//
+// Limited-memory BFGS for atom positions (no cell DOFs — cell optimization
+// stays on FIRE). Implements Nocedal's two-loop recursion with a scaled
+// identity initial Hessian.
+//
+// Knobs:
+//   LBFGS_M        history depth (number of (s, y) pairs kept)
+//   LBFGS_MAX_STEP cap on the infinity-norm of the displacement per step (Å)
+//   LBFGS_LS_MAX   max backtracking line-search trials per step
+//   LBFGS_ARMIJO   Armijo sufficient-decrease constant
+//
+// Line search: start α=1, backtrack α ← α/2 until the energy decreases by
+// Armijo · α · g·d. If the budget runs out, take the last trial anyway —
+// better than stalling.
+const LBFGS_M = 10
+const LBFGS_MAX_STEP = 0.2       // Å
+const LBFGS_LS_MAX = 5
+const LBFGS_ARMIJO = 1e-4
+
+async function resetLBFGS(): Promise<void> {
+  state.lbfgs = {
+    history: [],
+    currentE: 0,
+    currentG: null,
+    step: 0,
+  }
+}
+
+// L-BFGS two-loop recursion: returns the search direction d = -H_k g.
+function lbfgsDirection(
+  g: Float64Array,
+  history: { s: Float64Array; y: Float64Array; rho: number }[],
+): Float64Array {
+  const n = g.length
+  const q = new Float64Array(g)
+  const alphas = new Array<number>(history.length)
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i]
+    let sq = 0
+    for (let j = 0; j < n; j++) sq += h.s[j] * q[j]
+    alphas[i] = h.rho * sq
+    for (let j = 0; j < n; j++) q[j] -= alphas[i] * h.y[j]
+  }
+
+  // Scaled identity H_0 = (s·y) / (y·y) · I
+  let h0 = 1
+  if (history.length > 0) {
+    const last = history[history.length - 1]
+    let yy = 0, sy = 0
+    for (let j = 0; j < n; j++) {
+      yy += last.y[j] * last.y[j]
+      sy += last.s[j] * last.y[j]
+    }
+    if (yy > 0) h0 = sy / yy
+  }
+
+  const r = new Float64Array(n)
+  for (let i = 0; i < n; i++) r[i] = h0 * q[i]
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i]
+    let yr = 0
+    for (let j = 0; j < n; j++) yr += h.y[j] * r[j]
+    const beta = h.rho * yr
+    for (let j = 0; j < n; j++) r[j] += (alphas[i] - beta) * h.s[j]
+  }
+
+  // d = -H g
+  for (let i = 0; i < n; i++) r[i] = -r[i]
+  return r
+}
+
+function maxInfNorm(v: Float64Array): number {
+  let m = 0
+  for (let i = 0; i < v.length; i++) {
+    const a = Math.abs(v[i])
+    if (a > m) m = a
+  }
+  return m
+}
+
+async function runLBFGSStep(): Promise<boolean> {
+  if (!state.model || !state.positions || !state.atomicNumbers || !state.lbfgs) return true
+
+  const lb = state.lbfgs
+  const n3 = state.positions.length
+  const nAtoms = state.atomicNumbers.length
+
+  // First step: get E, g at the current position.
+  if (!lb.currentG) {
+    const result = await predictAtPositions(state.positions)
+    lb.currentE = result.energy
+    lb.currentG = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) lb.currentG[i] = -result.forces[i]
+  }
+
+  // Convergence check on atomic forces.
+  const forcesForCheck = new Float64Array(n3)
+  for (let i = 0; i < n3; i++) forcesForCheck[i] = -lb.currentG[i]
+  const maxF = calculateMaxForce(forcesForCheck, nAtoms)
+  if (maxF < state.forceThreshold) {
+    postOptStep(lb, nAtoms, true)
+    return true
+  }
+
+  // Give up after maxOptSteps iterations even if not converged.
+  if (lb.step >= state.maxOptSteps) {
+    postOptStep(lb, nAtoms, false)
+    return true
+  }
+
+  // Build search direction.
+  let d = lbfgsDirection(lb.currentG, lb.history)
+
+  // Safety: if not a descent direction, fall back to steepest descent and
+  // discard the curvature history (it's lying to us).
+  let dg = 0
+  for (let i = 0; i < n3; i++) dg += d[i] * lb.currentG[i]
+  if (dg >= 0) {
+    d = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) d[i] = -lb.currentG[i]
+    dg = 0
+    for (let i = 0; i < n3; i++) dg += d[i] * lb.currentG[i]
+    lb.history.length = 0
+  }
+
+  // Cap infinity-norm step size — prevents giant jumps early on when the
+  // approximate Hessian is still a scaled identity.
+  const dMax = maxInfNorm(d)
+  if (dMax > LBFGS_MAX_STEP) {
+    const scale = LBFGS_MAX_STEP / dMax
+    for (let i = 0; i < n3; i++) d[i] *= scale
+    dg *= scale
+  }
+
+  // Backtracking line search.
+  let alpha = 1
+  const trial = new Float64Array(n3)
+  let newE = Infinity
+  let newForces: ArrayLike<number> | null = null
+  let accepted = false
+  for (let ls = 0; ls < LBFGS_LS_MAX; ls++) {
+    for (let i = 0; i < n3; i++) trial[i] = state.positions[i] + alpha * d[i]
+    const r = await predictAtPositions(trial)
+    newE = r.energy
+    newForces = r.forces
+    if (newE <= lb.currentE + LBFGS_ARMIJO * alpha * dg) {
+      accepted = true
+      break
+    }
+    alpha *= 0.5
+  }
+  // If the line search gave up, still accept the last trial — any move beats
+  // stalling, and L-BFGS recovers well from imperfect steps as long as we
+  // trash the history when it happens.
+  if (!accepted) lb.history.length = 0
+
+  if (!newForces) return true  // shouldn't happen; guards the TS narrowing
+
+  const newG = new Float64Array(n3)
+  for (let i = 0; i < n3; i++) newG[i] = -newForces[i]
+
+  // Update curvature history (skip if s·y is tiny or negative — indicates
+  // non-convexity in this neighbourhood).
+  const s = new Float64Array(n3)
+  const y = new Float64Array(n3)
+  let sy = 0
+  for (let i = 0; i < n3; i++) {
+    s[i] = trial[i] - state.positions[i]
+    y[i] = newG[i] - lb.currentG[i]
+    sy += s[i] * y[i]
+  }
+  if (sy > 1e-12 && accepted) {
+    lb.history.push({ s, y, rho: 1 / sy })
+    if (lb.history.length > LBFGS_M) lb.history.shift()
+  }
+
+  // Commit the move.
+  state.positions.set(trial)
+  lb.currentE = newE
+  lb.currentG = newG
+  lb.step++
+  state.optStep = lb.step
+
+  postOptStep(lb, nAtoms, false)
+  return false
+}
+
+function postOptStep(
+  lb: NonNullable<WorkerState['lbfgs']>,
+  nAtoms: number,
+  converged: boolean,
+): void {
+  if (!state.positions) return
+  const forcesForReport = new Float64Array(lb.currentG!.length)
+  for (let i = 0; i < lb.currentG!.length; i++) forcesForReport[i] = -lb.currentG![i]
+  const maxF = calculateMaxForce(forcesForReport, nAtoms)
+  const posOut = new Float64Array(state.positions)
+  const cellOut = state.cell ? new Float64Array(state.cell) : null
+  const transfers: ArrayBuffer[] = [posOut.buffer]
+  if (cellOut) transfers.push(cellOut.buffer)
+  self.postMessage({
+    type: 'optStep',
+    positions: posOut,
+    cell: cellOut,
+    energy: lb.currentE,
+    maxForce: maxF,
+    maxStress: 0,
+    step: lb.step,
+    converged,
+  }, transfers)
+}
 
 // FIRE optimizer constants
 const FIRE_ALPHA_START = 0.1
@@ -373,7 +771,7 @@ let fireStress: Float64Array | null = null
 let fireCellForce: Float64Array | null = null
 
 // Reset FIRE optimizer state and initialize velocities along force direction
-function resetFIRE(): void {
+async function resetFIRE(): Promise<void> {
   state.fireAlpha = FIRE_ALPHA_START
   state.fireNpos = 0
   state.fireDt = 0.1  // Start with small timestep
@@ -394,13 +792,13 @@ function resetFIRE(): void {
   // Initialize velocities along force direction for faster startup
   if (state.module && state.model && state.positions && state.velocities && state.masses) {
     // Get initial forces
-    const system = state.module.AtomicSystem.create(
+    const system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
       state.isPeriodic
     )
-    const result = state.model.predictWithOptions(system, true)
+    const result = await state.model.predictWithOptions(system, true)
     const forces = new Float64Array(result.forces)
 
     // Calculate force magnitude
@@ -493,7 +891,7 @@ function calculateVolume(cell: Float64Array): number {
 // Reference: Bitzek et al., PRL 97, 170201 (2006)
 // Extended to optimize cell using stress tensor for periodic systems
 // Uses cached forces for single prediction per step (like MD)
-function runFIREStep(): boolean {
+async function runFIREStep(): Promise<boolean> {
   if (!state.module || !state.model || !state.positions || !state.velocities || !state.masses) {
     return true  // converged = done
   }
@@ -505,13 +903,13 @@ function runFIREStep(): boolean {
 
     // If no cached forces, compute initial forces
     if (!fireForces) {
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, true)
       fireForces = new Float64Array(result.forces)
       fireStress = result.stress ? new Float64Array(result.stress) : null
       if (optimizingCell && fireStress && state.cell) {
@@ -535,24 +933,28 @@ function runFIREStep(): boolean {
 
     if (converged || state.optStep >= state.maxOptSteps) {
       // Get final energy
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, true)
 
+      const posOut = new Float64Array(state.positions)
+      const cellOut = state.cell ? new Float64Array(state.cell) : null
+      const transfers: ArrayBuffer[] = [posOut.buffer]
+      if (cellOut) transfers.push(cellOut.buffer)
       self.postMessage({
         type: 'optStep',
-        positions: Array.from(state.positions),
-        cell: state.cell ? Array.from(state.cell) : null,
+        positions: posOut,
+        cell: cellOut,
         energy: result.energy,
         maxForce,
         maxStress,
         step: state.optStep,
         converged,
-      })
+      }, transfers)
       return true  // Done
     }
 
@@ -640,13 +1042,13 @@ function runFIREStep(): boolean {
     }
 
     // Get new forces (single prediction per step)
-    state.system = state.module.AtomicSystem.create(
+    state.system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
       state.isPeriodic
     )
-    const resultNew = state.model.predictWithOptions(state.system, true)
+    const resultNew = await state.model.predictWithOptions(state.system, true)
     const forcesNew = new Float64Array(resultNew.forces)
     const stressNew = resultNew.stress ? new Float64Array(resultNew.stress) : null
 
@@ -682,17 +1084,20 @@ function runFIREStep(): boolean {
     const maxForceNew = calculateMaxForce(forcesNew, state.numAtoms)
     const maxStressNew = (optimizingCell && stressNew) ? calculateMaxStress(stressNew) : 0
 
-    // Send update
+    const posOut = new Float64Array(state.positions)
+    const cellOut = state.cell ? new Float64Array(state.cell) : null
+    const transfers: ArrayBuffer[] = [posOut.buffer]
+    if (cellOut) transfers.push(cellOut.buffer)
     self.postMessage({
       type: 'optStep',
-      positions: Array.from(state.positions),
-      cell: state.cell ? Array.from(state.cell) : null,
+      positions: posOut,
+      cell: cellOut,
       energy: resultNew.energy,
       maxForce: maxForceNew,
       maxStress: maxStressNew,
       step: state.optStep,
       converged: false,
-    })
+    }, transfers)
 
     return false  // Not done yet
   } catch (err: any) {
@@ -702,7 +1107,7 @@ function runFIREStep(): boolean {
   }
 }
 
-function runMDStep(): void {
+async function runMDStep(): Promise<void> {
   if (!state.module || !state.model || !state.positions || !state.velocities || !state.masses) {
     return
   }
@@ -710,15 +1115,17 @@ function runMDStep(): void {
   try {
     const t0 = performance.now()
 
+    const useNCForces = !state.useConservativeForces
+
     // If we don't have cached forces, compute them first
     if (!state.forces) {
-      state.system = state.module.AtomicSystem.create(
+      state.system = await state.module.AtomicSystem.create(
         state.positions,
         state.atomicNumbers!,
         state.cell,
         state.isPeriodic
       )
-      const result = state.model.predictWithOptions(state.system, true)
+      const result = await state.model.predictWithOptions(state.system, useNCForces)
       state.forces = new Float64Array(result.forces)
     }
 
@@ -739,7 +1146,7 @@ function runMDStep(): void {
     const t1 = performance.now()
 
     // Get forces at new positions (single prediction per step)
-    state.system = state.module.AtomicSystem.create(
+    state.system = await state.module.AtomicSystem.create(
       state.positions,
       state.atomicNumbers!,
       state.cell,
@@ -747,7 +1154,7 @@ function runMDStep(): void {
     )
     const t2 = performance.now()
 
-    const result = state.model.predictWithOptions(state.system, true)
+    const result = await state.model.predictWithOptions(state.system, useNCForces)
     const t3 = performance.now()
 
     const forcesNew = new Float64Array(result.forces)
@@ -771,22 +1178,40 @@ function runMDStep(): void {
     // Remove center of mass motion to prevent drift
     removeCOMVelocity(state.velocities, state.masses, state.numAtoms)
 
-    // Apply thermostat (tau = 100 fs is a reasonable coupling time)
-    const { temp } = calculateKineticEnergy(state.velocities, state.masses, state.numAtoms)
-    berendsenThermostat(state.velocities, temp, state.temperature, 100, state.dt)
+    // Apply thermostat (skipped in NVE mode)
+    if (state.thermostat === 'csvr') {
+      csvrThermostat(
+        state.velocities, state.masses, state.numAtoms,
+        state.temperature, state.thermostatTau, state.dt
+      )
+    }
 
-    // Calculate updated temperature after thermostat
+    // Calculate final KE/T after (optional) thermostat
     const { ke: keNew, temp: tempNew } = calculateKineticEnergy(state.velocities, state.masses, state.numAtoms)
+
+    // NVE drift diagnostic: track total energy relative to first step.
+    // Only meaningful with conservative forces + no thermostat. We still report
+    // it in other modes so users can see what it's doing.
+    const totalE = result.energy + keNew
+    if (state.initialTotalEnergy === null) {
+      state.initialTotalEnergy = totalE
+    }
+    const energyDrift = totalE - state.initialTotalEnergy
+
     const t4 = performance.now()
 
-    // Send update with timing info
+    // Send update with timing info — transfer typed-array buffers zero-copy.
+    // state.forces keeps a copy so the next step can reuse cached forces.
+    const posOut = new Float64Array(state.positions)
+    const forcesOut = new Float64Array(forcesNew)
     self.postMessage({
       type: 'mdStep',
-      positions: Array.from(state.positions),
+      positions: posOut,
       energy: result.energy,
       kineticEnergy: keNew,
       temperature: tempNew,
-      forces: Array.from(forcesNew),
+      energyDrift,
+      forces: forcesOut,
       timing: {
         verlet1: t1 - t0,
         systemCreate: t2 - t1,
@@ -794,7 +1219,7 @@ function runMDStep(): void {
         verlet2: t4 - t3,
         total: t4 - t0,
       },
-    })
+    }, [posOut.buffer, forcesOut.buffer])
   } catch (err: any) {
     handleStop()
     self.postMessage({ type: 'error', message: `MD step failed: ${err.message}` })
@@ -811,7 +1236,7 @@ function rattlePositions(amount: number): void {
   }
 }
 
-function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): void {
+async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): Promise<void> {
   if (state.isRunning) return
 
   // Update mode if provided
@@ -822,8 +1247,22 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
   state.isRunning = true
 
   if (state.mode === 'optimize') {
-    // Reset FIRE state for new optimization
-    resetFIRE()
+    // Cell optimization (periodic + optimizeCell) always uses FIRE — cell
+    // dynamics are coupled to atoms and easier to reason about with a
+    // velocity-based scheme. Otherwise respect the user's pick.
+    const forceFIRE = state.isPeriodic && state.optimizeCell
+    const useLBFGS = !forceFIRE && state.optimizer === 'lbfgs'
+    self.postMessage({
+      type: 'optimizerStarted',
+      optimizer: useLBFGS ? 'lbfgs' : 'fire',
+      forced: forceFIRE,
+    })
+
+    if (useLBFGS) {
+      await resetLBFGS()
+    } else {
+      await resetFIRE()
+    }
 
     // Apply rattle if requested
     if (data.rattleAmount && data.rattleAmount > 0) {
@@ -831,9 +1270,9 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
     }
 
     // Run optimization steps as fast as possible
-    const runOptLoop = () => {
+    const runOptLoop = async () => {
       if (!state.isRunning) return
-      const done = runFIREStep()
+      const done = useLBFGS ? await runLBFGSStep() : await runFIREStep()
       if (done) {
         handleStop()
       } else {
@@ -846,10 +1285,10 @@ function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', r
     const stepsPerFrame = data.stepsPerFrame || 1
 
     // Run MD steps as fast as possible
-    const runMDLoop = () => {
+    const runMDLoop = async () => {
       if (!state.isRunning) return
       for (let i = 0; i < stepsPerFrame; i++) {
-        runMDStep()
+        await runMDStep()
       }
       mdTimeout = setTimeout(runMDLoop, 0)
     }
@@ -868,8 +1307,8 @@ function handleStop(): void {
   self.postMessage({ type: 'stopped' })
 }
 
-function handleStep(): void {
-  runMDStep()
+async function handleStep(): Promise<void> {
+  await runMDStep()
 }
 
 function handleRattle(data: { amount: number }): void {
@@ -881,10 +1320,11 @@ function handleRattle(data: { amount: number }): void {
   rattlePositions(data.amount)
 
   // Send back the new positions so visualization can update
+  const posOut = new Float64Array(state.positions)
   self.postMessage({
     type: 'rattled',
-    positions: Array.from(state.positions),
-  })
+    positions: posOut,
+  }, [posOut.buffer])
 }
 
 // Message router
@@ -899,25 +1339,28 @@ self.onmessage = async (e: MessageEvent) => {
       await handleLoadModel(data)
       break
     case 'setSystem':
-      handleSetSystem(data)
+      await handleSetSystem(data)
       break
     case 'predict':
-      handlePredict()
+      await handlePredict()
       break
     case 'setParameters':
       handleSetParameters(data)
       break
     case 'start':
-      handleStart(data)
+      await handleStart(data)
       break
     case 'stop':
       handleStop()
       break
     case 'step':
-      handleStep()
+      await handleStep()
       break
     case 'rattle':
       handleRattle(data)
+      break
+    case 'predictAt':
+      await handlePredictAt(data)
       break
     default:
       self.postMessage({ type: 'error', message: `Unknown message type: ${type}` })

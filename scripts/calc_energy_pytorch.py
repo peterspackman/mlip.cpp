@@ -4,17 +4,15 @@
 # dependencies = [
 #     "ase>=3.22.0",
 #     "torch>=2.0.0",
-#     "pet-mad",
+#     "upet",
 # ]
 # ///
 """
-Calculate energy, forces, and stress using PET-MAD PyTorch reference.
-
-Useful for validating mlipcpp results against the official implementation.
+Calculate energy, forces, and stress using upet PyTorch models.
 
 Usage:
-    uv run scripts/calc_energy_pytorch.py structure.xyz
-    uv run scripts/calc_energy_pytorch.py structure.xyz --device cuda
+    uv run scripts/calc_energy_pytorch.py structure.xyz --model pet-mad-s
+    uv run scripts/calc_energy_pytorch.py structure.xyz --model pet-omad-s --device cuda
 """
 
 import argparse
@@ -26,14 +24,15 @@ import ase.io
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Calculate energy using PET-MAD PyTorch"
+        description="Calculate energy using upet PyTorch models"
     )
     parser.add_argument("structure", type=str, help="Input structure file (XYZ, CIF, etc.)")
     parser.add_argument(
-        "--device", type=str, default="cpu", help="Device: cpu or cuda (default: cpu)"
+        "--model", type=str, default="pet-mad-s",
+        help="Model name: pet-mad-s, pet-omad-s, pet-omat-l, etc."
     )
     parser.add_argument(
-        "--version", type=str, default="latest", help="PET-MAD version (default: latest)"
+        "--device", type=str, default="cpu", help="Device: cpu or cuda (default: cpu)"
     )
     parser.add_argument(
         "--no-forces", action="store_true", help="Skip force calculation"
@@ -60,9 +59,10 @@ def main():
     print(f"  PBC: {atoms.pbc.tolist()}")
     print()
 
-    from pet_mad.calculator import PETMADCalculator
+    from upet.calculator import UPETCalculator
 
-    calculator = PETMADCalculator(version=args.version, device=args.device)
+    print(f"Model: {args.model}")
+    calculator = UPETCalculator(model=args.model, device=args.device)
     atoms.calc = calculator
 
     energy = atoms.get_potential_energy()
@@ -74,7 +74,7 @@ def main():
         forces = atoms.get_forces()
         print("Forces (eV/A):")
         for i, (symbol, force) in enumerate(zip(atoms.get_chemical_symbols(), forces)):
-            print(f"  {i:3d} {symbol:2s}: [{force[0]:12.6f}, {force[1]:12.6f}, {force[2]:12.6f}]")
+            print(f"  Atom {i:3d} ({symbol:2s}): [{force[0]:12.6f}, {force[1]:12.6f}, {force[2]:12.6f}]")
         print()
 
     if not args.no_stress and all(atoms.pbc):

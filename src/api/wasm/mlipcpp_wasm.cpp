@@ -92,9 +92,9 @@ public:
     bool isPeriodic() const { return periodic_; }
 
     val getPositions() const {
-        val result = val::global("Float64Array").new_(positions_.size());
+        val result = val::global("Float32Array").new_(positions_.size());
         for (size_t i = 0; i < positions_.size(); ++i) {
-            result.set(i, static_cast<double>(positions_[i]));
+            result.set(i, positions_[i]);
         }
         return result;
     }
@@ -111,9 +111,9 @@ public:
         if (!periodic_ || cell_.empty()) {
             return val::null();
         }
-        val result = val::global("Float64Array").new_(9);
+        val result = val::global("Float32Array").new_(9);
         for (int i = 0; i < 9; ++i) {
-            result.set(i, static_cast<double>(cell_[i]));
+            result.set(i, cell_[i]);
         }
         return result;
     }
@@ -139,6 +139,20 @@ public:
     PredictorWrapper() = default;
     PredictorWrapper(std::shared_ptr<mlipcpp::Predictor> p) : predictor_(std::move(p)) {}
 
+    // Map user-facing backend name strings to the public Backend enum.
+    static mlipcpp::Backend parseBackend(const std::string& name) {
+        if (name.empty() || name == "auto") return mlipcpp::Backend::Auto;
+        if (name == "cpu")    return mlipcpp::Backend::CPU;
+        if (name == "webgpu" || name == "wgpu") return mlipcpp::Backend::WebGPU;
+        if (name == "metal" || name == "mtl")   return mlipcpp::Backend::Metal;
+        if (name == "cuda")   return mlipcpp::Backend::CUDA;
+        if (name == "hip" || name == "rocm")    return mlipcpp::Backend::HIP;
+        if (name == "vulkan") return mlipcpp::Backend::Vulkan;
+        if (name == "sycl")   return mlipcpp::Backend::SYCL;
+        if (name == "cann")   return mlipcpp::Backend::CANN;
+        return mlipcpp::Backend::Auto;
+    }
+
     // Load model from file path (Emscripten VFS)
     static PredictorWrapper load(const std::string& path) {
         return PredictorWrapper(std::make_shared<mlipcpp::Predictor>(path));
@@ -146,6 +160,12 @@ public:
 
     // Load model from ArrayBuffer
     static PredictorWrapper loadFromBuffer(const val& buffer) {
+        return loadFromBufferWithBackend(buffer, std::string("auto"));
+    }
+
+    static PredictorWrapper loadFromBufferWithBackend(const val& buffer,
+                                                      const std::string& backend) {
+        mlipcpp::set_backend(parseBackend(backend));
         // Get data from ArrayBuffer
         val uint8Array = val::global("Uint8Array").new_(buffer);
         const size_t length = uint8Array["length"].as<size_t>();
@@ -228,18 +248,17 @@ public:
         val output = val::object();
         output.set("energy", static_cast<double>(result.energy));
 
-        // Convert forces to Float64Array
-        val forces = val::global("Float64Array").new_(result.forces.size());
+        // Return forces as Float32Array (native precision — no double-widening copy)
+        val forces = val::global("Float32Array").new_(result.forces.size());
         for (size_t i = 0; i < result.forces.size(); ++i) {
-            forces.set(i, static_cast<double>(result.forces[i]));
+            forces.set(i, result.forces[i]);
         }
         output.set("forces", forces);
 
-        // Include stress if available
         if (result.has_stress()) {
-            val stress = val::global("Float64Array").new_(6);
+            val stress = val::global("Float32Array").new_(6);
             for (int i = 0; i < 6; ++i) {
-                stress.set(i, static_cast<double>(result.stress[i]));
+                stress.set(i, result.stress[i]);
             }
             output.set("stress", stress);
         }
@@ -256,6 +275,14 @@ private:
 // Utility functions
 std::string getVersion() {
     return mlipcpp::version();
+}
+
+std::string getBackendName() {
+    return std::string(mlipcpp::get_backend_name());
+}
+
+void setBackend(const std::string& name) {
+    mlipcpp::set_backend(PredictorWrapper::parseBackend(name));
 }
 
 // Emscripten bindings
@@ -276,6 +303,7 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .constructor<>()
         .class_function("load", &PredictorWrapper::load)
         .class_function("loadFromBuffer", &PredictorWrapper::loadFromBuffer)
+        .class_function("loadFromBufferWithBackend", &PredictorWrapper::loadFromBufferWithBackend)
         .function("modelType", &PredictorWrapper::modelType)
         .function("cutoff", &PredictorWrapper::cutoff)
         .function("predictEnergy", &PredictorWrapper::predictEnergy)
@@ -285,4 +313,6 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
 
     // Utility functions
     function("getVersion", &getVersion);
+    function("getBackendName", &getBackendName);
+    function("setBackend", &setBackend);
 }

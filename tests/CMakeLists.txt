@@ -93,6 +93,45 @@ target_link_libraries(test_system
         Catch2::Catch2WithMain
 )
 
+# Graph interpreter tests
+add_executable(test_graph_interpreter
+    test_graph_interpreter.cpp
+)
+
+target_link_libraries(test_graph_interpreter
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+        ggml
+        fmt::fmt
+)
+
+target_include_directories(test_graph_interpreter
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
+)
+
+# Auto-export vs manual comparison tests
+add_executable(test_auto_vs_manual
+    test_auto_vs_manual.cpp
+)
+
+target_link_libraries(test_auto_vs_manual
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+        ggml
+        fmt::fmt
+)
+
+target_include_directories(test_auto_vs_manual
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/models/pet
+)
+
 # Register with CTest
 include(CTest)
 list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
@@ -102,3 +141,47 @@ catch_discover_tests(test_pet_gradients)
 catch_discover_tests(test_io)
 catch_discover_tests(test_neighbor_list)
 catch_discover_tests(test_system)
+catch_discover_tests(test_graph_interpreter)
+catch_discover_tests(test_auto_vs_manual)
+
+# Full export integration test
+add_executable(test_full_export
+    test_full_export.cpp
+)
+
+target_link_libraries(test_full_export
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+        ggml
+        fmt::fmt
+)
+
+target_include_directories(test_full_export
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
+)
+
+catch_discover_tests(test_full_export)
+
+# GraphModel tests
+add_executable(test_graph_model
+    test_graph_model.cpp
+)
+
+target_link_libraries(test_graph_model
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+        ggml
+        fmt::fmt
+)
+
+target_include_directories(test_graph_model
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
+)
+
+catch_discover_tests(test_graph_model)

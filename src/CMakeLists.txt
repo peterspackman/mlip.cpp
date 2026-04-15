@@ -25,6 +25,13 @@ set(MLIPCPP_IO_SOURCES
     io/xyz.cpp
 )
 
+# Runtime (graph interpreter)
+set(MLIPCPP_RUNTIME_SOURCES
+    runtime/graph_ir.cpp
+    runtime/graph_interpreter.cpp
+    runtime/graph_model.cpp
+)
+
 # Utilities
 set(MLIPCPP_UTIL_SOURCES
     ggml_attention.cpp
@@ -42,6 +49,7 @@ foreach(src IN LISTS
     MLIPCPP_CORE_SOURCES
     MLIPCPP_MODEL_SOURCES
     MLIPCPP_IO_SOURCES
+    MLIPCPP_RUNTIME_SOURCES
     MLIPCPP_UTIL_SOURCES
     MLIPCPP_API_SOURCES)
     list(APPEND MLIPCPP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/${src})
@@ -63,6 +71,7 @@ target_include_directories(mlipcpp
 target_link_libraries(mlipcpp
     PRIVATE
         ggml
+        nlohmann_json::nlohmann_json
         $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:fmt::fmt>
 )
 

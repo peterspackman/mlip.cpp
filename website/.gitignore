@@ -1,0 +1,6 @@
+node_modules
+dist
+.vite
+
+# GGUF model(s) are fetched at build time from HuggingFace — don't check them in.
+public/*.gguf
