@@ -1,10 +1,43 @@
 #include "backend.h"
 #include "log.h"
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <ggml.h>
 #include <ggml-cpu.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace mlipcpp {
+
+BackendPreference parse_backend_preference(std::string_view name_in) {
+  std::string name(name_in);
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  static const std::unordered_map<std::string, BackendPreference> table = {
+      {"auto",   BackendPreference::Auto},
+      {"cpu",    BackendPreference::CPU},
+      {"cuda",   BackendPreference::CUDA},
+      {"nvidia", BackendPreference::CUDA},
+      {"hip",    BackendPreference::HIP},
+      {"rocm",   BackendPreference::HIP},
+      {"metal",  BackendPreference::Metal},
+      {"mtl",    BackendPreference::Metal},
+      {"vulkan", BackendPreference::Vulkan},
+      {"vk",     BackendPreference::Vulkan},
+      {"webgpu", BackendPreference::WebGPU},
+      {"wgpu",   BackendPreference::WebGPU},
+      {"sycl",   BackendPreference::SYCL},
+      {"cann",   BackendPreference::CANN},
+  };
+  auto it = table.find(name);
+  if (it == table.end()) {
+    throw std::runtime_error("Unknown backend: " + std::string(name_in));
+  }
+  return it->second;
+}
 
 #ifndef __EMSCRIPTEN__
 namespace log {
@@ -113,21 +146,52 @@ BackendProvider::create(BackendPreference pref) {
     return provider;
   }
 
-  // Try GPU (discrete first, then integrated)
-  ggml_backend_t gpu = nullptr;
-  ggml_backend_dev_t gpu_dev =
-      ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-  if (gpu_dev) {
-    gpu = ggml_backend_dev_init(gpu_dev, nullptr);
-  }
-  if (!gpu) {
-    gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
-    if (gpu_dev) {
-      gpu = ggml_backend_dev_init(gpu_dev, nullptr);
+  // Enumerate all GPU devices and try to match the preference. For specific
+  // preferences (Metal, WebGPU, ...) we scan every GPU and pick one whose
+  // name matches. For Auto we pick the first GPU, except on Emscripten where
+  // we prefer WebGPU.
+  std::vector<ggml_backend_dev_t> gpu_devs;
+  {
+    size_t n_dev = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_dev; ++i) {
+      ggml_backend_dev_t d = ggml_backend_dev_get(i);
+      auto t = ggml_backend_dev_type(d);
+      if (t == GGML_BACKEND_DEVICE_TYPE_GPU ||
+          t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        gpu_devs.push_back(d);
+      }
     }
   }
 
-  // Check if GPU matches preference
+  ggml_backend_t gpu = nullptr;
+  if (pref == BackendPreference::Auto) {
+#ifdef __EMSCRIPTEN__
+    for (auto d : gpu_devs) {
+      std::string_view n = ggml_backend_dev_name(d);
+      if (n.find("WebGPU") != std::string_view::npos ||
+          n.find("webgpu") != std::string_view::npos) {
+        gpu = ggml_backend_dev_init(d, nullptr);
+        if (gpu) break;
+      }
+    }
+#endif
+    if (!gpu && !gpu_devs.empty()) {
+      gpu = ggml_backend_dev_init(gpu_devs[0], nullptr);
+    }
+  } else {
+    // Specific GPU preference: scan devices until one matches.
+    for (auto d : gpu_devs) {
+      ggml_backend_t b = ggml_backend_dev_init(d, nullptr);
+      if (!b) continue;
+      if (gpu_matches_preference(b)) {
+        gpu = b;
+        break;
+      }
+      ggml_backend_free(b);
+    }
+  }
+
+  // Check if GPU matches preference (Auto accepts any)
   if (gpu && gpu_matches_preference(gpu)) {
     provider->primary_ = gpu;
     provider->name_ = ggml_backend_name(provider->primary_);

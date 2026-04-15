@@ -94,7 +94,7 @@ private:
   ggml_context *ctx_weights_ = nullptr;
   std::shared_ptr<BackendProvider> backend_provider_;
   ggml_backend_buffer_t weight_buffer_ = nullptr;
-  ggml_backend_t cpu_backend_ = nullptr;
+  ggml_backend_t compute_backend_ = nullptr;
 
   // Species mapping (atomic number -> index)
   std::map<int, int> species_to_index_;

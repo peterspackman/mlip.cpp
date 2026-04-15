@@ -54,9 +54,7 @@ GraphModel::~GraphModel() {
   if (ctx_weights_) {
     ggml_free(ctx_weights_);
   }
-  if (cpu_backend_) {
-    ggml_backend_free(cpu_backend_);
-  }
+  // compute_backend_ is owned by backend_provider_; do not free here.
 }
 
 bool GraphModel::load_from_gguf(const std::string &path) {
@@ -184,10 +182,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
 
   ggml_free(temp_ctx);
 
-  // Initialize CPU backend (cached for lifetime of model)
-  cpu_backend_ = ggml_backend_cpu_init();
-  if (!cpu_backend_) {
-    throw std::runtime_error("Failed to create CPU backend");
+  // Use primary backend (may be GPU) for compute; owned by BackendProvider.
+  compute_backend_ = backend_provider_->primary();
+  if (!compute_backend_) {
+    throw std::runtime_error("Failed to get compute backend");
   }
 
   return true;
@@ -300,7 +298,7 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
 
   // Allocate input buffer
   ggml_backend_buffer_t input_buffer =
-      ggml_backend_alloc_ctx_tensors(input_ctx, cpu_backend_);
+      ggml_backend_alloc_ctx_tensors(input_ctx, compute_backend_);
   if (!input_buffer) {
     ggml_free(input_ctx);
     throw std::runtime_error("Failed to allocate input buffer");
@@ -474,7 +472,7 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
   }
 
   ggml_backend_buffer_t compute_buffer =
-      ggml_backend_alloc_ctx_tensors(compute_ctx, cpu_backend_);
+      ggml_backend_alloc_ctx_tensors(compute_ctx, compute_backend_);
   if (!compute_buffer) {
     ggml_free(compute_ctx);
     ggml_backend_buffer_free(input_buffer);
@@ -488,7 +486,7 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
     ggml_graph_reset(cgraph);
   }
 
-  ggml_status status = ggml_backend_graph_compute(cpu_backend_, cgraph);
+  ggml_status status = ggml_backend_graph_compute(compute_backend_, cgraph);
   if (status != GGML_STATUS_SUCCESS) {
     ggml_backend_buffer_free(compute_buffer);
     ggml_free(compute_ctx);
