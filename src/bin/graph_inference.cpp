@@ -1089,48 +1089,26 @@ int main(int argc, char *argv[]) {
                             .count();
 
     if (debug) {
-      auto tensor_sum = [](ggml_tensor *t) -> float {
-        if (!t || !t->data)
-          return 0.0f;
-        float sum = 0.0f;
-        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
-          for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
-            for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
-              for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
-                float *ptr =
-                    (float *)((char *)t->data + i0 * t->nb[0] +
-                              i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3]);
-                sum += *ptr;
-              }
-            }
-          }
-        }
-        return sum;
+      // Snapshot a contiguous tensor's data into a host buffer using
+      // backend-aware tensor_get (so this works for non-CPU backends too).
+      auto fetch = [](ggml_tensor *t) -> std::vector<float> {
+        std::vector<float> buf;
+        if (!t || !t->buffer || t->type != GGML_TYPE_F32) return buf;
+        buf.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+        return buf;
       };
-
-      auto tensor_min_max = [](ggml_tensor *t, float &min_val,
-                               float &max_val) {
-        if (!t || !t->data) {
-          min_val = max_val = 0.0f;
-          return;
-        }
-        min_val = 1e30f;
-        max_val = -1e30f;
-        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
-          for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
-            for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
-              for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
-                float *ptr = (float *)((char *)t->data + i0 * t->nb[0] +
-                                       i1 * t->nb[1] + i2 * t->nb[2] +
-                                       i3 * t->nb[3]);
-                if (*ptr < min_val)
-                  min_val = *ptr;
-                if (*ptr > max_val)
-                  max_val = *ptr;
-              }
-            }
-          }
-        }
+      auto tensor_sum = [&](ggml_tensor *t) -> float {
+        auto v = fetch(t);
+        double s = 0.0;
+        for (float x : v) s += x;
+        return (float) s;
+      };
+      auto tensor_min_max = [&](ggml_tensor *t, float &min_val, float &max_val) {
+        auto v = fetch(t);
+        if (v.empty()) { min_val = max_val = 0.0f; return; }
+        min_val = max_val = v[0];
+        for (float x : v) { if (x < min_val) min_val = x; if (x > max_val) max_val = x; }
       };
 
       std::cout << "\n=== Debug: Intermediate tensor sums ===\n";
@@ -1147,7 +1125,7 @@ int main(int argc, char *argv[]) {
             }
           }
         }
-        if (t && t->data && t->type == GGML_TYPE_F32) {
+        if (t && t->buffer && t->type == GGML_TYPE_F32) {
           float sum = tensor_sum(t);
           float min_val, max_val;
           tensor_min_max(t, min_val, max_val);
@@ -1211,7 +1189,7 @@ int main(int argc, char *argv[]) {
         ggml_backend_tensor_get(grad_tensor, grad_data.data(), 0,
                                 ggml_nbytes(grad_tensor));
 
-        if (debug) {
+        {
           float grad_min = 1e30f, grad_max = -1e30f, grad_sum = 0.0f;
           int nonzero = 0;
           for (size_t i = 0; i < grad_data.size(); i++) {
