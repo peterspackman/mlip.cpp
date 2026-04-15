@@ -28,13 +28,15 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: '3.1.50'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
 
       - name: Cache CPM packages
         uses: actions/cache@v4
@@ -43,6 +45,15 @@ jobs:
           key: cpm-wasm-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: |
             cpm-wasm-
+
+      # Cache the bundled GGUF across runs so we don't re-download from HF on
+      # every build. Keyed on the URL + filename so a model bump in
+      # package.json invalidates the cache automatically.
+      - name: Cache bundled GGUF
+        uses: actions/cache@v4
+        with:
+          path: website/public/pet-mad-xs.gguf
+          key: gguf-pet-mad-xs-${{ hashFiles('website/package.json') }}
 
       - name: Build WASM
         run: |
@@ -58,11 +69,11 @@ jobs:
 
       - name: Install website dependencies
         working-directory: website
-        run: npm install
+        run: bun install --frozen-lockfile
 
       - name: Build website
         working-directory: website
-        run: npm run build
+        run: bun run build
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

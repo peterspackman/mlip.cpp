@@ -92,9 +92,9 @@ public:
     bool isPeriodic() const { return periodic_; }
 
     val getPositions() const {
-        val result = val::global("Float64Array").new_(positions_.size());
+        val result = val::global("Float32Array").new_(positions_.size());
         for (size_t i = 0; i < positions_.size(); ++i) {
-            result.set(i, static_cast<double>(positions_[i]));
+            result.set(i, positions_[i]);
         }
         return result;
     }
@@ -111,9 +111,9 @@ public:
         if (!periodic_ || cell_.empty()) {
             return val::null();
         }
-        val result = val::global("Float64Array").new_(9);
+        val result = val::global("Float32Array").new_(9);
         for (int i = 0; i < 9; ++i) {
-            result.set(i, static_cast<double>(cell_[i]));
+            result.set(i, cell_[i]);
         }
         return result;
     }
@@ -248,18 +248,17 @@ public:
         val output = val::object();
         output.set("energy", static_cast<double>(result.energy));
 
-        // Convert forces to Float64Array
-        val forces = val::global("Float64Array").new_(result.forces.size());
+        // Return forces as Float32Array (native precision — no double-widening copy)
+        val forces = val::global("Float32Array").new_(result.forces.size());
         for (size_t i = 0; i < result.forces.size(); ++i) {
-            forces.set(i, static_cast<double>(result.forces[i]));
+            forces.set(i, result.forces[i]);
         }
         output.set("forces", forces);
 
-        // Include stress if available
         if (result.has_stress()) {
-            val stress = val::global("Float64Array").new_(6);
+            val stress = val::global("Float32Array").new_(6);
             for (int i = 0; i < 6; ++i) {
-                stress.set(i, static_cast<double>(result.stress[i]));
+                stress.set(i, result.stress[i]);
             }
             output.set("stress", stress);
         }

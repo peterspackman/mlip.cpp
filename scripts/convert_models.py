@@ -21,6 +21,7 @@ from pathlib import Path
 
 # Default models converted by `convert_models.py` (no flags)
 DEFAULT_MODELS = [
+    "pet-mad-xs",
     "pet-mad-s",
     "pet-oam-l",
     "pet-omad-xs",

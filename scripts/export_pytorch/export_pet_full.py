@@ -141,7 +141,48 @@ def load_pet_model(model_name: str):
         warnings.filterwarnings("ignore")
         pet_model = load_metatrain_model(path)
 
-    return pet_model
+    return _unwrap_to_pet(pet_model)
+
+
+def _unwrap_to_pet(model):
+    """Peel metatrain wrappers (LLPRUncertaintyModel, etc.) until we reach the
+    raw PET module that exposes .gnn_layers.
+
+    Newer metatrain checkpoints ship with uncertainty-quantification wrappers;
+    the checkpoints themselves used to hand back the bare PET. Try common
+    attribute names first, then fall back to scanning nn.Module children."""
+    if hasattr(model, 'gnn_layers'):
+        return model
+
+    candidates = ('model', 'module', 'pet', 'base_model', 'inner_model',
+                  'last_layer_features_model', 'backbone')
+    for attr in candidates:
+        inner = getattr(model, attr, None)
+        if inner is None:
+            continue
+        try:
+            unwrapped = _unwrap_to_pet(inner)
+        except AttributeError:
+            continue
+        if unwrapped is not None:
+            return unwrapped
+
+    # Fall back: scan named children for any module that has .gnn_layers
+    # somewhere in its subtree.
+    import torch.nn as nn
+    if isinstance(model, nn.Module):
+        for _name, child in model.named_children():
+            try:
+                unwrapped = _unwrap_to_pet(child)
+            except AttributeError:
+                continue
+            if unwrapped is not None:
+                return unwrapped
+
+    raise AttributeError(
+        f"Could not find a PET module with .gnn_layers under {type(model).__name__}; "
+        f"tried attributes {candidates} and scanned child modules"
+    )
 
 
 def get_model_params(pet_model):
