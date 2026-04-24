@@ -122,8 +122,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: 'https://registry.npmjs.org'
+
+      # npm <11.5.1 can sign provenance via OIDC but still does registry auth
+      # the old token way — so trusted-publisher publishes fall through to
+      # ENEEDAUTH/404. Pin a version that has full OIDC trusted-publisher
+      # registry support.
+      - name: Upgrade npm to an OIDC-capable version
+        run: npm install -g 'npm@^11.5.1'
 
       - name: Download WASM build artifacts
         uses: actions/download-artifact@v4
