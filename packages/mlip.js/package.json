@@ -43,7 +43,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/peterspackman/mlipcpp.git",
+    "url": "https://github.com/peterspackman/mlip.cpp.git",
     "directory": "packages/mlip.js"
   },
   "keywords": [
@@ -60,9 +60,9 @@
   "author": "Peter Spackman",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/peterspackman/mlipcpp/issues"
+    "url": "https://github.com/peterspackman/mlip.cpp/issues"
   },
-  "homepage": "https://github.com/peterspackman/mlipcpp#readme",
+  "homepage": "https://github.com/peterspackman/mlip.cpp#readme",
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
