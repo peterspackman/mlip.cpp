@@ -6,8 +6,10 @@
  * numerically equivalent results to the hand-coded PET implementation.
  *
  * Reference values from existing tests:
- * - water.xyz (3 atoms: O, H, H): -14.380176 eV
- * - si.xyz (2 atoms: Si, Si): -4.538056 eV
+ * References are from the upet PyTorch calculator with model=pet-mad-xs
+ * (the variant fetched by CI from HuggingFace).
+ * - water.xyz (3 atoms: O, H, H): -15.293853 eV
+ * - si.xyz  (2 atoms: Si, Si, a=5.43 Å): -5.704812 eV
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -38,8 +40,8 @@ static const char *WATER_XYZ = "geometries/water.xyz";
 static const char *SI_XYZ = "geometries/si.xyz";
 
 // Reference energies from existing PET tests
-static constexpr float WATER_ENERGY_REF = -14.380176f;
-static constexpr float SI_ENERGY_REF = -4.538056f;
+static constexpr float WATER_ENERGY_REF = -15.293853f;
+static constexpr float SI_ENERGY_REF    = -5.704812f;
 static constexpr float ENERGY_TOLERANCE = 1e-4f;
 
 /**

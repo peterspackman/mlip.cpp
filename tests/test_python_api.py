@@ -75,9 +75,9 @@ class TestPredictorAPI:
         positions, atomic_numbers = read_xyz(water_path)
         result = auto_model.predict(positions, atomic_numbers, compute_forces=False)
 
-        # Reference for pet-mad-xs.gguf (the model CI fetches from HuggingFace).
-        # The full pet-mad model gives -14.38 eV; the xs variant -15.29 eV.
-        # Tolerance accommodates small backend-to-backend numerical drift.
+        # Reference from upet PyTorch calculator with model=pet-mad-xs
+        # (the variant CI fetches from HuggingFace). Tolerance accommodates
+        # small CPU↔GPU floating-point drift.
         WATER_ENERGY_REF = -15.293853
         np.testing.assert_allclose(
             result.energy, WATER_ENERGY_REF, atol=0.05,

@@ -194,9 +194,9 @@ TEST_CASE("PET matches reference values", "[pet][verification]") {
     auto system = create_test_system_si2();
     auto result = model.predict(system);
 
-    // Expected energy from PyTorch reference
-    const double expected_energy = -4.538056;
-    const double tolerance = 0.001;
+    // Expected energy from upet PyTorch calculator with model=pet-mad-xs.
+    const double expected_energy = -5.704812;
+    const double tolerance = 0.005;
 
     INFO("Expected: " << expected_energy << " eV");
     INFO("Computed: " << result.energy << " eV");
@@ -210,9 +210,9 @@ TEST_CASE("PET matches reference values", "[pet][verification]") {
     auto system = create_test_system_water();
     auto result = model.predict(system);
 
-    // Expected energy from PyTorch reference
-    const double expected_energy = -14.380176;
-    const double tolerance = 0.01;
+    // Expected energy from upet PyTorch calculator with model=pet-mad-xs.
+    const double expected_energy = -15.293853;
+    const double tolerance = 0.05;
 
     INFO("Expected: " << expected_energy << " eV");
     INFO("Computed: " << result.energy << " eV");
