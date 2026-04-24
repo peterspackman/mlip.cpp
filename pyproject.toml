@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "mlipcpp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast C++ implementation of Machine Learning Interatomic Potentials"
 readme = "README.md"
 requires-python = ">=3.12"

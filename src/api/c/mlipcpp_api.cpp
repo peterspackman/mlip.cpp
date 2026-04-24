@@ -136,7 +136,7 @@ to_compute_precision(mlipcpp_precision_t precision) {
 // Version Information
 // ============================================================================
 
-const char *mlipcpp_version(void) { return "0.1.0"; }
+const char *mlipcpp_version(void) { return "0.1.1"; }
 
 // ============================================================================
 // Backend and Logging Control

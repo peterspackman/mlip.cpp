@@ -1,6 +1,6 @@
 {
   "name": "@peterspackman/mlip.js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "JavaScript/WebAssembly bindings for mlipcpp - Machine Learning Interatomic Potentials",
   "type": "module",
   "main": "dist/index.js",

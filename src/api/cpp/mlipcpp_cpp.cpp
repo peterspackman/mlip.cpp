@@ -15,7 +15,7 @@
 
 namespace mlipcpp {
 
-const char *version() { return "0.1.0"; }
+const char *version() { return "0.1.1"; }
 
 // Global backend provider - shared across all models
 static std::shared_ptr<BackendProvider> g_backend_provider;
