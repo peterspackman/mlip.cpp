@@ -11,6 +11,39 @@
 
 namespace mlipcpp {
 
+bool is_backend_available(BackendPreference pref) {
+  if (pref == BackendPreference::Auto || pref == BackendPreference::CPU) {
+    return true;
+  }
+
+  const char *needle = nullptr;
+  const char *needle2 = nullptr;
+  switch (pref) {
+  case BackendPreference::CUDA:   needle = "CUDA"; break;
+  case BackendPreference::HIP:    needle = "ROCm"; needle2 = "HIP"; break;
+  case BackendPreference::Metal:  needle = "Metal"; needle2 = "MTL"; break;
+  case BackendPreference::Vulkan: needle = "Vulkan"; break;
+  case BackendPreference::WebGPU: needle = "WebGPU"; break;
+  case BackendPreference::SYCL:   needle = "SYCL"; break;
+  case BackendPreference::CANN:   needle = "CANN"; break;
+  default: return false;
+  }
+
+  size_t n = ggml_backend_dev_count();
+  for (size_t i = 0; i < n; ++i) {
+    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+    auto t = ggml_backend_dev_type(dev);
+    if (t != GGML_BACKEND_DEVICE_TYPE_GPU &&
+        t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+      continue;
+    }
+    std::string_view name = ggml_backend_dev_name(dev);
+    if (name.find(needle) != std::string_view::npos) return true;
+    if (needle2 && name.find(needle2) != std::string_view::npos) return true;
+  }
+  return false;
+}
+
 BackendPreference parse_backend_preference(std::string_view name_in) {
   std::string name(name_in);
   std::transform(name.begin(), name.end(), name.begin(),
@@ -206,14 +239,19 @@ BackendProvider::create(BackendPreference pref) {
 
   // For specific GPU preferences, fail if not available
   if (pref != BackendPreference::Auto) {
-    throw std::runtime_error(std::string(backend_preference_name(pref)) +
-                             " backend requested but not available");
+    throw BackendUnavailableError(
+        std::string(backend_preference_name(pref)) +
+        " backend requested but not available (not compiled in or no "
+        "compatible device detected)");
   }
 
-  // Auto mode: fall back to CPU
+  // Auto mode: fall back to CPU. Log at warn level so it survives callers
+  // that set the log level to Warn or Error to suppress info-level chatter
+  // — users expecting GPU acceleration should see this.
   provider->primary_ = provider->cpu_;
   provider->name_ = ggml_backend_name(provider->primary_);
-  log::info("Backend: {} (GPU not available)", provider->name_);
+  log::warn("Backend: {} (GPU not available; Auto fell back to CPU)",
+            provider->name_);
   return provider;
 }
 

@@ -35,3 +35,26 @@ if(MLIPCPP_BUILD_FORTRAN)
     add_executable(fortran_api_test fortran_api_test.f90)
     target_link_libraries(fortran_api_test PRIVATE mlipcpp_fortran)
 endif()
+
+# =============================================================================
+# Register public-API examples as ctest cases when tests are enabled.
+# Each test is pointed at a canonical GGUF fixture (fetched by CI into
+# build/tests/gguf/pet-auto.gguf); when the file is absent the test binaries
+# exit 77 so CTest reports "skipped" instead of failing.
+# =============================================================================
+if(MLIPCPP_BUILD_TESTS)
+    set(MLIPCPP_TEST_MODEL "${CMAKE_BINARY_DIR}/tests/gguf/pet-auto.gguf"
+        CACHE FILEPATH "GGUF model used as a fixture for public-API example tests")
+
+    add_test(NAME c_api_test COMMAND c_api_test "${MLIPCPP_TEST_MODEL}")
+    set_tests_properties(c_api_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(NAME cpp_api_test COMMAND cpp_api_test "${MLIPCPP_TEST_MODEL}")
+    set_tests_properties(cpp_api_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    if(MLIPCPP_BUILD_FORTRAN)
+        add_test(NAME fortran_api_test
+            COMMAND fortran_api_test "${MLIPCPP_TEST_MODEL}")
+        set_tests_properties(fortran_api_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endif()

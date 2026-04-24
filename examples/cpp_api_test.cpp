@@ -8,6 +8,7 @@
 #include "mlipcpp/mlipcpp.hpp"
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <vector>
 
 int main(int argc, char **argv) {
@@ -17,6 +18,13 @@ int main(int argc, char **argv) {
   }
 
   const char *model_path = argv[1];
+
+  // Exit 77 (CTest SKIP_RETURN_CODE) when the model fixture is missing,
+  // so the same binary works as both a local example and a CI test.
+  if (!std::filesystem::exists(model_path)) {
+    fprintf(stderr, "Model file not found: %s — skipping\n", model_path);
+    return 77;
+  }
 
   // Suppress verbose logging
   mlipcpp::suppress_logging();

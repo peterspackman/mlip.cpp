@@ -13,6 +13,7 @@ program fortran_test
     type(mlipcpp_options) :: opts
     integer(c_int) :: ierr
     real(c_float) :: cutoff
+    logical :: file_exists
 
     ! Get command line argument
     if (command_argument_count() < 1) then
@@ -20,6 +21,14 @@ program fortran_test
         stop 1
     end if
     call get_command_argument(1, model_path)
+
+    ! Skip (CTest SKIP_RETURN_CODE=77) when the model fixture is missing,
+    ! so the same binary works as a local example and as a CI test.
+    inquire(file=trim(model_path), exist=file_exists)
+    if (.not. file_exists) then
+        print '(A,A,A)', 'Model file not found: ', trim(model_path), ' — skipping'
+        call exit(77)
+    end if
 
     ! Suppress verbose logging
     call mlipcpp_suppress_logging()

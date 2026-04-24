@@ -207,9 +207,28 @@ void set_backend(Backend backend);
 /**
  * @brief Get the name of the current backend
  *
+ * This reflects the backend that is actually in use after any Auto
+ * resolution. Check this after constructing a Predictor to verify that
+ * a requested GPU backend was actually selected.
+ *
  * @return Backend name (e.g., "Metal", "CPU", "CUDA")
  */
 const char *get_backend_name();
+
+/**
+ * @brief Check whether the currently active backend is a GPU device
+ */
+bool backend_is_gpu();
+
+/**
+ * @brief Check whether a specific backend is selectable on this host
+ *
+ * Returns true for Backend::CPU (always) and Backend::Auto (always, since
+ * Auto falls back to CPU). For specific GPU backends returns true only
+ * when the corresponding ggml backend is compiled in AND at least one
+ * matching device is detected.
+ */
+bool is_backend_available(Backend backend);
 
 /**
  * @brief Suppress verbose logging from mlipcpp and GGML

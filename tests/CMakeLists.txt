@@ -185,3 +185,21 @@ target_include_directories(test_graph_model
 )
 
 catch_discover_tests(test_graph_model)
+
+# Backend-selection unit tests (use only the public C API)
+add_executable(test_backend_selection
+    test_backend_selection.cpp
+)
+
+target_link_libraries(test_backend_selection
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+)
+
+target_compile_definitions(test_backend_selection
+    PRIVATE
+        MLIPCPP_TEST_MODEL_DEFAULT="${CMAKE_BINARY_DIR}/tests/gguf/pet-auto.gguf"
+)
+
+catch_discover_tests(test_backend_selection)

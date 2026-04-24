@@ -56,13 +56,15 @@ static BackendPreference to_internal(Backend b) {
   }
 }
 
-// Set the global backend preference (must be called before loading any models)
+// Set the global backend preference. Creation is deferred until the first
+// Predictor is built, so this is nothrow even if the requested backend
+// turns out to be unavailable — construction of the Predictor will surface
+// a BackendUnavailableError from BackendProvider::create().
 void set_backend(Backend backend) {
   std::lock_guard<std::mutex> lock(g_backend_mutex);
   auto pref = to_internal(backend);
-  if (g_backend_provider && g_backend_provider->preference() != pref) {
-    // Recreate backend with new preference
-    g_backend_provider = BackendProvider::create(pref);
+  if (g_backend_preference != pref) {
+    g_backend_provider.reset();
   }
   g_backend_preference = pref;
 }
@@ -71,6 +73,19 @@ void set_backend(Backend backend) {
 const char *get_backend_name() {
   auto backend = get_global_backend();
   return backend->name().c_str();
+}
+
+bool backend_is_gpu() {
+  try {
+    auto backend = get_global_backend();
+    return backend->is_gpu();
+  } catch (...) {
+    return false;
+  }
+}
+
+bool is_backend_available(Backend backend) {
+  return mlipcpp::is_backend_available(to_internal(backend));
 }
 
 // Suppress verbose logging
@@ -113,7 +128,15 @@ struct Predictor::Impl {
       model = std::move(pet_model);
     } else if (arch == "pet-graph") {
       auto graph_model = std::make_unique<runtime::GraphModel>();
-      graph_model->set_backend_preference(to_internal(options.backend));
+      // options.backend wins; when it's Auto we fall through to the
+      // global preference so a prior mlipcpp::set_backend() call isn't
+      // silently ignored.
+      auto graph_pref = to_internal(options.backend);
+      if (graph_pref == BackendPreference::Auto) {
+        std::lock_guard<std::mutex> lock(g_backend_mutex);
+        graph_pref = g_backend_preference;
+      }
+      graph_model->set_backend_preference(graph_pref);
 
       if (!graph_model->load_from_gguf(path)) {
         throw std::runtime_error("Failed to load graph model from: " + path);

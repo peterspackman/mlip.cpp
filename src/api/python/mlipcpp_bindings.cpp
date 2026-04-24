@@ -52,6 +52,7 @@ NB_MODULE(_mlipcpp, m) {
       .value("HIP", mlipcpp::Backend::HIP, "AMD HIP/ROCm GPU")
       .value("Metal", mlipcpp::Backend::Metal, "Apple Metal GPU (macOS/iOS)")
       .value("Vulkan", mlipcpp::Backend::Vulkan, "Vulkan GPU (cross-platform)")
+      .value("WebGPU", mlipcpp::Backend::WebGPU, "WebGPU (Dawn native or browser)")
       .value("SYCL", mlipcpp::Backend::SYCL, "Intel SYCL (oneAPI)")
       .value("CANN", mlipcpp::Backend::CANN, "Huawei Ascend NPU");
 
@@ -254,7 +255,27 @@ Example
 )doc");
 
   m.def("get_backend_name", &mlipcpp::get_backend_name,
-        "Get the name of the current backend (e.g., 'Metal', 'CPU', 'CUDA')");
+        "Get the name of the current backend (e.g., 'Metal', 'CPU', 'CUDA').\n"
+        "Check this after constructing a Predictor to confirm that a requested\n"
+        "GPU backend was actually selected rather than silently falling back to CPU.");
+
+  m.def("backend_is_gpu", &mlipcpp::backend_is_gpu,
+        "True if the currently active backend is a GPU device.");
+
+  m.def("is_backend_available", &mlipcpp::is_backend_available, "backend"_a,
+        R"doc(
+Check whether a specific backend is selectable on this host.
+
+Returns True for Backend.CPU (always) and Backend.Auto (always, since Auto
+falls back to CPU). For specific GPU backends returns True only when the
+corresponding ggml backend is compiled in AND at least one matching device
+is detected.
+
+Example
+-------
+>>> if mlipcpp.is_backend_available(mlipcpp.Backend.Metal):
+...     mlipcpp.set_backend(mlipcpp.Backend.Metal)
+)doc");
 
   // Version attribute
   m.attr("__version__") = mlipcpp::version();

@@ -202,6 +202,13 @@ CPMAddPackage(
 # =============================================================================
 add_subdirectory(src)
 
+# Enable CTest before descending into examples/, so add_test() calls there
+# (for c_api_test / cpp_api_test / fortran_api_test) actually register
+# rather than being silently dropped.
+if(MLIPCPP_BUILD_TESTS)
+    enable_testing()
+endif()
+
 # =============================================================================
 # Examples
 # =============================================================================
@@ -224,7 +231,6 @@ if(MLIPCPP_BUILD_TESTS)
         EXCLUDE_FROM_ALL YES
     )
 
-    enable_testing()
     add_subdirectory(tests)
 endif()
 

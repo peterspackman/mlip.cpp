@@ -19,6 +19,19 @@ int main(int argc, char** argv) {
 
     const char* model_path = argv[1];
 
+    /* If the model file is missing, exit 77 so CTest marks the test as
+     * skipped rather than failed. This lets the same binary act as both
+     * a standalone example (fail on missing model) and a CI-run test
+     * (skip when the HuggingFace fetch hasn't happened). */
+    {
+        FILE* f = fopen(model_path, "rb");
+        if (!f) {
+            fprintf(stderr, "Model file not found: %s — skipping\n", model_path);
+            return 77;
+        }
+        fclose(f);
+    }
+
     // Suppress verbose logging
     mlipcpp_suppress_logging();
 

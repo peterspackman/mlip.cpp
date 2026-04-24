@@ -89,7 +89,8 @@ typedef enum {
   MLIPCPP_BACKEND_METAL = 4,  /**< Use Metal GPU backend (macOS only) */
   MLIPCPP_BACKEND_VULKAN = 5, /**< Vulkan GPU (cross-platform) */
   MLIPCPP_BACKEND_SYCL = 6,   /**< Intel SYCL (oneAPI) */
-  MLIPCPP_BACKEND_CANN = 7    /**< Huawei Ascend NPU */
+  MLIPCPP_BACKEND_CANN = 7,   /**< Huawei Ascend NPU */
+  MLIPCPP_BACKEND_WEBGPU = 8  /**< WebGPU (Dawn native or browser) */
 } mlipcpp_backend_t;
 
 /**
@@ -104,8 +105,30 @@ void mlipcpp_set_backend(mlipcpp_backend_t backend);
 /**
  * @brief Get the name of the current backend
  * @return Backend name string (e.g., "Metal", "CPU", "CUDA")
+ *
+ * This reflects the backend that is actually in use after any Auto
+ * resolution. Use this to verify that an Auto request found the expected
+ * GPU rather than silently falling back to CPU.
  */
 const char *mlipcpp_get_backend_name(void);
+
+/**
+ * @brief Check whether the currently active backend is a GPU device
+ * @return true if a GPU backend is in use, false for CPU
+ */
+bool mlipcpp_backend_is_gpu(void);
+
+/**
+ * @brief Check whether a specific backend is compiled in and has a device
+ * @param backend Backend to query
+ * @return true if the backend can be selected on this host
+ *
+ * Returns true for MLIPCPP_BACKEND_CPU (always) and
+ * MLIPCPP_BACKEND_AUTO (always — Auto falls back to CPU). For specific
+ * GPU backends returns true only if the corresponding ggml backend is
+ * compiled in AND at least one matching device is detected.
+ */
+bool mlipcpp_is_backend_available(mlipcpp_backend_t backend);
 
 /**
  * @brief Suppress verbose logging from mlipcpp and GGML

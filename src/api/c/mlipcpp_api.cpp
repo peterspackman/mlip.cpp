@@ -108,6 +108,8 @@ mlipcpp::BackendPreference to_backend_preference(mlipcpp_backend_t backend) {
     return mlipcpp::BackendPreference::SYCL;
   case MLIPCPP_BACKEND_CANN:
     return mlipcpp::BackendPreference::CANN;
+  case MLIPCPP_BACKEND_WEBGPU:
+    return mlipcpp::BackendPreference::WebGPU;
   case MLIPCPP_BACKEND_AUTO:
   default:
     return mlipcpp::BackendPreference::Auto;
@@ -143,9 +145,13 @@ const char *mlipcpp_version(void) { return "0.1.0"; }
 void mlipcpp_set_backend(mlipcpp_backend_t backend) {
   std::lock_guard<std::mutex> lock(g_backend_mutex);
   auto pref = to_backend_preference(backend);
-  if (g_backend_provider && g_backend_provider->preference() != pref) {
-    // Recreate backend with new preference
-    g_backend_provider = mlipcpp::BackendProvider::create(pref);
+  if (g_backend_preference != pref) {
+    // Drop the cached provider so it's recreated lazily on next use.
+    // Deferring creation keeps set_backend nothrow — if the requested
+    // backend turns out to be unavailable, the error surfaces from
+    // mlipcpp_model_load() where it can be reported through the
+    // mlipcpp_error_t return channel.
+    g_backend_provider.reset();
   }
   g_backend_preference = pref;
 }
@@ -153,6 +159,19 @@ void mlipcpp_set_backend(mlipcpp_backend_t backend) {
 const char *mlipcpp_get_backend_name(void) {
   auto backend = get_global_backend();
   return backend->name().c_str();
+}
+
+bool mlipcpp_backend_is_gpu(void) {
+  try {
+    auto backend = get_global_backend();
+    return backend->is_gpu();
+  } catch (...) {
+    return false;
+  }
+}
+
+bool mlipcpp_is_backend_available(mlipcpp_backend_t backend) {
+  return mlipcpp::is_backend_available(to_backend_preference(backend));
 }
 
 void mlipcpp_suppress_logging(void) {
@@ -289,8 +308,17 @@ mlipcpp_error_t mlipcpp_model_load(mlipcpp_model_t model, const char *path) {
       model->model = std::move(pet_model);
     } else if (arch == "pet-graph") {
       auto graph_model = std::make_unique<mlipcpp::runtime::GraphModel>();
-      graph_model->set_backend_preference(
-          to_backend_preference(model->options.backend));
+      // Per-model options.backend wins. If it's Auto (the default) we
+      // fall through to whatever mlipcpp_set_backend() last set, so a
+      // prior set_backend(CUDA) isn't silently ignored by a
+      // mlipcpp_model_create(NULL) call — which is what the PET branch
+      // already does via get_global_backend().
+      auto graph_pref = to_backend_preference(model->options.backend);
+      if (graph_pref == mlipcpp::BackendPreference::Auto) {
+        std::lock_guard<std::mutex> lock(g_backend_mutex);
+        graph_pref = g_backend_preference;
+      }
+      graph_model->set_backend_preference(graph_pref);
 
       if (!graph_model->load_from_gguf(path)) {
         set_error(std::string("Failed to load graph model from: ") + path);
@@ -306,6 +334,9 @@ mlipcpp_error_t mlipcpp_model_load(mlipcpp_model_t model, const char *path) {
     model->weights_loaded = true;
     clear_error();
     return MLIPCPP_OK;
+  } catch (const mlipcpp::BackendUnavailableError &e) {
+    set_error(e.what());
+    return MLIPCPP_ERROR_BACKEND;
   } catch (const std::exception &e) {
     set_error(std::string("Error loading model: ") + e.what());
     return MLIPCPP_ERROR_IO;

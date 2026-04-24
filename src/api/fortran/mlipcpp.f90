@@ -47,12 +47,15 @@ module mlipcpp
     public :: MLIPCPP_BACKEND_VULKAN
     public :: MLIPCPP_BACKEND_SYCL
     public :: MLIPCPP_BACKEND_CANN
+    public :: MLIPCPP_BACKEND_WEBGPU
 
     ! Public procedures
     public :: mlipcpp_version
     public :: mlipcpp_error_string
     public :: mlipcpp_set_backend
     public :: mlipcpp_get_backend_name
+    public :: mlipcpp_backend_is_gpu
+    public :: mlipcpp_is_backend_available
     public :: mlipcpp_suppress_logging
 
     ! Error codes
@@ -77,6 +80,7 @@ module mlipcpp
     integer(c_int), parameter :: MLIPCPP_BACKEND_VULKAN = 5
     integer(c_int), parameter :: MLIPCPP_BACKEND_SYCL = 6
     integer(c_int), parameter :: MLIPCPP_BACKEND_CANN = 7
+    integer(c_int), parameter :: MLIPCPP_BACKEND_WEBGPU = 8
 
     !> Model options
     type, bind(c) :: mlipcpp_options
@@ -133,6 +137,17 @@ module mlipcpp
         function c_mlipcpp_get_backend_name() bind(c, name='mlipcpp_get_backend_name')
             import :: c_ptr
             type(c_ptr) :: c_mlipcpp_get_backend_name
+        end function
+
+        function c_mlipcpp_backend_is_gpu() bind(c, name='mlipcpp_backend_is_gpu')
+            import :: c_bool
+            logical(c_bool) :: c_mlipcpp_backend_is_gpu
+        end function
+
+        function c_mlipcpp_is_backend_available(backend) bind(c, name='mlipcpp_is_backend_available')
+            import :: c_bool, c_int
+            integer(c_int), value :: backend
+            logical(c_bool) :: c_mlipcpp_is_backend_available
         end function
 
         subroutine c_mlipcpp_suppress_logging() bind(c, name='mlipcpp_suppress_logging')
@@ -279,6 +294,19 @@ contains
         type(c_ptr) :: cptr
         cptr = c_mlipcpp_get_backend_name()
         name = c_to_f_string(cptr)
+    end function
+
+    !> True if the currently active backend is a GPU device
+    function mlipcpp_backend_is_gpu() result(is_gpu)
+        logical :: is_gpu
+        is_gpu = logical(c_mlipcpp_backend_is_gpu())
+    end function
+
+    !> True if `backend` is compiled in and has a device available on this host
+    function mlipcpp_is_backend_available(backend) result(avail)
+        integer(c_int), intent(in) :: backend
+        logical :: avail
+        avail = logical(c_mlipcpp_is_backend_available(backend))
     end function
 
     !> Suppress verbose logging from mlipcpp and GGML
