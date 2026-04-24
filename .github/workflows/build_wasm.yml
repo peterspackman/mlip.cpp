@@ -143,7 +143,21 @@ jobs:
             echo "should_publish=false" >> $GITHUB_OUTPUT
           fi
 
+      # setup-node writes an .npmrc with `_authToken=${NODE_AUTH_TOKEN}` when
+      # `registry-url` is set. With no real token that still makes npm attempt
+      # token-auth first and fail with a confusing 404 before the OIDC exchange
+      # can happen. Strip the auth line so `npm publish --provenance` falls
+      # through to trusted-publisher OIDC cleanly.
+      - name: Strip token line from setup-node npmrc (force OIDC)
+        if: steps.version.outputs.should_publish == 'true'
+        run: |
+          if [ -n "$NPM_CONFIG_USERCONFIG" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+            sed -i '/_authToken=/d' "$NPM_CONFIG_USERCONFIG"
+          fi
+
       - name: Publish to npm
         if: steps.version.outputs.should_publish == 'true'
         working-directory: packages/mlip.js
+        env:
+          NODE_AUTH_TOKEN: ""
         run: npm publish --provenance --access public --ignore-scripts
