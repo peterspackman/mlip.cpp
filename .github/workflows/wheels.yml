@@ -1,0 +1,144 @@
+name: Python Wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - 'python/**'
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'tests/test_python_api.py'
+      - '.github/workflows/wheels.yml'
+  workflow_dispatch:
+
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm_cache
+
+jobs:
+  build_wheels:
+    name: Wheel · ${{ matrix.os }} · ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache CPM packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-wheels-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cpm-wheels-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+          # Forward the CPM cache to the manylinux container; macOS runs on host.
+          CIBW_ENVIRONMENT_LINUX: CPM_SOURCE_CACHE=/host${{ env.CPM_SOURCE_CACHE }}
+          CIBW_ENVIRONMENT_MACOS: CPM_SOURCE_CACHE=${{ env.CPM_SOURCE_CACHE }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  test_wheel:
+    name: Python integration tests
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: '3.12'
+
+      - name: Download linux wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-x86_64
+          path: wheelhouse
+
+      - name: Install wheel + test deps
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python wheelhouse/*.whl
+          uv pip install --python .venv/bin/python pytest ase
+
+      - name: Fetch reference GGUF from HuggingFace
+        run: |
+          mkdir -p gguf
+          curl -fL --retry 3 \
+            -o gguf/pet-auto.gguf \
+            https://huggingface.co/peterspackman/mlip-gguf/resolve/main/pet-mad-xs.gguf
+
+      - name: Run Python tests
+        run: .venv/bin/pytest tests/test_python_api.py -v
+
+  build_sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - name: Verify sdist installs from source
+        run: |
+          uv venv .venv-sdist
+          uv pip install --python .venv-sdist/bin/python dist/*.tar.gz
+          .venv-sdist/bin/python -c "import mlipcpp; print(mlipcpp.version())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish_pypi:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist, test_wheel]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mlipcpp
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

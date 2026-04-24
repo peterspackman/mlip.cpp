@@ -2,11 +2,17 @@
 # Example programs
 # =============================================================================
 
-# Internal examples (use private headers, need ggml and fmt)
-add_executable(simple_inference simple_inference.cpp)
-target_link_libraries(simple_inference PRIVATE mlipcpp ggml fmt::fmt)
-target_include_directories(simple_inference PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# Legacy example kept behind an off-by-default flag. It pokes at private
+# model internals from the pre-graph-interpreter era and isn't something
+# downstream users should build against — prefer cpp_api_test / graph_inference.
+option(MLIPCPP_BUILD_LEGACY_EXAMPLES "Build deprecated pre-graph-interpreter examples (simple_inference)" OFF)
+if(MLIPCPP_BUILD_LEGACY_EXAMPLES)
+    add_executable(simple_inference simple_inference.cpp)
+    target_link_libraries(simple_inference PRIVATE mlipcpp ggml fmt::fmt)
+    target_include_directories(simple_inference PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 
+# Internal examples (use private headers, need ggml and fmt)
 add_executable(backend_benchmark backend_benchmark.cpp)
 target_link_libraries(backend_benchmark PRIVATE mlipcpp ggml fmt::fmt)
 target_include_directories(backend_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/src)

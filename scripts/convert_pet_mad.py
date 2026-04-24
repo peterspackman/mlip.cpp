@@ -318,7 +318,7 @@ def main():
 
     convert_pet_to_gguf(model, hypers, args.output, version=args.version)
 
-    print(f"\nUsage: ./build/bin/simple_inference {args.output} structure.xyz")
+    print(f"\nUsage: ./build/bin/graph_inference {args.output} structure.xyz")
 
 
 if __name__ == "__main__":

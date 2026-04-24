@@ -7,17 +7,18 @@ name = "mlipcpp"
 version = "0.1.0"
 description = "Fast C++ implementation of Machine Learning Interatomic Potentials"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Peter Spackman", email = "peterspackman@fastmail.com" },
 ]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Programming Language :: C++",
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics",
 ]
+license = { file = "LICENSE" }
 dependencies = ["numpy >=1.24.0"]
 
 [project.optional-dependencies]
@@ -39,9 +40,12 @@ MLIPCPP_BUILD_EXAMPLES = "OFF"
 MLIPCPP_BUILD_TESTS = "OFF"
 
 [tool.cibuildwheel]
+# One stable-ABI wheel per platform (cp312-abi3 is forward compatible with 3.12+).
+build = ["cp312-*"]
+skip = ["*musllinux*", "pp*"]
 build-verbosity = 1
-skip = ["cp38-*", "cp39-*", "pp*", "*musllinux*"]
-archs = ["auto64"]
+build-frontend = "build[uv]"
+test-command = 'python -c "import mlipcpp, numpy; print(\"mlipcpp\", mlipcpp.version())"'
 
 [tool.cibuildwheel.macos.environment]
 MACOSX_DEPLOYMENT_TARGET = "11.0"

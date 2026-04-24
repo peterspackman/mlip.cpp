@@ -96,13 +96,13 @@ cmake --build . -j
 
 ```bash
 # Energy only
-./build/bin/simple_inference gguf/pet-mad-s.gguf structure.xyz
+./build/bin/graph_inference gguf/pet-mad-s.gguf structure.xyz
 
 # With forces
-./build/bin/simple_inference gguf/pet-mad-s.gguf structure.xyz --forces
+./build/bin/graph_inference gguf/pet-mad-s.gguf structure.xyz --forces
 
 # With forces and stress (periodic systems)
-./build/bin/simple_inference gguf/pet-mad-s.gguf structure.xyz --forces --stress
+./build/bin/graph_inference gguf/pet-mad-s.gguf structure.xyz --forces --stress
 ```
 
 ## API
