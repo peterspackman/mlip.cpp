@@ -75,10 +75,13 @@ class TestPredictorAPI:
         positions, atomic_numbers = read_xyz(water_path)
         result = auto_model.predict(positions, atomic_numbers, compute_forces=False)
 
-        # Reference from manual PET model (test_auto_vs_manual.cpp)
-        WATER_ENERGY_REF = -14.380176
-        np.testing.assert_allclose(result.energy, WATER_ENERGY_REF, atol=0.01,
-                                   err_msg=f"Water energy {result.energy} eV doesn't match reference {WATER_ENERGY_REF} eV")
+        # Reference for pet-mad-xs.gguf (the model CI fetches from HuggingFace).
+        # The full pet-mad model gives -14.38 eV; the xs variant -15.29 eV.
+        # Tolerance accommodates small backend-to-backend numerical drift.
+        WATER_ENERGY_REF = -15.293853
+        np.testing.assert_allclose(
+            result.energy, WATER_ENERGY_REF, atol=0.05,
+            err_msg=f"Water energy {result.energy} eV doesn't match reference {WATER_ENERGY_REF} eV")
 
     def test_water_forces(self, auto_model):
         water_path = geometry_path("water.xyz")
