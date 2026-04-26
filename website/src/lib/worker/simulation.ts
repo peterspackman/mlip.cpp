@@ -7,7 +7,7 @@
 
 export type Backend = 'auto' | 'cpu' | 'webgpu'
 export type Thermostat = 'csvr' | 'none'
-export type Optimizer = 'lbfgs' | 'fire'
+export type Optimizer = 'lbfgs' | 'fire' | 'cg'
 
 export interface MDStep {
   positions: Float64Array
@@ -213,8 +213,8 @@ export class Simulation {
     await this.request('setParameters', params)
   }
 
-  start(stepsPerFrame = 1, mode: 'md' | 'optimize' = 'md', rattleAmount = 0): void {
-    this.worker.postMessage({ type: 'start', stepsPerFrame, mode, rattleAmount })
+  start(stepsPerFrame = 1, mode: 'md' | 'optimize' = 'md', rattleAmount = 0, frozen?: number[]): void {
+    this.worker.postMessage({ type: 'start', stepsPerFrame, mode, rattleAmount, frozen })
   }
 
   stop(): void {

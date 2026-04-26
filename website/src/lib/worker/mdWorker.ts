@@ -49,13 +49,24 @@ interface WorkerState {
   thermostatTau: number  // fs
   useConservativeForces: boolean  // false = NC forces (faster, non-conservative)
   initialTotalEnergy: number | null  // baseline for NVE drift diagnostic
-  optimizer: 'lbfgs' | 'fire'
+  optimizer: 'lbfgs' | 'fire' | 'cg'
   lbfgs: {
     history: { s: Float64Array; y: Float64Array; rho: number }[]
     currentE: number
     currentG: Float64Array | null
     step: number
   } | null
+  cg: {
+    currentE: number
+    currentG: Float64Array | null  // gradient = -forces
+    dir: Float64Array | null       // current search direction
+    step: number
+    /** Counts steps since the last steepest-descent restart. */
+    sinceRestart: number
+  } | null
+  /** Atoms whose forces are zeroed during optimization (or velocities
+   *  zero-initialized in FIRE). null = no constraints. Set per `start`. */
+  frozenAtoms: Set<number> | null
 }
 
 const state: WorkerState = {
@@ -91,6 +102,23 @@ const state: WorkerState = {
   initialTotalEnergy: null,
   optimizer: 'lbfgs',
   lbfgs: null,
+  cg: null,
+  frozenAtoms: null,
+}
+
+/** Zero out gradient (or force) entries for atoms the user has frozen.
+ *  Called after every gradient compute in CG/L-BFGS, and after each force
+ *  evaluation in FIRE. Effect: frozen atoms see zero force → never move. */
+function maskFrozen(g: Float64Array): void {
+  if (!state.frozenAtoms) return
+  for (const i of state.frozenAtoms) {
+    const k = i * 3
+    if (k + 2 < g.length) {
+      g[k] = 0
+      g[k + 1] = 0
+      g[k + 2] = 0
+    }
+  }
 }
 
 // Standard atomic weights in amu (IUPAC 2021). Covers rows 1-5 plus the common
@@ -473,13 +501,22 @@ async function handleSetBackend(data: { backend?: string }): Promise<void> {
 }
 
 async function handleSetSystem(data: { xyz: string }): Promise<void> {
+  // Module instantiation is normally deferred to loadModel (where the backend
+  // is known). Structure-only flows (build / edit a molecule before picking a
+  // model) hit this path with no module yet — instantiate the CPU variant on
+  // demand so setSystem doesn't fail. A later loadModel with a different
+  // backend will swap modules via ensureModuleForBackend.
   if (!state.module) {
-    self.postMessage({ type: 'error', message: 'Module not initialized' })
-    return
+    try {
+      await ensureModuleForBackend('cpu')
+    } catch (err: any) {
+      self.postMessage({ type: 'error', message: `Failed to initialize WASM: ${err.message}` })
+      return
+    }
   }
 
   try {
-    state.system = await state.module.AtomicSystem.fromXyzString(data.xyz)
+    state.system = await state.module!.AtomicSystem.fromXyzString(data.xyz)
     state.numAtoms = await state.system.numAtoms()
     state.isPeriodic = await state.system.isPeriodic()
     state.positions = new Float64Array(await state.system.getPositions())
@@ -510,6 +547,9 @@ async function handleSetSystem(data: { xyz: string }): Promise<void> {
     state.fireDt = 0.1
     state.optStep = 0
     state.cellVelocities = null
+
+    // Constraints reset: a fresh structure has no idea what was frozen.
+    state.frozenAtoms = null
 
     self.postMessage({
       type: 'systemSet',
@@ -578,7 +618,7 @@ function handleSetParameters(data: {
   thermostat?: 'csvr' | 'none',
   thermostatTau?: number,
   useConservativeForces?: boolean,
-  optimizer?: 'lbfgs' | 'fire',
+  optimizer?: 'lbfgs' | 'fire' | 'cg',
 }): void {
   if (data.dt !== undefined) state.dt = data.dt
   if (data.temperature !== undefined) state.temperature = data.temperature
@@ -716,6 +756,7 @@ async function runLBFGSStep(): Promise<boolean> {
     lb.currentE = result.energy
     lb.currentG = new Float64Array(n3)
     for (let i = 0; i < n3; i++) lb.currentG[i] = -result.forces[i]
+    maskFrozen(lb.currentG)
   }
 
   // Convergence check on atomic forces.
@@ -723,13 +764,13 @@ async function runLBFGSStep(): Promise<boolean> {
   for (let i = 0; i < n3; i++) forcesForCheck[i] = -lb.currentG[i]
   const maxF = calculateMaxForce(forcesForCheck, nAtoms)
   if (maxF < state.forceThreshold) {
-    postOptStep(lb, nAtoms, true)
+    postOptStep(lb.currentE, lb.currentG!, lb.step, nAtoms, true)
     return true
   }
 
   // Give up after maxOptSteps iterations even if not converged.
   if (lb.step >= state.maxOptSteps) {
-    postOptStep(lb, nAtoms, false)
+    postOptStep(lb.currentE, lb.currentG!, lb.step, nAtoms, false)
     return true
   }
 
@@ -783,6 +824,7 @@ async function runLBFGSStep(): Promise<boolean> {
 
   const newG = new Float64Array(n3)
   for (let i = 0; i < n3; i++) newG[i] = -newForces[i]
+  maskFrozen(newG)
 
   // Update curvature history (skip if s·y is tiny or negative — indicates
   // non-convexity in this neighbourhood).
@@ -806,18 +848,20 @@ async function runLBFGSStep(): Promise<boolean> {
   lb.step++
   state.optStep = lb.step
 
-  postOptStep(lb, nAtoms, false)
+  postOptStep(lb.currentE, lb.currentG!, lb.step, nAtoms, false)
   return false
 }
 
 function postOptStep(
-  lb: NonNullable<WorkerState['lbfgs']>,
+  energy: number,
+  currentG: Float64Array,
+  step: number,
   nAtoms: number,
   converged: boolean,
 ): void {
   if (!state.positions) return
-  const forcesForReport = new Float64Array(lb.currentG!.length)
-  for (let i = 0; i < lb.currentG!.length; i++) forcesForReport[i] = -lb.currentG![i]
+  const forcesForReport = new Float64Array(currentG.length)
+  for (let i = 0; i < currentG.length; i++) forcesForReport[i] = -currentG[i]
   const maxF = calculateMaxForce(forcesForReport, nAtoms)
   const posOut = new Float64Array(state.positions)
   const cellOut = state.cell ? new Float64Array(state.cell) : null
@@ -827,12 +871,181 @@ function postOptStep(
     type: 'optStep',
     positions: posOut,
     cell: cellOut,
-    energy: lb.currentE,
+    energy,
     maxForce: maxF,
     maxStress: 0,
-    step: lb.step,
+    step,
     converged,
   }, transfers)
+}
+
+// ========== Polak–Ribière+ Conjugate Gradient ==========
+//
+// Builds a search direction d_{k+1} = -g_{k+1} + β · d_k with
+//   β = max(0, (g_{k+1} - g_k) · g_{k+1} / (g_k · g_k))   (PR+ — automatic restart)
+// Backtracking Armijo line search along d. Restart to steepest descent on
+// non-descent direction or every 3·N steps. Cheaper per step than L-BFGS,
+// often a better fit when you're close-ish to a minimum after manual edits.
+const CG_MAX_STEP = 0.2  // Å; cap inf-norm of the trial step
+const CG_LS_MAX = 5
+const CG_ARMIJO = 1e-4
+
+async function resetCG(): Promise<void> {
+  state.cg = {
+    currentE: 0,
+    currentG: null,
+    dir: null,
+    step: 0,
+    sinceRestart: 0,
+  }
+}
+
+async function runCGStep(): Promise<boolean> {
+  if (!state.model || !state.positions || !state.atomicNumbers || !state.cg) return true
+
+  const cg = state.cg
+  const n3 = state.positions.length
+  const nAtoms = state.atomicNumbers.length
+
+  // First step: get E, g at the current position; initial direction = -g.
+  if (!cg.currentG) {
+    const result = await predictAtPositions(state.positions)
+    cg.currentE = result.energy
+    cg.currentG = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) cg.currentG[i] = -result.forces[i]
+    maskFrozen(cg.currentG)
+    cg.dir = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) cg.dir[i] = -cg.currentG[i]
+  }
+
+  // Convergence check.
+  const forcesForCheck = new Float64Array(n3)
+  for (let i = 0; i < n3; i++) forcesForCheck[i] = -cg.currentG[i]
+  const maxF = calculateMaxForce(forcesForCheck, nAtoms)
+  if (maxF < state.forceThreshold) {
+    postOptStep(cg.currentE, cg.currentG, cg.step, nAtoms, true)
+    return true
+  }
+
+  if (cg.step >= state.maxOptSteps) {
+    postOptStep(cg.currentE, cg.currentG, cg.step, nAtoms, false)
+    return true
+  }
+
+  let d = cg.dir!
+
+  // Periodic restart so accumulated direction noise doesn't pile up.
+  if (cg.sinceRestart >= 3 * nAtoms) {
+    d = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) d[i] = -cg.currentG[i]
+    cg.dir = d
+    cg.sinceRestart = 0
+  }
+
+  // Force a descent direction; if not, restart to steepest descent.
+  let dg = 0
+  for (let i = 0; i < n3; i++) dg += d[i] * cg.currentG[i]
+  if (dg >= 0) {
+    d = new Float64Array(n3)
+    for (let i = 0; i < n3; i++) d[i] = -cg.currentG[i]
+    cg.dir = d
+    cg.sinceRestart = 0
+    dg = 0
+    for (let i = 0; i < n3; i++) dg += d[i] * cg.currentG[i]
+  }
+
+  // Cap the trial step's inf-norm.
+  const dMax = maxInfNorm(d)
+  let scale = 1
+  if (dMax > CG_MAX_STEP) {
+    scale = CG_MAX_STEP / dMax
+  }
+
+  // Armijo backtracking line search along d. Track the lowest-energy trial
+  // separately so that if no alpha satisfies Armijo we can still salvage
+  // a strict decrease — accepting an increase here is the classic source
+  // of CG oscillation, since the next step then runs steepest descent from
+  // the inflated energy and bounces back.
+  let alpha = scale
+  const trial = new Float64Array(n3)
+  let newE = Infinity
+  let newForces: ArrayLike<number> | null = null
+  let bestE = Infinity
+  let bestAlpha = 0
+  let bestForces: ArrayLike<number> | null = null
+  let accepted = false
+  for (let ls = 0; ls < CG_LS_MAX; ls++) {
+    for (let i = 0; i < n3; i++) trial[i] = state.positions[i] + alpha * d[i]
+    const r = await predictAtPositions(trial)
+    newE = r.energy
+    newForces = r.forces
+    if (newE < bestE) {
+      bestE = newE
+      bestAlpha = alpha
+      bestForces = newForces
+    }
+    if (newE <= cg.currentE + CG_ARMIJO * alpha * dg) {
+      accepted = true
+      break
+    }
+    alpha *= 0.5
+  }
+
+  // Armijo never satisfied. Fall back to the lowest-energy alpha if it
+  // actually beat the current point; otherwise refuse the step and restart
+  // with steepest descent next iteration. Refusing prevents an uphill move
+  // from poisoning the next direction.
+  if (!accepted) {
+    if (bestForces !== null && bestE < cg.currentE) {
+      alpha = bestAlpha
+      newE = bestE
+      newForces = bestForces
+      for (let i = 0; i < n3; i++) trial[i] = state.positions[i] + alpha * d[i]
+    } else {
+      const sd = new Float64Array(n3)
+      for (let i = 0; i < n3; i++) sd[i] = -cg.currentG[i]
+      cg.dir = sd
+      cg.sinceRestart = 0
+      cg.step++
+      state.optStep = cg.step
+      postOptStep(cg.currentE, cg.currentG, cg.step, nAtoms, false)
+      return false
+    }
+  }
+
+  if (!newForces) return true
+
+  const newG = new Float64Array(n3)
+  for (let i = 0; i < n3; i++) newG[i] = -newForces[i]
+  maskFrozen(newG)
+
+  // Polak–Ribière+ β.
+  let gOldDot = 0
+  let prDot = 0
+  for (let i = 0; i < n3; i++) {
+    gOldDot += cg.currentG[i] * cg.currentG[i]
+    prDot += (newG[i] - cg.currentG[i]) * newG[i]
+  }
+  let beta = 0
+  if (gOldDot > 1e-20) {
+    beta = prDot / gOldDot
+    if (beta < 0) beta = 0  // PR+ — automatic restart on non-monotone steps
+  }
+  if (!accepted) beta = 0  // line-search fallback — steepest descent next
+
+  const nextDir = new Float64Array(n3)
+  for (let i = 0; i < n3; i++) nextDir[i] = -newG[i] + beta * d[i]
+
+  state.positions.set(trial)
+  cg.currentE = newE
+  cg.currentG = newG
+  cg.dir = nextDir
+  cg.step++
+  cg.sinceRestart++
+  state.optStep = cg.step
+
+  postOptStep(cg.currentE, cg.currentG, cg.step, nAtoms, false)
+  return false
 }
 
 // FIRE optimizer constants
@@ -989,6 +1202,7 @@ async function runFIREStep(): Promise<boolean> {
       )
       const result = await state.model.predictWithOptions(state.system, true)
       fireForces = new Float64Array(result.forces)
+      maskFrozen(fireForces)
       fireStress = result.stress ? new Float64Array(result.stress) : null
       if (optimizingCell && fireStress && state.cell) {
         const volume = calculateVolume(state.cell)
@@ -1156,6 +1370,7 @@ async function runFIREStep(): Promise<boolean> {
     }
 
     // Cache new forces for next step
+    maskFrozen(forcesNew)
     fireForces = forcesNew
     fireStress = stressNew
 
@@ -1314,13 +1529,17 @@ function rattlePositions(amount: number): void {
   }
 }
 
-async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number }): Promise<void> {
+async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimize', rattleAmount?: number, frozen?: number[] }): Promise<void> {
   if (state.isRunning) return
 
   // Update mode if provided
   if (data.mode !== undefined) {
     state.mode = data.mode
   }
+
+  // Apply optimization constraints (atoms whose forces will be zeroed during
+  // this run). Cleared automatically on the next setSystem.
+  state.frozenAtoms = (data.frozen && data.frozen.length > 0) ? new Set(data.frozen) : null
 
   state.isRunning = true
 
@@ -1329,18 +1548,16 @@ async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimi
     // dynamics are coupled to atoms and easier to reason about with a
     // velocity-based scheme. Otherwise respect the user's pick.
     const forceFIRE = state.isPeriodic && state.optimizeCell
-    const useLBFGS = !forceFIRE && state.optimizer === 'lbfgs'
+    const chosen: 'lbfgs' | 'fire' | 'cg' = forceFIRE ? 'fire' : state.optimizer
     self.postMessage({
       type: 'optimizerStarted',
-      optimizer: useLBFGS ? 'lbfgs' : 'fire',
+      optimizer: chosen,
       forced: forceFIRE,
     })
 
-    if (useLBFGS) {
-      await resetLBFGS()
-    } else {
-      await resetFIRE()
-    }
+    if (chosen === 'lbfgs')      await resetLBFGS()
+    else if (chosen === 'cg')    await resetCG()
+    else                         await resetFIRE()
 
     // Apply rattle if requested
     if (data.rattleAmount && data.rattleAmount > 0) {
@@ -1348,9 +1565,13 @@ async function handleStart(data: { stepsPerFrame?: number, mode?: 'md' | 'optimi
     }
 
     // Run optimization steps as fast as possible
+    const stepFn =
+      chosen === 'lbfgs' ? runLBFGSStep :
+      chosen === 'cg'    ? runCGStep    :
+                           runFIREStep
     const runOptLoop = async () => {
       if (!state.isRunning) return
-      const done = useLBFGS ? await runLBFGSStep() : await runFIREStep()
+      const done = await stepFn()
       if (done) {
         handleStop()
       } else {
