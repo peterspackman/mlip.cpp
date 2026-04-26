@@ -15,7 +15,9 @@
   let pubchemError = $state('')
   let editorOpen = $state(false)
 
-  const ready = $derived(store.modelStatus === 'ready')
+  // Structure load only needs the WASM worker, not a model — editing geometry
+  // doesn't require energies. Run / optimize controls keep their own model gate.
+  const ready = $derived(store.wasmReady)
   const xyzSummary = $derived(summarise(customXyz))
 
   function summarise(xyz: string): string {
@@ -29,7 +31,7 @@
   async function loadStructure() {
     if (!customXyz.trim()) return
     const lattice = parseLattice(customXyz)
-    await store.setStructure(customXyz, lattice)
+    await store.loadStructure(customXyz, lattice)
   }
 
   function pickSample(name: string) {

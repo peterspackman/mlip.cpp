@@ -17,7 +17,8 @@
       bind:value={store.optimizer}
       options={[
         { value: 'lbfgs', label: 'L-BFGS' },
-        { value: 'fire', label: 'FIRE' },
+        { value: 'cg',    label: 'CG' },
+        { value: 'fire',  label: 'FIRE' },
       ]}
     />
   </label>
@@ -25,10 +26,12 @@
     {#if cellForced}
       Periodic cell optimization uses FIRE regardless of this selection.
     {:else if store.activeOptimizer}
-      Running <strong>{store.activeOptimizer === 'lbfgs' ? 'L-BFGS' : 'FIRE'}</strong>
+      Running <strong>{store.activeOptimizer === 'lbfgs' ? 'L-BFGS' : store.activeOptimizer === 'cg' ? 'CG' : 'FIRE'}</strong>
       {#if store.optimizerForced}(forced){/if}
     {:else if store.optimizer === 'lbfgs'}
       L-BFGS with max step 0.2 Å, Armijo backtracking line search.
+    {:else if store.optimizer === 'cg'}
+      Polak–Ribière+ conjugate gradient, Armijo backtracking. Lighter per step than L-BFGS — good cleanup after manual edits.
     {:else}
       FIRE — velocity-based, robust but slower near minima.
     {/if}

@@ -58,9 +58,14 @@ a:hover {
 }
 
 .header {
-  padding: 1.5rem 0;
-  text-align: center;
+  padding: 1.25rem 0 0;
   border-bottom: 1px solid var(--border);
+}
+.header-inner {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
 }
 .header h1 {
   font-size: 2rem;
@@ -71,6 +76,39 @@ a:hover {
   color: var(--text-secondary);
   margin: 0.25rem 0 0;
   font-size: 1rem;
+}
+.tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: -1px;
+}
+.tab {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  color: var(--text-secondary);
+  padding: 0.45rem 1rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  margin-right: -1px;
+}
+.tab:hover {
+  color: var(--text-primary);
+}
+.tab.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--bg-primary);
+}
+@media (max-width: 700px) {
+  .header-inner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
 }
 
 .main {
@@ -165,4 +203,53 @@ a:hover {
   color: var(--text-secondary);
   font-size: 0.85rem;
   border-top: 1px solid var(--border);
+}
+
+/* Window-level drag overlay (file drops anywhere on the page). */
+.app-dropzone {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 17, 24, 0.72);
+  backdrop-filter: blur(4px);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  animation: app-dropzone-fade 120ms ease-out;
+}
+@keyframes app-dropzone-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.app-dropzone-card {
+  padding: 2rem 2.5rem;
+  background: var(--bg-secondary);
+  border: 2px dashed var(--accent, #ff9900);
+  border-radius: 12px;
+  color: var(--text-primary);
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.app-dropzone-icon {
+  font-size: 2.4rem;
+  line-height: 1;
+  color: var(--accent, #ff9900);
+  margin-bottom: 0.5rem;
+}
+.app-dropzone-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+}
+.app-dropzone-sub {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+.app-dropzone-sub code {
+  background: var(--bg-primary);
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--text-primary);
 }
