@@ -3,8 +3,12 @@
   import type { SimulationStore } from '../lib/stores/simulation.svelte'
   const store = getContext<SimulationStore>('store')
   let isDragging = $state(false)
+  /** When a model is already loaded, hide the loader UI behind a "change"
+   *  toggle — most of the time the user isn't swapping models. */
+  let showLoaders = $state(false)
 
   async function loadBuffer(buffer: ArrayBuffer, source: string) {
+    showLoaders = false
     await store.loadModel(buffer, source)
   }
 
@@ -20,13 +24,9 @@
   async function loadBundled() {
     const url = `${import.meta.env.BASE_URL}pet-mad-xs.gguf`
     try {
-      // no-store bypasses the HTTP cache — we want the freshly-built file,
-      // not a stale cached copy from a previous convert_models.py run.
       const res = await fetch(url, { cache: 'no-store' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const fetched = await res.arrayBuffer()
-      // Sanity-check the GGUF magic — catches caching / transform layers
-      // that might silently hand back a truncated or compressed payload.
       const magic = new Uint8Array(fetched, 0, 4)
       const isGguf =
         magic[0] === 0x47 && magic[1] === 0x47 && magic[2] === 0x55 && magic[3] === 0x46
@@ -37,9 +37,6 @@
             .join(' ')}) — likely a cache/transform issue`,
         )
       }
-      // Fresh standalone ArrayBuffer so the transfer into the worker is
-      // guaranteed clean (Response.arrayBuffer() can return a buffer with
-      // different backing semantics than File.arrayBuffer()).
       const buffer = fetched.slice(0)
       await loadBuffer(buffer, 'pet-mad-xs.gguf')
     } catch (err: any) {
@@ -61,65 +58,121 @@
     if (f) handleFile(f)
     target.value = ''
   }
+
+  let isLoading = $derived(store.modelStatus === 'loading')
+  let isReady   = $derived(store.modelStatus === 'ready')
+  let isError   = $derived(store.modelStatus === 'error')
+  // When we have a model, default-collapsed; when none, default-expanded.
+  let loadersVisible = $derived(showLoaders || (!isReady && !isLoading))
+
+  /** Best-guess WebGPU availability. 'available' = navigator.gpu present and
+   *  the browser actually exposes a real adapter. 'unreliable' = some Firefox /
+   *  Safari builds expose navigator.gpu via flags but in practice fall over
+   *  inside Web Workers (we run WASM in a worker). 'unavailable' = no API. */
+  type GpuStatus = 'available' | 'unreliable' | 'unavailable'
+  function detectGpu(): GpuStatus {
+    if (typeof navigator === 'undefined') return 'available'
+    if (!('gpu' in navigator)) return 'unavailable'
+    const ua = navigator.userAgent
+    if (/Firefox/i.test(ua)) return 'unreliable'
+    const isSafari = /Safari/i.test(ua) && !/Chrome|Chromium|Android/i.test(ua)
+    if (isSafari) return 'unreliable'
+    return 'available'
+  }
+  const gpuStatus: GpuStatus = detectGpu()
 </script>
 
 <section class="panel-section">
   <h3>Model</h3>
 
-  <label class="control-label">
-    Backend
+  {#if isReady}
+    <div class="status ready">
+      <span class="check">✓</span>
+      <div class="status-text">
+        <div class="line-1">{store.modelSource}</div>
+        <div class="line-2">{store.modelType} · {store.activeBackend || '?'} backend</div>
+      </div>
+      <button class="ghost-link"
+        onclick={() => (showLoaders = !showLoaders)}
+        disabled={isLoading || store.isRunning}
+      >{showLoaders ? 'cancel' : 'change'}</button>
+    </div>
+  {:else if isLoading}
+    <div class="status loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <span>Loading {store.modelSource}…</span>
+    </div>
+  {:else if isError}
+    <div class="status error">
+      <span class="x">!</span>
+      <span>{store.modelError}</span>
+    </div>
+  {:else}
+    <p class="why">
+      A model predicts energies and forces — load one to enable run / optimize.
+    </p>
+  {/if}
+
+  {#if loadersVisible}
+    <button
+      class="primary"
+      onclick={loadBundled}
+      disabled={isLoading || store.isRunning}
+    >
+      <span class="primary-icon">⬇</span>
+      <span class="primary-body">
+        <span class="primary-title">Use bundled model</span>
+        <span class="primary-sub">PET-MAD xs · ~16 MB</span>
+      </span>
+    </button>
+
+    <div class="or"><span>or load your own</span></div>
+
+    <div
+      class="model-drop"
+      class:dragging={isDragging}
+      ondragover={(e) => { e.preventDefault(); isDragging = true }}
+      ondragleave={() => { isDragging = false }}
+      ondrop={onDrop}
+      role="button"
+      tabindex="-1"
+    >
+      <span class="drop-text">
+        Drop a <code>.gguf</code> file
+      </span>
+      <label class="browse-link">
+        or browse…
+        <input type="file" accept=".gguf" style="display:none" onchange={onInput} />
+      </label>
+    </div>
+  {/if}
+
+  <label class="control-label" class:dim={!isReady && !loadersVisible}>
+    <span>Backend</span>
     <select
       bind:value={store.backendChoice}
-      onchange={() => { if (store.modelStatus === 'ready') store.switchBackend() }}
-      disabled={store.modelStatus === 'loading' || store.isRunning}
+      onchange={() => { if (isReady) store.switchBackend() }}
+      disabled={isLoading || store.isRunning}
     >
-      <option value="auto">auto</option>
+      <option value="auto">auto{gpuStatus === 'available' ? ' (prefer webgpu)' : ' (cpu)'}</option>
       <option value="cpu">cpu</option>
-      <option value="webgpu">webgpu</option>
+      <option value="webgpu" disabled={gpuStatus === 'unavailable'}>
+        webgpu{gpuStatus !== 'available' ? ' — unsupported here' : ''}
+      </option>
     </select>
   </label>
 
-  <div
-    class="model-drop"
-    class:dragging={isDragging}
-    ondragover={(e) => { e.preventDefault(); isDragging = true }}
-    ondragleave={() => { isDragging = false }}
-    ondrop={onDrop}
-    role="button"
-    tabindex="-1"
-  >
-    <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-      <path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-    <p>
-      Drop a <code>.gguf</code> model here
+  {#if gpuStatus === 'unavailable'}
+    <p class="gpu-note">
+      Your browser doesn't expose WebGPU — calculations will run on CPU.
+      For GPU acceleration, use <strong>Chrome</strong> or <strong>Edge</strong>.
     </p>
-    <label class="browse-link">
-      or browse…
-      <input type="file" accept=".gguf" style="display:none" onchange={onInput} />
-    </label>
-  </div>
-
-  <button
-    class="bundled-link"
-    onclick={loadBundled}
-    disabled={store.modelStatus === 'loading' || store.isRunning}
-    title="Load the bundled small PET-MAD model"
-  >
-    use bundled <code>pet-mad-xs.gguf</code>
-  </button>
-
-  <div class="model-status">
-    {#if store.modelStatus === 'loading'}
-      <span>Loading {store.modelSource}…</span>
-    {:else if store.modelStatus === 'ready'}
-      <span>{store.modelType} · {store.activeBackend || 'backend?'} · {store.modelSource}</span>
-    {:else if store.modelStatus === 'error'}
-      <span class="error">{store.modelError}</span>
-    {:else}
-      <span class="muted">No model loaded</span>
-    {/if}
-  </div>
+  {:else if gpuStatus === 'unreliable'}
+    <p class="gpu-note">
+      WebGPU is flaky in this browser (especially in Web Workers, which we
+      use). Defaulting to CPU. For GPU acceleration, use <strong>Chrome</strong> or <strong>Edge</strong>.
+    </p>
+  {/if}
 </section>
 
 <style>
@@ -128,6 +181,9 @@
     background-color: var(--bg-secondary);
     border-radius: 8px;
     border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
   }
   .panel-section h3 {
     font-size: 0.7rem;
@@ -135,54 +191,167 @@
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    margin-bottom: 0.5rem;
+    margin: 0;
   }
-  .control-label {
+
+  .why {
+    margin: 0;
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.78rem;
+  }
+  .status.ready {
+    background: color-mix(in srgb, var(--success, #4ade80) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--success, #4ade80) 30%, transparent);
+    color: var(--text-primary);
+  }
+  .status.ready .check {
+    color: var(--success, #4ade80);
+    font-weight: 700;
+  }
+  .status-text {
+    flex: 1;
+    min-width: 0;
+    line-height: 1.25;
+  }
+  .status-text .line-1 {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .status-text .line-2 {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+  }
+  .ghost-link {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .ghost-link:hover:not(:disabled) { color: var(--text-primary); }
+  .ghost-link:disabled { opacity: 0.4; cursor: default; }
+
+  .status.loading {
+    color: var(--text-secondary);
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--text-primary);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .status.error {
+    background: color-mix(in srgb, var(--error, #ef4444) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error, #ef4444) 30%, transparent);
+    color: var(--text-primary);
+    align-items: flex-start;
+    line-height: 1.35;
+  }
+  .status.error .x {
+    color: var(--error, #ef4444);
+    font-weight: 800;
+    margin-top: 0.05rem;
+  }
+
+  .primary {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.55rem 0.65rem;
+    border-radius: 6px;
+    background: var(--accent, #ff9900);
+    color: #1a1a1a;
+    border: 1px solid transparent;
+    cursor: pointer;
+    text-align: left;
+    font-family: inherit;
+    transition: transform 80ms ease, filter 120ms ease;
+  }
+  .primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+    transform: translateY(-1px);
+  }
+  .primary:disabled { opacity: 0.5; cursor: default; }
+  .primary-icon {
+    font-size: 1.05rem;
+    line-height: 1;
+  }
+  .primary-body {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-    margin-bottom: 0.5rem;
+    gap: 0.05rem;
+    line-height: 1.2;
   }
+  .primary-title {
+    font-weight: 700;
+    font-size: 0.82rem;
+  }
+  .primary-sub {
+    font-size: 0.66rem;
+    opacity: 0.78;
+  }
+
+  .or {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-secondary);
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .or::before, .or::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
   .model-drop {
-    border: 2px dashed var(--border);
-    border-radius: 8px;
-    padding: 1rem 0.75rem;
+    border: 1.5px dashed var(--border);
+    border-radius: 6px;
+    padding: 0.55rem 0.65rem;
     text-align: center;
     transition: background-color 0.15s, border-color 0.15s, color 0.15s;
-    margin-bottom: 0.4rem;
     display: flex;
-    flex-direction: column;
     align-items: center;
-    gap: 0.25rem;
+    justify-content: center;
+    gap: 0.4rem;
     color: var(--text-secondary);
     cursor: copy;
+    font-size: 0.74rem;
   }
   .model-drop.dragging {
-    background-color: color-mix(in srgb, var(--success) 15%, transparent);
-    border-color: var(--success);
+    background-color: color-mix(in srgb, var(--success, #4ade80) 12%, transparent);
+    border-color: var(--success, #4ade80);
     border-style: solid;
-    color: var(--success);
+    color: var(--success, #4ade80);
   }
-  .drop-icon {
-    width: 28px;
-    height: 28px;
-    opacity: 0.65;
-    transition: opacity 0.15s;
-  }
-  .model-drop.dragging .drop-icon {
-    opacity: 1;
-  }
-  .model-drop p {
-    margin: 0;
-    font-size: 0.8rem;
-  }
+  .drop-text { white-space: nowrap; }
   code {
     background-color: var(--bg-primary);
-    padding: 0.05rem 0.3rem;
+    padding: 0.02rem 0.28rem;
     border-radius: 3px;
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     color: var(--text-primary);
   }
   .browse-link {
@@ -191,51 +360,38 @@
     text-underline-offset: 2px;
     cursor: pointer;
     opacity: 0.8;
-  }
-  .browse-link:hover {
-    opacity: 1;
-  }
-  .bundled-link {
-    align-self: center;
-    padding: 0.2rem 0.4rem;
-    font-size: 0.72rem;
     color: var(--text-secondary);
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    text-decoration: underline;
-    text-underline-offset: 2px;
   }
-  .bundled-link:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  .browse-link:hover { opacity: 1; color: var(--text-primary); }
+
+  .control-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    font-size: 0.74rem;
+    color: var(--text-secondary);
   }
-  .bundled-link:hover:not(:disabled) {
-    color: var(--text-primary);
-  }
-  .bundled-link code {
-    background: transparent;
-    padding: 0;
-    font-size: 0.72rem;
-    color: inherit;
-  }
+  .control-label.dim { opacity: 0.7; }
   select {
-    padding: 0.4rem;
+    padding: 0.25rem 0.4rem;
     border: 1px solid var(--border);
     border-radius: 4px;
     background-color: var(--bg-primary);
     color: var(--text-primary);
-    font-size: 0.85rem;
+    font-size: 0.74rem;
   }
-  .model-status {
-    font-size: 0.75rem;
+  .gpu-note {
+    margin: 0;
+    padding: 0.4rem 0.5rem;
+    background: color-mix(in srgb, var(--accent, #ff9900) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent, #ff9900) 28%, transparent);
+    border-radius: 5px;
+    font-size: 0.7rem;
+    line-height: 1.4;
     color: var(--text-secondary);
-    min-height: 1rem;
   }
-  .model-status .error {
-    color: var(--error);
-  }
-  .model-status .muted {
-    opacity: 0.6;
+  .gpu-note strong {
+    color: var(--text-primary);
   }
 </style>
