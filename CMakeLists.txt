@@ -162,6 +162,14 @@ if(MLIPCPP_USE_BLAS)
     set(GGML_BLAS ON CACHE BOOL "" FORCE)
 endif()
 
+# Default to a portable CPU baseline (no -march=native). Wheels and CI need
+# this — without it ggml bakes the build host's CPU features into the binary
+# and the resulting library SIGILLs on machines with a different (or older)
+# CPU. Users wanting host-tuned builds can pass -DGGML_NATIVE=ON explicitly.
+if(NOT DEFINED CACHE{GGML_NATIVE})
+    set(GGML_NATIVE OFF CACHE BOOL "Build with -march=native (non-portable)")
+endif()
+
 # WASM-specific ggml configuration
 if(EMSCRIPTEN)
     # SINGLE_FILE=ON embeds the .wasm as base64 inside the .js, which blocks
