@@ -96,10 +96,26 @@ if(NOT (EXISTS ${CPM_DOWNLOAD_LOCATION}))
     file(DOWNLOAD
         https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
         ${CPM_DOWNLOAD_LOCATION}
+        STATUS _cpm_download_status
+        TLS_VERIFY ON
     )
+    list(GET _cpm_download_status 0 _cpm_download_code)
+    if(NOT _cpm_download_code EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to download CPM.cmake from "
+            "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake "
+            "(status: ${_cpm_download_status}). Check your network/proxy, then "
+            "delete ${CPM_DOWNLOAD_LOCATION} and re-run cmake.")
+    endif()
 endif()
 
 include(${CPM_DOWNLOAD_LOCATION})
+
+if(NOT COMMAND CPMAddPackage)
+    message(FATAL_ERROR
+        "CPM.cmake at ${CPM_DOWNLOAD_LOCATION} is invalid (CPMAddPackage not defined). "
+        "Delete that file and re-run cmake to redownload.")
+endif()
 
 # ggml (forked version with gradient support)
 # Use MLIPCPP_GGML_SOURCE_DIR to point to a local ggml checkout for development
@@ -168,7 +184,7 @@ else()
     CPMAddPackage(
         NAME ggml
         GITHUB_REPOSITORY peterspackman/ggml
-        GIT_TAG 833b864d
+        GIT_TAG 9be7b7f8
         EXCLUDE_FROM_ALL YES
     )
 endif()

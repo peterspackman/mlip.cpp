@@ -563,6 +563,47 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
       }
 
       result.has_forces = true;
+
+      // Virial stress for periodic systems: σ_ab = (1/V) Σ_edges r_a ⊗ ∂E/∂r_b.
+      // Off-diagonal Voigt components are symmetrized.
+      const Cell *cell = system.cell();
+      if (cell &&
+          (cell->periodic[0] || cell->periodic[1] || cell->periodic[2])) {
+        const auto &m = cell->matrix;
+        float vol = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        vol = std::abs(vol);
+
+        if (vol > 1e-10f) {
+          result.stress.assign(6, 0.0f);
+          for (int ca = 0; ca < n_atoms; ca++) {
+            for (int slot = 0; slot < max_neighbors; slot++) {
+              int flat_idx = ca * max_neighbors + slot;
+              if (pm_data[flat_idx] > 0.5f) continue;
+
+              int base = slot * stride_slot + ca * stride_atom;
+              float ex = ev_data[base + 0];
+              float ey = ev_data[base + 1];
+              float ez = ev_data[base + 2];
+              float gx = grad_data[base + 0];
+              float gy = grad_data[base + 1];
+              float gz = grad_data[base + 2];
+
+              result.stress[0] += ex * gx;                    // xx
+              result.stress[1] += ey * gy;                    // yy
+              result.stress[2] += ez * gz;                    // zz
+              result.stress[3] += 0.5f * (ey * gz + ez * gy); // yz
+              result.stress[4] += 0.5f * (ex * gz + ez * gx); // xz
+              result.stress[5] += 0.5f * (ex * gy + ey * gx); // xy
+            }
+          }
+          for (int i = 0; i < 6; i++) {
+            result.stress[i] *= energy_scale_ / vol;
+          }
+          result.has_stress = true;
+        }
+      }
     }
   }
 
