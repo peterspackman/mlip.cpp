@@ -144,6 +144,8 @@ ATEN_TO_GGML = {
     "aten.cos": "COS",
     "aten.sin.default": "SIN",
     "aten.sin": "SIN",
+    "aten.abs.default": "UNARY_ABS",
+    "aten.abs": "UNARY_ABS",
     "aten.clamp.default": "CLAMP",
     "aten.clamp": "CLAMP",
 

@@ -339,6 +339,8 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_unary(ctx, node, GGML_UNARY_OP_EXP);
   } else if (node.op == "UNARY_NEG") {
     return build_unary(ctx, node, GGML_UNARY_OP_NEG);
+  } else if (node.op == "UNARY_ABS") {
+    return build_unary(ctx, node, GGML_UNARY_OP_ABS);
   } else if (node.op == "UNARY_SIGMOID") {
     return build_sigmoid(ctx, node);
   } else if (node.op == "DECOMPOSE") {
@@ -1457,27 +1459,80 @@ ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
 
 ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,
                                            const GIRNode &node) {
-  // SLICE: extract a slice from a tensor along one dimension.
-  // Supports: full pass-through (shapes match) and simple prefix slicing from offset 0.
+  // SLICE: extract a slice from a tensor along one dimension. Supports arbitrary
+  // start (including negative) and end (including negative or sentinel/INT64_MAX
+  // meaning "to end"). Honours params {dim, start, end} from the FX export and
+  // falls back to inferring from output_shape when params are absent.
   if (node.inputs.empty()) {
     throw std::runtime_error("SLICE requires at least 1 input");
   }
 
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
 
-  auto output_shape = node.output_shape;
-  if (output_shape.empty()) {
-    // No output shape info: pass through (full slice)
-    return a;
+  // Try param-driven slicing first.
+  if (has_param(node, "dim") &&
+      (has_param(node, "start") || has_param(node, "end"))) {
+    int dim_pt = static_cast<int>(get_param<int64_t>(node, "dim", 0));
+    int64_t start = has_param(node, "start")
+                         ? get_param<int64_t>(node, "start", 0)
+                         : 0;
+    int64_t end = has_param(node, "end")
+                       ? get_param<int64_t>(node, "end",
+                                            std::numeric_limits<int64_t>::max())
+                       : std::numeric_limits<int64_t>::max();
+
+    int n_dims = ggml_n_dims(a);
+    if (dim_pt < 0) dim_pt += n_dims;
+    // PyTorch dim → GGML dim (reverse order)
+    int dim_g = n_dims - 1 - dim_pt;
+    if (dim_g < 0 || dim_g >= n_dims) {
+      throw std::runtime_error("SLICE: dim out of range at node '" + node.name + "'");
+    }
+    int64_t size = a->ne[dim_g];
+
+    // Normalize start/end (negative indexing, INT64_MAX → size).
+    if (start < 0) start += size;
+    if (end < 0) end += size;
+    if (start < 0) start = 0;
+    if (end > size) end = size;
+    if (end < start) end = start;
+    int64_t new_len = end - start;
+    if (new_len <= 0) {
+      throw std::runtime_error(
+          "SLICE: empty slice at node '" + node.name + "'");
+    }
+
+    // GGML view with offset along dim_g.
+    int64_t ne_out[4] = {a->ne[0], a->ne[1], a->ne[2], a->ne[3]};
+    ne_out[dim_g] = new_len;
+    size_t offset = static_cast<size_t>(start) * a->nb[dim_g];
+
+    switch (n_dims) {
+    case 1:
+      return ggml_view_1d(ctx, a, ne_out[0], offset);
+    case 2:
+      return ggml_view_2d(ctx, a, ne_out[0], ne_out[1], a->nb[1], offset);
+    case 3:
+      return ggml_view_3d(ctx, a, ne_out[0], ne_out[1], ne_out[2],
+                          a->nb[1], a->nb[2], offset);
+    case 4:
+      return ggml_view_4d(ctx, a, ne_out[0], ne_out[1], ne_out[2], ne_out[3],
+                          a->nb[1], a->nb[2], a->nb[3], offset);
+    default:
+      throw std::runtime_error(
+          "SLICE: unsupported number of dimensions: " +
+          std::to_string(n_dims) + " at node '" + node.name + "'");
+    }
   }
 
-  // Resolve symbolic dimensions
+  // No params: legacy shape-based fallback (prefix slice from offset 0).
+  auto output_shape = node.output_shape;
+  if (output_shape.empty()) {
+    return a;
+  }
   output_shape = resolve_shape(output_shape);
-
-  // Reverse for GGML
   std::reverse(output_shape.begin(), output_shape.end());
 
-  // Check if shapes match (full pass-through)
   bool shapes_match = true;
   for (size_t i = 0; i < output_shape.size() && i < 4; i++) {
     if (output_shape[i] != static_cast<int64_t>(a->ne[i])) {
@@ -1485,13 +1540,8 @@ ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,
       break;
     }
   }
+  if (shapes_match) return a;
 
-  if (shapes_match) {
-    return a;
-  }
-
-  // Only support simple prefix slicing from offset 0 along one dimension.
-  // Verify that exactly one dimension differs and the output is smaller.
   int n_diff = 0;
   for (size_t i = 0; i < output_shape.size() && i < 4; i++) {
     if (output_shape[i] != static_cast<int64_t>(a->ne[i])) {
@@ -1504,14 +1554,12 @@ ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,
       n_diff++;
     }
   }
-
   if (n_diff > 1) {
     throw std::runtime_error(
         "SLICE: multiple dimensions differ between input and output at node '" +
         node.name + "'. Only single-dimension slicing is supported.");
   }
 
-  // Simple prefix slice from offset 0
   switch (output_shape.size()) {
   case 1:
     return ggml_view_1d(ctx, a, output_shape[0], 0);

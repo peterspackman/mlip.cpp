@@ -38,6 +38,301 @@ float cutoff_func_cosine(float distance, float cutoff, float width) {
   return 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * x));
 }
 
+// Internal state from compute_adaptive_cutoffs that the chain-rule stress
+// correction reuses (avoids re-deriving it for every edge perturbation).
+struct AdaptiveCutoffCache {
+  std::vector<float> probes;            // [n_probes]
+  std::vector<double> diff;             // [n_atoms * n_probes]
+  std::vector<double> width;            // [n_atoms * n_probes]
+  std::vector<double> weights;          // [n_atoms * n_probes]   softmax over probes
+  std::vector<float> atomic_cutoffs;    // [n_atoms]
+  // X[k * n_probes + p] = ∂atomic_cutoffs[k] / ∂diff[k, p].
+  // Populated by compute_adaptive_cutoffs_with_jacobian.
+  std::vector<double> diff_jacobian;
+  float effective_width = 0.0f;
+  int n_probes = 0;
+};
+
+// Compute per-atom adaptive cutoffs. Mirrors metatrain.pet.modules
+// .adaptive_cutoff.get_adaptive_cutoffs: probe-grid + Gaussian weighting,
+// width per probe taken from the numerical gradient of (effective_nn -
+// target + baseline) along the probe axis.
+//
+// Inputs:
+//   centers, distances : edge index/value arrays of length n_edges
+//   target             : num_neighbors_adaptive (e.g. 8.0)
+//   n_atoms, max_cutoff: as passed by the caller
+// Returns: vector of length n_atoms with per-atom adapted cutoff radii.
+std::vector<float> compute_adaptive_cutoffs(
+    const std::vector<int32_t> &centers,
+    const std::vector<float> &distances,
+    float target,
+    int n_atoms,
+    float max_cutoff,
+    float min_cutoff = 0.5f,
+    float effective_width = 1.0f) {
+  const float probe_spacing = effective_width / 4.0f;
+  std::vector<float> probe_cutoffs;
+  for (float pc = min_cutoff; pc < max_cutoff; pc += probe_spacing) {
+    probe_cutoffs.push_back(pc);
+  }
+  const int n_probes = static_cast<int>(probe_cutoffs.size());
+  if (n_probes == 0 || n_atoms == 0) {
+    return std::vector<float>(n_atoms, max_cutoff);
+  }
+
+  // diff[atom * n_probes + p] starts as effective_num_neighbors at probe p,
+  // then we subtract `target` and add the baseline = target * (p/(n-1))^3.
+  std::vector<double> diff(static_cast<size_t>(n_atoms) * n_probes, 0.0);
+
+  // Accumulate effective neighbor count: f(d, probe, effective_width).
+  const size_t n_edges = distances.size();
+  for (int p = 0; p < n_probes; p++) {
+    const float pc = probe_cutoffs[p];
+    for (size_t e = 0; e < n_edges; e++) {
+      const int a = centers[e];
+      const float w = cutoff_func_bump(distances[e], pc, effective_width);
+      diff[static_cast<size_t>(a) * n_probes + p] += static_cast<double>(w);
+    }
+  }
+
+  // Subtract target, add baseline.
+  for (int a = 0; a < n_atoms; a++) {
+    for (int p = 0; p < n_probes; p++) {
+      double x = (n_probes > 1)
+                     ? static_cast<double>(p) / static_cast<double>(n_probes - 1)
+                     : 0.0;
+      double baseline = target * x * x * x;
+      diff[static_cast<size_t>(a) * n_probes + p] += baseline - target;
+    }
+  }
+
+  // Numerical gradient along probe axis (matches torch.gradient with default
+  // edge_order=1: central differences interior, one-sided at boundaries).
+  std::vector<double> grad(diff.size(), 0.0);
+  for (int a = 0; a < n_atoms; a++) {
+    const double *d = &diff[static_cast<size_t>(a) * n_probes];
+    double *g = &grad[static_cast<size_t>(a) * n_probes];
+    if (n_probes == 1) {
+      g[0] = std::abs(d[0]) * 0.5;
+    } else {
+      g[0] = d[1] - d[0];
+      g[n_probes - 1] = d[n_probes - 1] - d[n_probes - 2];
+      for (int p = 1; p < n_probes - 1; p++) {
+        g[p] = 0.5 * (d[p + 1] - d[p - 1]);
+      }
+    }
+  }
+  // width = max(|grad|, eps)
+  const double eps = 1e-12;
+  for (size_t i = 0; i < grad.size(); i++) {
+    grad[i] = std::max(std::abs(grad[i]), eps);
+  }
+
+  // Gaussian weights: log = -0.5 * (diff/width)^2 ; subtract max per row;
+  // exponentiate; normalize.
+  std::vector<float> result(n_atoms, 0.0f);
+  for (int a = 0; a < n_atoms; a++) {
+    const double *d = &diff[static_cast<size_t>(a) * n_probes];
+    const double *w = &grad[static_cast<size_t>(a) * n_probes];
+
+    // First pass: compute logw and find max
+    std::vector<double> logw(n_probes);
+    double logw_max = -std::numeric_limits<double>::infinity();
+    for (int p = 0; p < n_probes; p++) {
+      double r = d[p] / w[p];
+      logw[p] = -0.5 * r * r;
+      if (logw[p] > logw_max) logw_max = logw[p];
+    }
+    // Second pass: exp(logw - max) and accumulate
+    double sum_w = 0.0;
+    double weighted_cutoff = 0.0;
+    for (int p = 0; p < n_probes; p++) {
+      double weight = std::exp(logw[p] - logw_max);
+      sum_w += weight;
+      weighted_cutoff += weight * probe_cutoffs[p];
+    }
+    result[a] = (sum_w > 0.0)
+                    ? static_cast<float>(weighted_cutoff / sum_w)
+                    : max_cutoff;
+  }
+  return result;
+}
+
+// Bump function value AND derivative w.r.t. distance.
+//   f(d, rc, w) = 0.5 * (1 + tanh(1/tan(pi*x))), x = (d-(rc-w))/w
+//   f'(d) = 0.5 * sech^2(...) * d/dx[1/tan(pi*x)] / w
+//         = 0.5 * sech^2 * (-pi/sin^2(pi*x)) / w
+// Returns 0 outside the active region (since the bump is 0 or 1 there).
+double bump_derivative(float distance, float cutoff, float width) {
+  double x = (static_cast<double>(distance) -
+              (static_cast<double>(cutoff) - static_cast<double>(width))) /
+             static_cast<double>(width);
+  if (x <= 0.0 || x >= 1.0) return 0.0;
+  double pi_x = M_PI * x;
+  double s = std::sin(pi_x);
+  double c = std::cos(pi_x);
+  double t = c / s;                  // 1/tan(pi*x)
+  double sech2 = 1.0 - std::tanh(t) * std::tanh(t);
+  // dt/dx = -pi/sin^2(pi*x) ; dx/d(distance) = 1/width
+  double dt_dx = -M_PI / (s * s);
+  return 0.5 * sech2 * dt_dx / static_cast<double>(width);
+}
+
+// Same as compute_adaptive_cutoffs but stashes the intermediate state
+// (eff_nn, diff, width, softmax weights, the diff-Jacobian X) needed by the
+// stress chain-rule correction.
+void compute_adaptive_cutoffs_with_state(
+    const std::vector<int32_t> &centers,
+    const std::vector<float> &distances,
+    float target,
+    int n_atoms,
+    float max_cutoff,
+    AdaptiveCutoffCache &out,
+    float min_cutoff = 0.5f,
+    float effective_width = 1.0f) {
+  out = {};
+  const float probe_spacing = effective_width / 4.0f;
+  for (float pc = min_cutoff; pc < max_cutoff; pc += probe_spacing) {
+    out.probes.push_back(pc);
+  }
+  const int n_probes = static_cast<int>(out.probes.size());
+  out.n_probes = n_probes;
+  out.effective_width = effective_width;
+  out.atomic_cutoffs.assign(n_atoms, max_cutoff);
+  if (n_probes == 0 || n_atoms == 0) return;
+
+  // diff[a*n_probes + p] starts as effective_num_neighbors, then we subtract
+  // target and add baseline (kept as in compute_adaptive_cutoffs).
+  out.diff.assign(static_cast<size_t>(n_atoms) * n_probes, 0.0);
+  const size_t n_edges = distances.size();
+  for (int p = 0; p < n_probes; p++) {
+    const float pc = out.probes[p];
+    for (size_t e = 0; e < n_edges; e++) {
+      const int a = centers[e];
+      out.diff[static_cast<size_t>(a) * n_probes + p] +=
+          static_cast<double>(cutoff_func_bump(distances[e], pc, effective_width));
+    }
+  }
+  for (int a = 0; a < n_atoms; a++) {
+    for (int p = 0; p < n_probes; p++) {
+      double x = (n_probes > 1)
+                     ? static_cast<double>(p) / static_cast<double>(n_probes - 1)
+                     : 0.0;
+      out.diff[static_cast<size_t>(a) * n_probes + p] +=
+          static_cast<double>(target) * x * x * x -
+          static_cast<double>(target);
+    }
+  }
+
+  // grad along probe axis (centred for interior, one-sided at ends), then
+  // width = max(|grad|, eps). We also remember sign(grad) per row so the
+  // Jacobian can use it without a redundant sign step.
+  out.width.assign(out.diff.size(), 0.0);
+  std::vector<double> grad(out.diff.size(), 0.0);
+  std::vector<double> grad_sign(out.diff.size(), 0.0);
+  const double eps = 1e-12;
+  for (int a = 0; a < n_atoms; a++) {
+    const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
+    double *g = &grad[static_cast<size_t>(a) * n_probes];
+    if (n_probes == 1) {
+      g[0] = std::abs(d[0]) * 0.5;
+    } else {
+      g[0] = d[1] - d[0];
+      g[n_probes - 1] = d[n_probes - 1] - d[n_probes - 2];
+      for (int p = 1; p < n_probes - 1; p++) {
+        g[p] = 0.5 * (d[p + 1] - d[p - 1]);
+      }
+    }
+    for (int p = 0; p < n_probes; p++) {
+      double abs_g = std::abs(g[p]);
+      out.width[static_cast<size_t>(a) * n_probes + p] = std::max(abs_g, eps);
+      grad_sign[static_cast<size_t>(a) * n_probes + p] = (g[p] >= 0.0) ? 1.0 : -1.0;
+    }
+  }
+
+  // Softmax weights and atomic_cutoffs.
+  out.weights.assign(out.diff.size(), 0.0);
+  for (int a = 0; a < n_atoms; a++) {
+    const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
+    const double *w = &out.width[static_cast<size_t>(a) * n_probes];
+    double *we = &out.weights[static_cast<size_t>(a) * n_probes];
+
+    std::vector<double> logw(n_probes);
+    double logw_max = -std::numeric_limits<double>::infinity();
+    for (int p = 0; p < n_probes; p++) {
+      double r = d[p] / w[p];
+      logw[p] = -0.5 * r * r;
+      if (logw[p] > logw_max) logw_max = logw[p];
+    }
+    double sum_w = 0.0;
+    double weighted_cutoff = 0.0;
+    for (int p = 0; p < n_probes; p++) {
+      we[p] = std::exp(logw[p] - logw_max);
+      sum_w += we[p];
+      weighted_cutoff += we[p] * out.probes[p];
+    }
+    if (sum_w > 0.0) {
+      for (int p = 0; p < n_probes; p++) we[p] /= sum_w;
+      out.atomic_cutoffs[a] = static_cast<float>(weighted_cutoff / sum_w);
+    } else {
+      // Degenerate: keep uniform so downstream divisions are safe.
+      double uniform = 1.0 / std::max(1, n_probes);
+      for (int p = 0; p < n_probes; p++) we[p] = uniform;
+    }
+  }
+
+  // Diff-Jacobian X[a, p_target] = d(atomic_cutoffs[a])/d(diff[a, p_target]).
+  // Only logits[a, r] depends on diff[a, *]; chain through w via
+  //   d(a)/d(logits_r) = w_r * (probes_r - atomic_cutoffs[a]).
+  // logits_r = -0.5 * (diff_r / width_r)^2; width_r is a numerical gradient
+  // of diff and so depends on diff_{r-1}, diff_{r+1} (or endpoints).
+  out.diff_jacobian.assign(out.diff.size(), 0.0);
+  for (int a = 0; a < n_atoms; a++) {
+    const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
+    const double *w_arr = &out.width[static_cast<size_t>(a) * n_probes];
+    const double *we = &out.weights[static_cast<size_t>(a) * n_probes];
+    const double *gs = &grad_sign[static_cast<size_t>(a) * n_probes];
+    const double a_val = static_cast<double>(out.atomic_cutoffs[a]);
+    double *X = &out.diff_jacobian[static_cast<size_t>(a) * n_probes];
+
+    for (int r = 0; r < n_probes; r++) {
+      double coef = we[r] * (static_cast<double>(out.probes[r]) - a_val);
+      double w_r = w_arr[r];
+      if (w_r <= eps) continue;
+      double inv_w2 = 1.0 / (w_r * w_r);
+      double d_over_w3 = (d[r] * d[r]) / (w_r * w_r * w_r);
+
+      // direct contribution: d(logits_r)/d(diff_r) = -d_r / w_r^2
+      X[r] += coef * (-d[r] * inv_w2);
+
+      // width contribution: d(logits_r)/d(diff_target) =
+      //     (d_r^2 / w_r^3) * d(width_r)/d(diff_target)
+      // d(width_r)/d(diff_target) = sign(grad_r) * d(grad_r)/d(diff_target).
+      double sgn = gs[r];
+      if (n_probes == 1) {
+        // only r=0 case, with d(grad_0)/d(diff_0) ~ 0.5*sign already baked in
+        // Skip — degenerate.
+      } else if (r == 0) {
+        // grad_0 = diff_1 - diff_0
+        double t = coef * d_over_w3;
+        X[0] += t * sgn * (-1.0);
+        X[1] += t * sgn * (+1.0);
+      } else if (r == n_probes - 1) {
+        // grad_{n-1} = diff_{n-1} - diff_{n-2}
+        double t = coef * d_over_w3;
+        X[n_probes - 1] += t * sgn * (+1.0);
+        X[n_probes - 2] += t * sgn * (-1.0);
+      } else {
+        // grad_r = 0.5 * (diff_{r+1} - diff_{r-1})
+        double t = coef * d_over_w3;
+        X[r - 1] += t * sgn * (-0.5);
+        X[r + 1] += t * sgn * (+0.5);
+      }
+    }
+  }
+}
+
 } // namespace
 
 // Context sizes
@@ -219,10 +514,66 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
   const int n_atoms = static_cast<int>(system.num_atoms());
   const int32_t *atomic_numbers = system.atomic_numbers();
 
-  // Build neighbor list
+  // Build neighbor list at the global model cutoff (the search radius).
   NeighborList nlist = neighbor_builder_.build(system);
 
-  // Count max neighbors
+  // Per-pair cutoffs: default to global cutoff. When the graph itself does
+  // adaptive cutoff (adaptive_cutoff_in_graph_), C++ leaves pair_cutoffs at
+  // the global cutoff and skips filtering — the graph computes per-pair
+  // cutoffs from edge_distances and applies them via cutoff_factors.
+  // Otherwise, when num_neighbors_adaptive_ > 0, C++ does the legacy
+  // filtering and passes per-pair cutoffs as a constant input.
+  std::vector<float> pair_cutoffs(nlist.num_pairs(), cutoff_);
+
+  // Pre-filter (full) neighbor list and adaptive-cutoff state are kept here
+  // so the stress chain-rule correction can use them after the backward pass
+  // (the model only sees the post-filter list, but atomic_cutoffs is computed
+  // on the full list).
+  NeighborList full_nlist;
+  AdaptiveCutoffCache adapt_cache;
+  bool have_adaptive = false;
+
+  if (num_neighbors_adaptive_ > 0.0f) {
+    full_nlist = nlist;  // copy of pre-filter list
+    compute_adaptive_cutoffs_with_state(
+        nlist.centers, nlist.distances,
+        num_neighbors_adaptive_, n_atoms, cutoff_, adapt_cache,
+        /*min_cutoff=*/0.5f,
+        /*effective_width=*/cutoff_width_);
+    have_adaptive = true;
+    const auto &atomic_cutoffs = adapt_cache.atomic_cutoffs;
+
+    // Compact nlist in place: keep edge e iff distances[e] <= pair_cutoff
+    const int n_in = nlist.num_pairs();
+    std::vector<float> kept_pair_cutoffs;
+    kept_pair_cutoffs.reserve(n_in);
+    int n_out = 0;
+    for (int e = 0; e < n_in; e++) {
+      const int i = nlist.centers[e];
+      const int j = nlist.neighbors[e];
+      const float pc = 0.5f * (atomic_cutoffs[i] + atomic_cutoffs[j]);
+      if (nlist.distances[e] > pc) continue;
+      if (n_out != e) {
+        nlist.centers[n_out] = nlist.centers[e];
+        nlist.neighbors[n_out] = nlist.neighbors[e];
+        nlist.edge_vectors[n_out] = nlist.edge_vectors[e];
+        nlist.distances[n_out] = nlist.distances[e];
+        if (!nlist.cell_shifts.empty()) {
+          nlist.cell_shifts[n_out] = nlist.cell_shifts[e];
+        }
+      }
+      kept_pair_cutoffs.push_back(pc);
+      ++n_out;
+    }
+    nlist.centers.resize(n_out);
+    nlist.neighbors.resize(n_out);
+    nlist.edge_vectors.resize(n_out);
+    nlist.distances.resize(n_out);
+    if (!nlist.cell_shifts.empty()) nlist.cell_shifts.resize(n_out);
+    pair_cutoffs = std::move(kept_pair_cutoffs);
+  }
+
+  // Count max neighbors after any adaptive filtering
   std::vector<int> neighbor_counts(n_atoms, 0);
   for (int e = 0; e < nlist.num_pairs(); e++) {
     neighbor_counts[nlist.centers[e]]++;
@@ -234,9 +585,6 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
   if (max_neighbors == 0) {
     max_neighbors = 1;
   }
-
-  // Per-pair cutoff distances (for bump cutoff computation)
-  std::vector<float> pair_cutoffs(nlist.num_pairs(), cutoff_);
 
   // Set symbolic dimensions for this system
   interp_.set_dimension("n_atoms", n_atoms);
@@ -294,6 +642,11 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
   // Mark edge_vectors as parameter for gradient computation
   if (compute_forces) {
     ggml_set_param(edge_vectors_t);
+    // Adaptive cutoff models also need ∂E/∂cutoff_values to recover the
+    // missing chain in the virial stress (correction added in C++).
+    if (cutoff_values_t && num_neighbors_adaptive_ > 0.0f) {
+      ggml_set_param(cutoff_values_t);
+    }
   }
 
   // Allocate input buffer
@@ -598,6 +951,70 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
               result.stress[5] += 0.5f * (ex * gy + ey * gx); // xy
             }
           }
+          // Chain-rule correction: the model's autograd doesn't see the
+          // implicit dependence of pair_cutoffs on edge_distances (the C++
+          // adaptive cutoff math). When cutoff_values_t was marked as a
+          // ggml param, its gradient C[e] = ∂E/∂cutoff_values[e] is also
+          // available; combined with the analytic Jacobian J[e'] =
+          // ∂atomic_cutoffs[i_{e'}]/∂d_{e'} we recover the missing virial
+          // term. Skipped when adaptive cutoff isn't active.
+          if (have_adaptive && cutoff_values_t) {
+            ggml_tensor *cv_grad = ggml_graph_get_grad(cgraph, cutoff_values_t);
+            if (cv_grad && cv_grad->data) {
+              std::vector<float> cv_grad_data(ggml_nelements(cv_grad));
+              ggml_backend_tensor_get(cv_grad, cv_grad_data.data(), 0,
+                                      ggml_nbytes(cv_grad));
+
+              // S[k] = Σ_e (in filtered list, edge e touches atom k) C_e
+              std::vector<double> S(n_atoms, 0.0);
+              for (int ca = 0; ca < n_atoms; ca++) {
+                for (int slot = 0; slot < max_neighbors; slot++) {
+                  int flat_idx = ca * max_neighbors + slot;
+                  if (pm_data[flat_idx] > 0.5f) continue;
+                  int na = neighbor_atoms_vec[flat_idx];
+                  if (na < 0) continue;
+                  double c = static_cast<double>(cv_grad_data[flat_idx]);
+                  S[ca] += c;
+                  S[na] += c;
+              }
+              }
+              // S[k] is symmetric in i↔j averaging since cv[e] = 0.5*(a[i]+a[j])
+              // and we summed C over both endpoints for each edge.
+
+              const int n_probes = adapt_cache.n_probes;
+              const auto &probes = adapt_cache.probes;
+              const auto &X = adapt_cache.diff_jacobian;
+              const float ew = adapt_cache.effective_width;
+
+              double corr[6] = {0, 0, 0, 0, 0, 0};
+              for (int e = 0; e < full_nlist.num_pairs(); e++) {
+                int k = full_nlist.centers[e];
+                double d = static_cast<double>(full_nlist.distances[e]);
+                if (d <= 0.0) continue;
+                // J[e] = Σ_p X[k, p] * bump_derivative(d, probes[p], ew)
+                double J = 0.0;
+                const double *Xk = &X[static_cast<size_t>(k) * n_probes];
+                for (int p = 0; p < n_probes; p++) {
+                  J += Xk[p] * bump_derivative(static_cast<float>(d),
+                                               probes[p], ew);
+                }
+                if (J == 0.0) continue;
+                double coef = 0.5 * J * S[k] / d;
+                const auto &r = full_nlist.edge_vectors[e];
+                double ex = r[0], ey = r[1], ez = r[2];
+                corr[0] += coef * ex * ex;
+                corr[1] += coef * ey * ey;
+                corr[2] += coef * ez * ez;
+                corr[3] += 0.5 * coef * (ey * ez + ez * ey);
+                corr[4] += 0.5 * coef * (ex * ez + ez * ex);
+                corr[5] += 0.5 * coef * (ex * ey + ey * ex);
+              }
+              for (int i = 0; i < 6; i++) {
+                result.stress[i] += static_cast<float>(corr[i]);
+              }
+            }
+          }
+
           for (int i = 0; i < 6; i++) {
             result.stress[i] *= energy_scale_ / vol;
           }

@@ -71,7 +71,9 @@ NB_MODULE(_mlipcpp, m) {
       .def_rw("compute_stress", &mlipcpp::PredictOptions::compute_stress,
               "Whether to compute stress tensor (default: False)")
       .def_rw("use_nc_forces", &mlipcpp::PredictOptions::use_nc_forces,
-              "Use non-conservative forces from forward pass heads (faster, not energy-conserving)");
+              "Use non-conservative forces from forward pass heads (faster, not energy-conserving)")
+      .def_rw("fd_stress", &mlipcpp::PredictOptions::fd_stress,
+              "Use finite-difference Voigt-strain stress (12 forward passes, slow but exact)");
 
   // Result struct
   nb::class_<mlipcpp::Result>(m, "Result", "Prediction results")
@@ -118,7 +120,7 @@ NB_MODULE(_mlipcpp, m) {
                  atomic_numbers,
              std::optional<nb::ndarray<const float, nb::shape<3, 3>, nb::c_contig>> cell,
              std::optional<std::array<bool, 3>> pbc,
-             bool compute_forces, bool compute_stress) {
+             bool compute_forces, bool compute_stress, bool fd_stress) {
             size_t n_atoms = positions.shape(0);
             if (atomic_numbers.shape(0) != n_atoms) {
               throw std::runtime_error(
@@ -140,6 +142,7 @@ NB_MODULE(_mlipcpp, m) {
             mlipcpp::PredictOptions options;
             options.compute_forces = compute_forces || compute_stress;
             options.compute_stress = compute_stress;
+            options.fd_stress = fd_stress;
 
             return self.predict(static_cast<int32_t>(n_atoms), positions.data(),
                                 atomic_numbers.data(), cell_ptr, pbc_ptr,
@@ -147,7 +150,7 @@ NB_MODULE(_mlipcpp, m) {
           },
           "positions"_a, "atomic_numbers"_a, "cell"_a = nb::none(),
           "pbc"_a = nb::none(), "compute_forces"_a = true,
-          "compute_stress"_a = false,
+          "compute_stress"_a = false, "fd_stress"_a = false,
           R"doc(
 Predict energy and forces for an atomic system.
 
@@ -165,6 +168,10 @@ compute_forces : bool
     Whether to compute forces (default: True)
 compute_stress : bool
     Whether to compute stress tensor (default: False)
+fd_stress : bool
+    If True, evaluate stress via 4th-order central difference on energy
+    under symmetric Voigt strain (12 forward passes, slow but exact w.r.t.
+    the model's own energy). Default uses the autograd-based virial.
 
 Returns
 -------

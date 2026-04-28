@@ -15,7 +15,7 @@
 
 namespace mlipcpp {
 
-const char *version() { return "0.1.1"; }
+const char *version() { return "0.1.2"; }
 
 // Global backend provider - shared across all models
 static std::shared_ptr<BackendProvider> g_backend_provider;
@@ -163,6 +163,96 @@ struct Predictor::Impl {
     return result;
   }
 
+  /**
+   * Symmetric Voigt strain → cell @ F.T, positions @ F.T (rows are lattice
+   * vectors). Used by the FD stress path.
+   */
+  static AtomicSystem strain(const AtomicSystem &src, const float eta[6]) {
+    AtomicSystem out = src;
+    // Strain matrix from Voigt (engineering shear → factor of 1/2 off-diag)
+    double e[3][3] = {
+        {1.0 + eta[0], 0.5 * eta[5], 0.5 * eta[4]},
+        {0.5 * eta[5], 1.0 + eta[1], 0.5 * eta[3]},
+        {0.5 * eta[4], 0.5 * eta[3], 1.0 + eta[2]},
+    };
+    // Transform cell rows: each lattice vector a_i' = e * a_i
+    if (auto *cell_ptr = src.cell(); cell_ptr) {
+      Cell new_cell = *cell_ptr;
+      for (int i = 0; i < 3; ++i) {
+        double a[3] = {cell_ptr->matrix[i][0], cell_ptr->matrix[i][1],
+                       cell_ptr->matrix[i][2]};
+        for (int alpha = 0; alpha < 3; ++alpha) {
+          new_cell.matrix[i][alpha] = static_cast<float>(
+              e[alpha][0] * a[0] + e[alpha][1] * a[1] + e[alpha][2] * a[2]);
+        }
+      }
+      // Recompute inverse via the public Cell ctor
+      Cell rebuilt(new_cell.matrix, new_cell.periodic[0],
+                   new_cell.periodic[1], new_cell.periodic[2]);
+      out.set_cell(rebuilt);
+    }
+    // Transform positions: r' = e * r
+    auto &pos = out.positions_mut();
+    for (int i = 0; i < src.num_atoms(); ++i) {
+      double r[3] = {pos[3 * i + 0], pos[3 * i + 1], pos[3 * i + 2]};
+      for (int alpha = 0; alpha < 3; ++alpha) {
+        pos[3 * i + alpha] = static_cast<float>(
+            e[alpha][0] * r[0] + e[alpha][1] * r[1] + e[alpha][2] * r[2]);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Stress via 4th-order central difference in symmetric Voigt strain.
+   * 12 forward passes; bypasses autograd entirely.
+   *
+   * σ_voigt[k] = [8(E(+δ) - E(-δ)) - (E(+2δ) - E(-2δ))] / (12 V δ)
+   *
+   * Voigt[k] convention: (xx, yy, zz, yz, xz, xy). Off-diagonals use
+   * symmetric strain ε_αβ = ε_βα = η_k/2 (engineering shear) so the same
+   * formula applies to all six components.
+   */
+  std::vector<float> compute_fd_stress(const AtomicSystem &system,
+                                       float delta = 5e-3f) {
+    const auto *cell = system.cell();
+    if (!cell) {
+      return {};
+    }
+    const auto &m = cell->matrix;
+    double vol = static_cast<double>(m[0][0]) *
+                     (static_cast<double>(m[1][1]) * m[2][2] -
+                      static_cast<double>(m[1][2]) * m[2][1]) -
+                 static_cast<double>(m[0][1]) *
+                     (static_cast<double>(m[1][0]) * m[2][2] -
+                      static_cast<double>(m[1][2]) * m[2][0]) +
+                 static_cast<double>(m[0][2]) *
+                     (static_cast<double>(m[1][0]) * m[2][1] -
+                      static_cast<double>(m[1][1]) * m[2][0]);
+    vol = std::abs(vol);
+    if (vol < 1e-10) {
+      return {};
+    }
+
+    auto E_at = [&](int k, double scale) {
+      float eta[6] = {0, 0, 0, 0, 0, 0};
+      eta[k] = static_cast<float>(delta * scale);
+      auto strained = strain(system, eta);
+      return static_cast<double>(model->predict(strained, /*forces=*/false).energy);
+    };
+
+    std::vector<float> stress(6, 0.0f);
+    for (int k = 0; k < 6; ++k) {
+      double ep1 = E_at(k, +1.0);
+      double em1 = E_at(k, -1.0);
+      double ep2 = E_at(k, +2.0);
+      double em2 = E_at(k, -2.0);
+      stress[k] = static_cast<float>(
+          (8.0 * (ep1 - em1) - (ep2 - em2)) / (12.0 * vol * delta));
+    }
+    return stress;
+  }
+
   Result predict_impl(const AtomicSystem &system, const PredictOptions &options) {
     // Use predict_batch for NC forces support
     auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
@@ -185,6 +275,9 @@ struct Predictor::Impl {
       if (options.compute_stress && internal_result.has_stress) {
         result.stress = std::move(internal_result.stress);
       }
+      if (options.compute_stress && options.fd_stress) {
+        result.stress = compute_fd_stress(system);
+      }
       return result;
     } else {
       // Fallback for non-PET models
@@ -194,6 +287,9 @@ struct Predictor::Impl {
       }
       if (!options.compute_stress) {
         result.stress.clear();
+      }
+      if (options.compute_stress && options.fd_stress) {
+        result.stress = compute_fd_stress(system);
       }
       return result;
     }

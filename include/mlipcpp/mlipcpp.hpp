@@ -73,6 +73,13 @@ struct PredictOptions {
   bool compute_stress = false;  ///< Compute stress tensor
   bool use_nc_forces = false;   ///< Use non-conservative forces from forward pass heads
                                 ///< (faster, but forces are not gradient of energy)
+  /**
+   * If true and compute_stress is true, evaluate stress via finite differences
+   * on the energy under symmetric Voigt strain (12 forward passes, slow but
+   * exact w.r.t. the model's own energy — useful as a validation oracle).
+   * Default false uses the autograd-based virial path.
+   */
+  bool fd_stress = false;
 };
 
 /**
