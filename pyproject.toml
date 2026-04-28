@@ -38,6 +38,11 @@ cmake.targets = ["_mlipcpp"]
 MLIPCPP_BUILD_PYTHON = "ON"
 MLIPCPP_BUILD_EXAMPLES = "OFF"
 MLIPCPP_BUILD_TESTS = "OFF"
+# Build portable wheels: -march=native bakes the build host's CPU features
+# (e.g. AVX-512 on some Azure VMs) into the binary, causing SIGILL on test
+# or end-user machines that lack those instructions. ggml falls back to a
+# conservative baseline + runtime feature detection when NATIVE is OFF.
+GGML_NATIVE = "OFF"
 
 [tool.cibuildwheel]
 # One stable-ABI wheel per platform (cp312-abi3 is forward compatible with 3.12+).
