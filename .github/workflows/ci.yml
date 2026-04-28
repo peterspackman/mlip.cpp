@@ -33,13 +33,18 @@ jobs:
           restore-keys: |
             cpm-${{ runner.os }}-
 
+      # Bump the prefix (currently v2) to invalidate stale caches built with
+      # different ggml CPU baselines. Pre-v2 caches were built with
+      # -march=native; after we defaulted GGML_NATIVE=OFF in CMakeLists.txt
+      # the new objects and the old library archive can disagree on
+      # available CPU features at link time and SIGILL at runtime.
       - name: Cache build directory
         uses: actions/cache@v4
         with:
           path: build
-          key: build-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**') }}
+          key: build-v2-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**') }}
           restore-keys: |
-            build-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+            build-v2-${{ runner.os }}-${{ env.BUILD_TYPE }}-
 
       - name: Configure CMake
         run: |
