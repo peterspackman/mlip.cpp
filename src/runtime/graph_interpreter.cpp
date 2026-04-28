@@ -1469,7 +1469,12 @@ ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,
 
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
 
-  // Try param-driven slicing first.
+  // Try param-driven slicing when the params describe a non-trivial slice.
+  // We need the *PyTorch* dim count to translate `dim` correctly: ggml's
+  // ggml_n_dims collapses trailing-1 dims, so a logically-3D PT tensor whose
+  // runtime ne[2]=1 reports n_dims=2 and we'd map dim_pt to the wrong axis.
+  // The graph's output_shape (when present) reflects the true PT rank.
+  bool tried_params = false;
   if (has_param(node, "dim") &&
       (has_param(node, "start") || has_param(node, "end"))) {
     int dim_pt = static_cast<int>(get_param<int64_t>(node, "dim", 0));
@@ -1481,48 +1486,54 @@ ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,
                                             std::numeric_limits<int64_t>::max())
                        : std::numeric_limits<int64_t>::max();
 
-    int n_dims = ggml_n_dims(a);
-    if (dim_pt < 0) dim_pt += n_dims;
+    // PT rank: prefer output_shape, fall back to ggml_n_dims.
+    int pt_rank = node.output_shape.empty()
+                      ? ggml_n_dims(a)
+                      : static_cast<int>(node.output_shape.size());
+    if (dim_pt < 0) dim_pt += pt_rank;
     // PyTorch dim → GGML dim (reverse order)
-    int dim_g = n_dims - 1 - dim_pt;
-    if (dim_g < 0 || dim_g >= n_dims) {
-      throw std::runtime_error("SLICE: dim out of range at node '" + node.name + "'");
-    }
-    int64_t size = a->ne[dim_g];
+    int dim_g = pt_rank - 1 - dim_pt;
+    int n_dims = std::max(ggml_n_dims(a), pt_rank);
+    if (dim_g >= 0 && dim_g < 4) {
+      int64_t size = a->ne[dim_g];
 
-    // Normalize start/end (negative indexing, INT64_MAX → size).
-    if (start < 0) start += size;
-    if (end < 0) end += size;
-    if (start < 0) start = 0;
-    if (end > size) end = size;
-    if (end < start) end = start;
-    int64_t new_len = end - start;
-    if (new_len <= 0) {
-      throw std::runtime_error(
-          "SLICE: empty slice at node '" + node.name + "'");
+      // Normalize start/end (negative indexing, INT64_MAX → size).
+      if (start < 0) start += size;
+      if (end < 0) end += size;
+      if (start < 0) start = 0;
+      if (start > size) start = size;
+      if (end > size) end = size;
+      if (end < start) end = start;
+      int64_t new_len = end - start;
+      // If the slice is the full-axis pass (start==0, new_len==size), prefer
+      // the legacy / pass-through path so old graphs whose every SLICE is
+      // emitted as `tensor[:]` keep working without us re-creating views.
+      if (start == 0 && new_len == size) {
+        return a;
+      }
+      if (new_len > 0) {
+        // GGML view with offset along dim_g.
+        int64_t ne_out[4] = {a->ne[0], a->ne[1], a->ne[2], a->ne[3]};
+        ne_out[dim_g] = new_len;
+        size_t offset = static_cast<size_t>(start) * a->nb[dim_g];
+        switch (n_dims) {
+        case 1:
+          return ggml_view_1d(ctx, a, ne_out[0], offset);
+        case 2:
+          return ggml_view_2d(ctx, a, ne_out[0], ne_out[1], a->nb[1], offset);
+        case 3:
+          return ggml_view_3d(ctx, a, ne_out[0], ne_out[1], ne_out[2],
+                              a->nb[1], a->nb[2], offset);
+        case 4:
+          return ggml_view_4d(ctx, a, ne_out[0], ne_out[1], ne_out[2], ne_out[3],
+                              a->nb[1], a->nb[2], a->nb[3], offset);
+        default:
+          break;  // fall through to legacy
+        }
+      }
     }
-
-    // GGML view with offset along dim_g.
-    int64_t ne_out[4] = {a->ne[0], a->ne[1], a->ne[2], a->ne[3]};
-    ne_out[dim_g] = new_len;
-    size_t offset = static_cast<size_t>(start) * a->nb[dim_g];
-
-    switch (n_dims) {
-    case 1:
-      return ggml_view_1d(ctx, a, ne_out[0], offset);
-    case 2:
-      return ggml_view_2d(ctx, a, ne_out[0], ne_out[1], a->nb[1], offset);
-    case 3:
-      return ggml_view_3d(ctx, a, ne_out[0], ne_out[1], ne_out[2],
-                          a->nb[1], a->nb[2], offset);
-    case 4:
-      return ggml_view_4d(ctx, a, ne_out[0], ne_out[1], ne_out[2], ne_out[3],
-                          a->nb[1], a->nb[2], a->nb[3], offset);
-    default:
-      throw std::runtime_error(
-          "SLICE: unsupported number of dimensions: " +
-          std::to_string(n_dims) + " at node '" + node.name + "'");
-    }
+    tried_params = true;  // params were present but couldn't lower; try legacy
+    (void)tried_params;
   }
 
   // No params: legacy shape-based fallback (prefix slice from offset 0).
