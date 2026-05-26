@@ -20,6 +20,14 @@
   const ready = $derived(store.wasmReady)
   const xyzSummary = $derived(summarise(customXyz))
 
+  let autoLoaded = false
+  $effect(() => {
+    if (ready && !autoLoaded) {
+      autoLoaded = true
+      loadStructure()
+    }
+  })
+
   function summarise(xyz: string): string {
     const lines = xyz.trim().split('\n')
     const n = parseInt(lines[0])

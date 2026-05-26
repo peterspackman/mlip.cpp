@@ -88,7 +88,6 @@ export class ViewerStage {
 
   constructor(canvas: HTMLCanvasElement) {
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x1a1a2e);
 
     const rect = canvas.parentElement?.getBoundingClientRect() ?? { width: 800, height: 600 };
     const aspect = rect.width / rect.height;
@@ -112,8 +111,15 @@ export class ViewerStage {
     });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(rect.width, rect.height);
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.0;
+    // No tone mapping — the OutputPass would otherwise re-map the entire
+    // framebuffer (including the user-picked background) on its final blit,
+    // rolling pure white down to ~#d8d8d8. Toon / Standard materials look fine
+    // without it on this page.
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    // Initial clear color tracks --bg-primary (see app.css) — Viewer overrides
+    // it as soon as the store mounts, but this avoids a flash on first paint.
+    const dark = typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+    this.renderer.setClearColor(dark ? 0x1a1a1a : 0xffffff, 1);
 
     this.controls = this.createControls(this.camera, canvas);
 
@@ -396,7 +402,7 @@ export class ViewerStage {
   }
 
   setBackground(color: number): void {
-    (this.scene.background as THREE.Color).set(color);
+    this.renderer.setClearColor(color, 1);
     // Sync fog color if fog exists
     if (this.scene.fog instanceof THREE.FogExp2) {
       this.scene.fog.color.set(color);
@@ -406,7 +412,7 @@ export class ViewerStage {
 
   setFog(enabled: boolean, density: number): void {
     if (enabled) {
-      const bgColor = (this.scene.background as THREE.Color).clone();
+      const bgColor = this.renderer.getClearColor(new THREE.Color());
       this.scene.fog = new THREE.FogExp2(bgColor.getHex(), density);
     } else {
       this.scene.fog = null;

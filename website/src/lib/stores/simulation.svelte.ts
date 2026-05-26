@@ -14,6 +14,13 @@ import * as THREE from 'three'
 /** Same scale the ball-and-stick representation uses for atom radii. Keeps
  *  ghost halos visually paired with the atoms they trail. */
 const GHOST_ATOM_SCALE = 0.3
+
+/** Mirrors --bg-primary in src/styles/app.css so the viewer canvas blends
+ *  into the page on first paint. Stays a plain string so $state stays cheap. */
+function defaultViewerBackground(): string {
+  if (typeof window === 'undefined') return '#1a1a1a'
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? '#1a1a1a' : '#ffffff'
+}
 import { getMass } from '../chem/elements'
 import { computeVibrations, type VibMode, type VibProgress } from '../vib/modes'
 
@@ -95,9 +102,11 @@ export class SimulationStore {
   // Viewer
   viewStyle = $state<'ball+stick' | 'spacefill' | 'wireframe' | 'tube'>('ball+stick')
   /** Scene background color as a `#rrggbb` string. Hex format keeps it in
-   *  the same shape as a native `<input type="color">` value. */
-  viewerBackground = $state('#1a1a2e')
-  wrapPositions = $state(true)
+   *  the same shape as a native `<input type="color">` value. Initial value
+   *  tracks the prefers-color-scheme media query so the viewer matches the
+   *  rest of the UI on first paint. */
+  viewerBackground = $state(defaultViewerBackground())
+  wrapPositions = $state(false)
   supercell = $state<[number, number, number]>([2, 2, 2])
   /** When true (default), bonds are re-detected from distances on every
    *  position update — bonds appear/disappear as atoms move (good for MD,

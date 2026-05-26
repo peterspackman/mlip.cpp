@@ -3,16 +3,6 @@
   import type { SimulationStore } from '../lib/stores/simulation.svelte'
 
   const store = getContext<SimulationStore>('store')
-
-  // One-click background presets — covers the common "I want a publishable
-  // figure" cases (white/light) and the "I'm working" cases (dark).
-  const BG_PRESETS: { label: string; value: string }[] = [
-    { label: 'midnight', value: '#1a1a2e' },
-    { label: 'black',    value: '#000000' },
-    { label: 'graphite', value: '#2a2a2a' },
-    { label: 'paper',    value: '#f4f1ea' },
-    { label: 'white',    value: '#ffffff' },
-  ]
 </script>
 
 <div class="bar">
@@ -41,27 +31,15 @@
     </label>
   {/if}
 
-  <div class="bg-row inline" role="group" aria-label="Viewer background">
+  <label class="bg-row inline">
     <span>bg</span>
-    {#each BG_PRESETS as p}
-      <button
-        type="button"
-        class="swatch"
-        class:active={store.viewerBackground.toLowerCase() === p.value.toLowerCase()}
-        style="background: {p.value};"
-        onclick={() => (store.viewerBackground = p.value)}
-        title={p.label}
-        aria-label={`Background: ${p.label}`}
-      ></button>
-    {/each}
     <input
       type="color"
       class="picker"
       bind:value={store.viewerBackground}
-      title="Custom color"
-      aria-label="Custom background color"
+      aria-label="Viewer background color"
     />
-  </div>
+  </label>
 </div>
 
 <style>
@@ -98,21 +76,7 @@
   }
   .bg-row {
     margin-left: auto;
-    gap: 0.25rem;
-  }
-  .swatch {
-    width: 0.95rem;
-    height: 0.95rem;
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    cursor: pointer;
-    transition: transform 80ms ease, border-color 80ms ease;
-  }
-  .swatch:hover { border-color: var(--text-primary); transform: translateY(-1px); }
-  .swatch.active {
-    border-color: #ff9900;
-    box-shadow: 0 0 0 1.5px rgba(255, 153, 0, 0.6);
+    gap: 0.35rem;
   }
   .picker {
     width: 1.4rem;
