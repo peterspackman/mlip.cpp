@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getContext } from 'svelte'
   import type { SimulationStore } from '../lib/stores/simulation.svelte'
-  import { SAMPLE_MOLECULES, SAMPLE_CRYSTALS, SAMPLE_STRUCTURES } from '../lib/data/samples'
+  import { SAMPLE_MOLECULES, SAMPLE_CRYSTALS, SAMPLE_CLUSTERS, SAMPLE_STRUCTURES } from '../lib/data/samples'
   import { parseLattice } from '../lib/chem/cell'
   import { fetchFromPubChem } from '../lib/chem/pubchem'
   import XyzEditorModal from './XyzEditorModal.svelte'
@@ -90,6 +90,11 @@
     </optgroup>
     <optgroup label="Crystals">
       {#each Object.keys(SAMPLE_CRYSTALS) as name (name)}
+        <option value={name}>{name}</option>
+      {/each}
+    </optgroup>
+    <optgroup label="Clusters">
+      {#each Object.keys(SAMPLE_CLUSTERS) as name (name)}
         <option value={name}>{name}</option>
       {/each}
     </optgroup>

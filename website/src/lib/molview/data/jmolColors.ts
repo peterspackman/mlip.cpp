@@ -22,6 +22,10 @@ export const JMOL_COLORS_255: [number, number, number][] = [
   [84, 92, 242],   [120, 92, 227],  [138, 79, 227],  [161, 54, 212],  [179, 31, 212],
   [179, 31, 186],  [179, 13, 166],  [189, 13, 135],  [199, 0, 102],   [204, 0, 89],
   [209, 0, 79],    [217, 0, 69],    [224, 0, 56],    [230, 0, 46],    [235, 0, 38],
+  // 110-118: Jmol defines no official colours past Mt (109); continue the
+  // crimson→magenta trend so the superheavy cells stay visually distinct.
+  [235, 0, 46],    [235, 0, 56],    [235, 0, 69],    [235, 0, 82],    [235, 0, 97],
+  [235, 0, 115],   [235, 0, 135],   [235, 0, 158],   [235, 0, 186],
 ];
 
 /** Jmol palette in 0-1 sRGB. */

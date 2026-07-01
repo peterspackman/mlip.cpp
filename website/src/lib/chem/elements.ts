@@ -96,7 +96,7 @@ export const ELEMENTS: ElementData[] = [
   { atomicNumber: 81, symbol: 'Tl', name: 'thallium', covalentRadius: 1.45, vdwRadius: 1.96, mass: 204.3833 },
   { atomicNumber: 82, symbol: 'Pb', name: 'lead', covalentRadius: 1.46, vdwRadius: 2.02, mass: 207.2 },
   { atomicNumber: 83, symbol: 'Bi', name: 'bismuth', covalentRadius: 1.48, vdwRadius: 2.07, mass: 208.98038 },
-  { atomicNumber: 84, symbol: 'Po', name: 'polonium', covalentRadius: 1.40, vdwRadius: 1.97, mass: 290.0 },
+  { atomicNumber: 84, symbol: 'Po', name: 'polonium', covalentRadius: 1.40, vdwRadius: 1.97, mass: 209.0 },
   { atomicNumber: 85, symbol: 'At', name: 'astatine', covalentRadius: 1.21, vdwRadius: 2.02, mass: 210.0 },
   { atomicNumber: 86, symbol: 'Rn', name: 'radon', covalentRadius: 1.50, vdwRadius: 2.20, mass: 222.0 },
   { atomicNumber: 87, symbol: 'Fr', name: 'francium', covalentRadius: 2.60, vdwRadius: 3.48, mass: 223.0 },
@@ -116,6 +116,24 @@ export const ELEMENTS: ElementData[] = [
   { atomicNumber: 101, symbol: 'Md', name: 'mendelevium', covalentRadius: 1.50, vdwRadius: 2.46, mass: 258.0 },
   { atomicNumber: 102, symbol: 'No', name: 'nobelium', covalentRadius: 1.50, vdwRadius: 2.46, mass: 259.0 },
   { atomicNumber: 103, symbol: 'Lr', name: 'lawrencium', covalentRadius: 1.50, vdwRadius: 2.00, mass: 262.0 },
+  // Superheavy elements (104-118). Covalent radii are computed estimates
+  // (Pyykkö 2009); van der Waals radii are unknown, so a nominal 2.0 is used.
+  // Masses are the mass number of the most stable / best-characterised isotope.
+  { atomicNumber: 104, symbol: 'Rf', name: 'rutherfordium', covalentRadius: 1.57, vdwRadius: 2.00, mass: 267.0 },
+  { atomicNumber: 105, symbol: 'Db', name: 'dubnium', covalentRadius: 1.49, vdwRadius: 2.00, mass: 268.0 },
+  { atomicNumber: 106, symbol: 'Sg', name: 'seaborgium', covalentRadius: 1.43, vdwRadius: 2.00, mass: 269.0 },
+  { atomicNumber: 107, symbol: 'Bh', name: 'bohrium', covalentRadius: 1.41, vdwRadius: 2.00, mass: 270.0 },
+  { atomicNumber: 108, symbol: 'Hs', name: 'hassium', covalentRadius: 1.34, vdwRadius: 2.00, mass: 269.0 },
+  { atomicNumber: 109, symbol: 'Mt', name: 'meitnerium', covalentRadius: 1.29, vdwRadius: 2.00, mass: 278.0 },
+  { atomicNumber: 110, symbol: 'Ds', name: 'darmstadtium', covalentRadius: 1.28, vdwRadius: 2.00, mass: 281.0 },
+  { atomicNumber: 111, symbol: 'Rg', name: 'roentgenium', covalentRadius: 1.21, vdwRadius: 2.00, mass: 282.0 },
+  { atomicNumber: 112, symbol: 'Cn', name: 'copernicium', covalentRadius: 1.22, vdwRadius: 2.00, mass: 285.0 },
+  { atomicNumber: 113, symbol: 'Nh', name: 'nihonium', covalentRadius: 1.36, vdwRadius: 2.00, mass: 286.0 },
+  { atomicNumber: 114, symbol: 'Fl', name: 'flerovium', covalentRadius: 1.43, vdwRadius: 2.00, mass: 289.0 },
+  { atomicNumber: 115, symbol: 'Mc', name: 'moscovium', covalentRadius: 1.62, vdwRadius: 2.00, mass: 290.0 },
+  { atomicNumber: 116, symbol: 'Lv', name: 'livermorium', covalentRadius: 1.75, vdwRadius: 2.00, mass: 293.0 },
+  { atomicNumber: 117, symbol: 'Ts', name: 'tennessine', covalentRadius: 1.65, vdwRadius: 2.00, mass: 294.0 },
+  { atomicNumber: 118, symbol: 'Og', name: 'oganesson', covalentRadius: 1.57, vdwRadius: 2.00, mass: 294.0 },
 ]
 
 // Lookup maps for fast access

@@ -25,6 +25,8 @@
     for (let z = 72; z <= 86; z++) out.push({ z, row: 6, col: z - 68 })
     out.push({ z: 87, row: 7, col: 1 }, { z: 88, row: 7, col: 2 })
     for (let z = 89; z <= 103; z++) out.push({ z, row: 9, col: z - 86 })
+    // Period-7 d/p block: Rf(104)…Cn(112) then Nh(113)…Og(118).
+    for (let z = 104; z <= 118; z++) out.push({ z, row: 7, col: z - 100 })
     return out
   })()
 

@@ -98,7 +98,7 @@ const ELEMENTS: ElementBase[] = [
   { name: "thallium", symbol: "Tl", atomicNumber: 81, covalentRadius: 1.45, vdwRadius: 1.96, mass: 204.3833 },
   { name: "lead", symbol: "Pb", atomicNumber: 82, covalentRadius: 1.46, vdwRadius: 2.02, mass: 207.2 },
   { name: "bismuth", symbol: "Bi", atomicNumber: 83, covalentRadius: 1.48, vdwRadius: 2.00, mass: 208.98038 },
-  { name: "polonium", symbol: "Po", atomicNumber: 84, covalentRadius: 1.40, vdwRadius: 2.00, mass: 290.0 },
+  { name: "polonium", symbol: "Po", atomicNumber: 84, covalentRadius: 1.40, vdwRadius: 2.00, mass: 209.0 },
   { name: "astatine", symbol: "At", atomicNumber: 85, covalentRadius: 1.21, vdwRadius: 2.00, mass: 210.0 },
   { name: "radon", symbol: "Rn", atomicNumber: 86, covalentRadius: 1.50, vdwRadius: 2.00, mass: 222.0 },
   { name: "francium", symbol: "Fr", atomicNumber: 87, covalentRadius: 2.60, vdwRadius: 2.00, mass: 223.0 },
@@ -118,6 +118,23 @@ const ELEMENTS: ElementBase[] = [
   { name: "mendelevium", symbol: "Md", atomicNumber: 101, covalentRadius: 1.50, vdwRadius: 2.00, mass: 258.0 },
   { name: "nobelium", symbol: "No", atomicNumber: 102, covalentRadius: 1.50, vdwRadius: 2.00, mass: 259.0 },
   { name: "lawrencium", symbol: "Lr", atomicNumber: 103, covalentRadius: 1.50, vdwRadius: 2.00, mass: 262.0 },
+  // Superheavy elements (104-118). Covalent radii are computed estimates
+  // (Pyykkö 2009); van der Waals radii are unknown, so a nominal 2.0 is used.
+  { name: "rutherfordium", symbol: "Rf", atomicNumber: 104, covalentRadius: 1.57, vdwRadius: 2.00, mass: 267.0 },
+  { name: "dubnium", symbol: "Db", atomicNumber: 105, covalentRadius: 1.49, vdwRadius: 2.00, mass: 268.0 },
+  { name: "seaborgium", symbol: "Sg", atomicNumber: 106, covalentRadius: 1.43, vdwRadius: 2.00, mass: 269.0 },
+  { name: "bohrium", symbol: "Bh", atomicNumber: 107, covalentRadius: 1.41, vdwRadius: 2.00, mass: 270.0 },
+  { name: "hassium", symbol: "Hs", atomicNumber: 108, covalentRadius: 1.34, vdwRadius: 2.00, mass: 269.0 },
+  { name: "meitnerium", symbol: "Mt", atomicNumber: 109, covalentRadius: 1.29, vdwRadius: 2.00, mass: 278.0 },
+  { name: "darmstadtium", symbol: "Ds", atomicNumber: 110, covalentRadius: 1.28, vdwRadius: 2.00, mass: 281.0 },
+  { name: "roentgenium", symbol: "Rg", atomicNumber: 111, covalentRadius: 1.21, vdwRadius: 2.00, mass: 282.0 },
+  { name: "copernicium", symbol: "Cn", atomicNumber: 112, covalentRadius: 1.22, vdwRadius: 2.00, mass: 285.0 },
+  { name: "nihonium", symbol: "Nh", atomicNumber: 113, covalentRadius: 1.36, vdwRadius: 2.00, mass: 286.0 },
+  { name: "flerovium", symbol: "Fl", atomicNumber: 114, covalentRadius: 1.43, vdwRadius: 2.00, mass: 289.0 },
+  { name: "moscovium", symbol: "Mc", atomicNumber: 115, covalentRadius: 1.62, vdwRadius: 2.00, mass: 290.0 },
+  { name: "livermorium", symbol: "Lv", atomicNumber: 116, covalentRadius: 1.75, vdwRadius: 2.00, mass: 293.0 },
+  { name: "tennessine", symbol: "Ts", atomicNumber: 117, covalentRadius: 1.65, vdwRadius: 2.00, mass: 294.0 },
+  { name: "oganesson", symbol: "Og", atomicNumber: 118, covalentRadius: 1.57, vdwRadius: 2.00, mass: 294.0 },
 ];
 
 import { JMOL_COLORS_NORMALIZED } from "./jmolColors";
@@ -164,7 +181,7 @@ export function vdwRadius(symbol: string): number {
   return getElement(symbol).vdwRadius;
 }
 
-/** All element records (merged with current overrides). Z 0..103. */
+/** All element records (merged with current overrides). Z 0..118. */
 export function allElements(): ElementData[] {
   return ELEMENTS.map(_merge);
 }

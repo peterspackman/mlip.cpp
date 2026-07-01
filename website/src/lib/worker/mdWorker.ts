@@ -13,6 +13,7 @@
 
 import createMlipcpp from '@peterspackman/mlip.js'
 import type { MlipcppModule, Model, AtomicSystem } from '@peterspackman/mlip.js'
+import { getMass } from '../chem/elements'
 // Grab both variant WASM URLs so Vite bundles them as static assets. The
 // loader picks one at runtime based on the user's backend choice.
 import cpuWasmUrl from '@peterspackman/mlip.js/cpu-wasm?url'
@@ -121,26 +122,14 @@ function maskFrozen(g: Float64Array): void {
   }
 }
 
-// Standard atomic weights in amu (IUPAC 2021). Covers rows 1-5 plus the common
-// heavier elements seen in MLIP training sets. Unknown Z falls back to carbon
-// with a console warning so missing entries are visible.
-const ATOMIC_MASSES: Record<number, number> = {
-  1: 1.008, 2: 4.0026,
-  3: 6.94, 4: 9.0122, 5: 10.81, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 10: 20.180,
-  11: 22.990, 12: 24.305, 13: 26.982, 14: 28.085, 15: 30.974, 16: 32.06, 17: 35.45, 18: 39.95,
-  19: 39.098, 20: 40.078, 21: 44.956, 22: 47.867, 23: 50.942, 24: 51.996, 25: 54.938, 26: 55.845,
-  27: 58.933, 28: 58.693, 29: 63.546, 30: 65.38, 31: 69.723, 32: 72.630, 33: 74.922, 34: 78.971,
-  35: 79.904, 36: 83.798,
-  37: 85.468, 38: 87.62, 39: 88.906, 40: 91.224, 41: 92.906, 42: 95.95, 44: 101.07, 45: 102.91,
-  46: 106.42, 47: 107.87, 48: 112.41, 49: 114.82, 50: 118.71, 51: 121.76, 52: 127.60, 53: 126.90, 54: 131.29,
-  55: 132.91, 56: 137.33, 72: 178.49, 73: 180.95, 74: 183.84, 75: 186.21, 76: 190.23, 77: 192.22,
-  78: 195.08, 79: 196.97, 80: 200.59, 81: 204.38, 82: 207.2, 83: 208.98,
-}
-
+// Atomic masses are pulled from the shared element table (Z 1-118) so every
+// element the editor can produce also gets correct dynamics. Z with no tabulated
+// mass (0 = dummy, or out of range) falls back to carbon with a console warning
+// so any gap is visible rather than silently wrong.
 const warnedMassZ = new Set<number>()
 function massFor(z: number): number {
-  const m = ATOMIC_MASSES[z]
-  if (m !== undefined) return m
+  const m = getMass(z)
+  if (m > 0) return m
   if (!warnedMassZ.has(z)) {
     warnedMassZ.add(z)
     console.warn(`[mdWorker] No atomic mass for Z=${z}; using 12.011 (carbon). Dynamics will be wrong for this element.`)
