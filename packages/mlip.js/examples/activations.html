@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mlip.js — activation inspector</title>
+    <style>
+        :root {
+            --fg: #1a1a1a;
+            --muted: #666;
+            --bg: #fafafa;
+            --panel: #fff;
+            --border: #e5e5e5;
+            --accent: #0066cc;
+            --good: #0a8d3a;
+            --bad: #c0392b;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font: 14px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            color: var(--fg);
+            background: var(--bg);
+        }
+        header {
+            padding: 12px 20px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+        }
+        h1 { font-size: 16px; margin: 0 0 4px 0; }
+        .sub { color: var(--muted); font-size: 12px; }
+        main {
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            gap: 12px;
+            padding: 12px 20px;
+            height: calc(100vh - 56px);
+        }
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 12px;
+            overflow: auto;
+        }
+        label { display: block; font-weight: 500; margin: 8px 0 4px; }
+        input[type=file], select, button, textarea {
+            font: inherit;
+            padding: 6px 8px;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: white;
+            color: var(--fg);
+        }
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            cursor: pointer;
+            padding: 8px 14px;
+            font-weight: 500;
+        }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        textarea { width: 100%; height: 90px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; }
+        .status { color: var(--muted); margin-top: 8px; font-size: 12px; }
+        .status.err { color: var(--bad); }
+        .status.ok { color: var(--good); }
+
+        #right { display: grid; grid-template-rows: auto 1fr auto; gap: 8px; padding: 0; }
+        #summary { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+        #summary span.k { color: var(--muted); margin-right: 4px; }
+        #summary span.v { font-family: ui-monospace, 'SF Mono', Menlo, monospace; margin-right: 14px; }
+
+        #tableWrap { overflow: auto; }
+        table { width: 100%; border-collapse: collapse; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; }
+        thead th {
+            position: sticky; top: 0;
+            background: #f0f0f0;
+            text-align: left;
+            padding: 6px 10px;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            user-select: none;
+        }
+        thead th:hover { background: #e6e6e6; }
+        thead th.sort-asc::after  { content: ' ▲'; color: var(--accent); }
+        thead th.sort-desc::after { content: ' ▼'; color: var(--accent); }
+        tbody tr { cursor: pointer; }
+        tbody tr:hover { background: #f4f8ff; }
+        tbody tr.selected { background: #dceaff; }
+        tbody td { padding: 4px 10px; border-bottom: 1px solid #f0f0f0; }
+        td.num { text-align: right; }
+        td.name { color: var(--accent); }
+        td.dtype.f32 { color: #555; }
+        td.dtype.i32 { color: #b06; }
+        td.dtype.i8  { color: #960; }
+
+        #preview {
+            border-top: 1px solid var(--border);
+            padding: 10px 12px;
+            font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow: auto;
+            white-space: pre-wrap;
+            background: #fafbfc;
+        }
+        #preview h3 { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 500; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>mlip.js · activation inspector</h1>
+        <div class="sub">Run a graph model on a system and browse every intermediate tensor.</div>
+    </header>
+
+    <main>
+        <aside class="panel">
+            <label>Backend</label>
+            <select id="backendSel">
+                <option value="cpu">CPU</option>
+                <option value="webgpu">WebGPU</option>
+                <option value="auto">auto</option>
+            </select>
+
+            <label>1. Load GGUF model</label>
+            <input type="file" id="modelFile" accept=".gguf">
+
+            <label>2. Geometry</label>
+            <select id="presetSel">
+                <option value="water">Water (H₂O)</option>
+                <option value="methane">Methane (CH₄)</option>
+                <option value="custom">Custom XYZ…</option>
+            </select>
+            <textarea id="xyzInput" placeholder="Paste XYZ here (only used when 'Custom XYZ…' is selected)"></textarea>
+
+            <label>3. Run</label>
+            <button id="runBtn" disabled>Capture activations</button>
+
+            <div id="status" class="status">Loading mlip.js…</div>
+        </aside>
+
+        <section id="right" class="panel">
+            <div id="summary"></div>
+            <div id="tableWrap">
+                <table id="actTable">
+                    <thead>
+                        <tr>
+                            <th data-key="node_id">id</th>
+                            <th data-key="name">name</th>
+                            <th data-key="dtype">dtype</th>
+                            <th data-key="shape_str">shape</th>
+                            <th data-key="n_elements" class="num">n</th>
+                            <th data-key="min" class="num">min</th>
+                            <th data-key="max" class="num">max</th>
+                            <th data-key="mean" class="num">mean</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div id="preview"><h3>Click a row to preview values</h3></div>
+        </section>
+    </main>
+
+    <script type="module">
+        import createMlip from '../dist/index.browser.js';
+
+        const els = {
+            status: document.getElementById('status'),
+            backendSel: document.getElementById('backendSel'),
+            modelFile: document.getElementById('modelFile'),
+            presetSel: document.getElementById('presetSel'),
+            xyzInput: document.getElementById('xyzInput'),
+            runBtn: document.getElementById('runBtn'),
+            summary: document.getElementById('summary'),
+            tbody: document.querySelector('#actTable tbody'),
+            ths: document.querySelectorAll('#actTable th'),
+            preview: document.getElementById('preview'),
+        };
+
+        // Pre-canned geometries (Å). Format matches mlip.js AtomicSystem.create().
+        const PRESETS = {
+            water: {
+                positions: new Float64Array([
+                    0.0,  0.000,  0.117,
+                    0.0,  0.757, -0.469,
+                    0.0, -0.757, -0.469,
+                ]),
+                Z: new Int32Array([8, 1, 1]),
+            },
+            methane: {
+                positions: new Float64Array([
+                    0.000,  0.000,  0.000,
+                    0.629,  0.629,  0.629,
+                   -0.629, -0.629,  0.629,
+                   -0.629,  0.629, -0.629,
+                    0.629, -0.629, -0.629,
+                ]),
+                Z: new Int32Array([6, 1, 1, 1, 1]),
+            },
+        };
+
+        function setStatus(msg, kind) {
+            els.status.textContent = msg;
+            els.status.className = 'status ' + (kind ?? '');
+        }
+
+        // Minimal XYZ parser: skip header lines, then `<element> x y z` per line.
+        const PERIODIC = ['', 'H','He','Li','Be','B','C','N','O','F','Ne','Na','Mg','Al','Si','P','S','Cl','Ar','K','Ca'];
+        const ELEM_TO_Z = Object.fromEntries(PERIODIC.map((s, i) => [s.toLowerCase(), i]).filter(([s]) => s));
+        function parseXyz(text) {
+            const lines = text.trim().split(/\r?\n/);
+            const n = parseInt(lines[0], 10);
+            if (!Number.isFinite(n)) throw new Error('XYZ: first line must be the atom count.');
+            const positions = new Float64Array(n * 3);
+            const Z = new Int32Array(n);
+            for (let i = 0; i < n; i++) {
+                const parts = lines[2 + i].trim().split(/\s+/);
+                const z = ELEM_TO_Z[parts[0].toLowerCase()];
+                if (!z) throw new Error(`XYZ: unknown element '${parts[0]}'`);
+                Z[i] = z;
+                positions[i*3]   = parseFloat(parts[1]);
+                positions[i*3+1] = parseFloat(parts[2]);
+                positions[i*3+2] = parseFloat(parts[3]);
+            }
+            return { positions, Z };
+        }
+
+        function getGeometry() {
+            const sel = els.presetSel.value;
+            if (sel === 'custom') return parseXyz(els.xyzInput.value);
+            return PRESETS[sel];
+        }
+
+        // --- main state ---
+        let Module = null;
+        let model = null;
+        let rows = [];      // [{node_id, name, dtype, shape, shape_str, data, n_elements, min, max, mean}]
+        let sortKey = 'node_id';
+        let sortDir = 1;    // 1 asc, -1 desc
+
+        function statsOf(arr) {
+            if (!arr || arr.length === 0) return { min: NaN, max: NaN, mean: NaN };
+            let mn = Infinity, mx = -Infinity, sum = 0;
+            for (let i = 0; i < arr.length; i++) {
+                const v = arr[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v;
+            }
+            return { min: mn, max: mx, mean: sum / arr.length };
+        }
+
+        const fmt = v => Number.isFinite(v) ? v.toExponential(2) : '—';
+
+        function renderTable() {
+            const sorted = rows.slice().sort((a, b) => {
+                const x = a[sortKey], y = b[sortKey];
+                if (x === y) return 0;
+                if (x === undefined || x === null || Number.isNaN(x)) return 1;
+                if (y === undefined || y === null || Number.isNaN(y)) return -1;
+                return (x < y ? -1 : 1) * sortDir;
+            });
+            // Build the rows in one string for speed (a few hundred rows max).
+            const html = sorted.map(r => `
+                <tr data-id="${r.node_id}">
+                    <td class="num">${r.node_id}</td>
+                    <td class="name">${r.name}</td>
+                    <td class="dtype ${r.dtype}">${r.dtype}</td>
+                    <td>${r.shape_str}</td>
+                    <td class="num">${r.n_elements}</td>
+                    <td class="num">${fmt(r.min)}</td>
+                    <td class="num">${fmt(r.max)}</td>
+                    <td class="num">${fmt(r.mean)}</td>
+                </tr>`).join('');
+            els.tbody.innerHTML = html;
+            els.ths.forEach(th => {
+                th.classList.remove('sort-asc', 'sort-desc');
+                if (th.dataset.key === sortKey) {
+                    th.classList.add(sortDir > 0 ? 'sort-asc' : 'sort-desc');
+                }
+            });
+        }
+
+        els.ths.forEach(th => {
+            th.addEventListener('click', () => {
+                const k = th.dataset.key;
+                if (sortKey === k) sortDir = -sortDir;
+                else { sortKey = k; sortDir = 1; }
+                renderTable();
+            });
+        });
+
+        els.tbody.addEventListener('click', e => {
+            const tr = e.target.closest('tr');
+            if (!tr) return;
+            const id = parseInt(tr.dataset.id, 10);
+            const r = rows.find(x => x.node_id === id);
+            if (!r) return;
+            els.tbody.querySelectorAll('tr.selected').forEach(t => t.classList.remove('selected'));
+            tr.classList.add('selected');
+            const n = Math.min(r.data.length, 64);
+            const head = Array.from(r.data.slice(0, n))
+                .map(v => typeof v === 'number' ? v.toFixed(4) : String(v))
+                .join(', ');
+            els.preview.innerHTML =
+                `<h3>id ${r.node_id} · ${r.name} · [${r.shape_str}] · ${r.dtype} · ${r.n_elements} elts</h3>` +
+                `[${head}${r.data.length > n ? `, … (+${r.data.length - n} more)` : ''}]`;
+        });
+
+        // --- init ---
+        // Module is (re)created when the user picks a model, with the selected
+        // backend. This lets you switch CPU<->WebGPU without reloading the page.
+        async function ensureModule() {
+            const backend = els.backendSel.value;
+            if (Module && Module.__backend === backend) return Module;
+            Module = await createMlip({ backend });
+            Module.__backend = backend;
+            return Module;
+        }
+
+        setStatus('Pick a backend and load a model.', 'ok');
+
+        els.modelFile.addEventListener('change', async e => {
+            const file = e.target.files[0];
+            if (!file) return;
+            setStatus(`Loading ${file.name}…`);
+            els.runBtn.disabled = true;
+            try {
+                const mod = await ensureModule();
+                const v = await mod.getVersion();
+                const buf = await file.arrayBuffer();
+                // await everywhere so this works against both the CPU build
+                // (sync) and the GPU build (ASYNCIFY → all calls return Promises).
+                model = await mod.Model.loadFromBuffer(buf);
+                const [type, cutoff] = await Promise.all([model.modelType(), model.cutoff()]);
+                setStatus(`mlip.js v${v} · ${els.backendSel.value} · ${type} · cutoff ${cutoff.toFixed(2)} Å`, 'ok');
+                els.runBtn.disabled = false;
+            } catch (err) {
+                setStatus('Failed to load model: ' + err.message, 'err');
+                console.error(err);
+            }
+        });
+
+        els.runBtn.addEventListener('click', async () => {
+            if (!model) return;
+            els.runBtn.disabled = true;
+            setStatus('Running…');
+            try {
+                const { positions, Z } = getGeometry();
+                const mod = await ensureModule();
+                const sys = await mod.AtomicSystem.create(positions, Z, null, false);
+                const t0 = performance.now();
+                const result = await model.predictWithActivations(sys);
+                const elapsed = performance.now() - t0;
+
+                rows = [];
+                let totalBytes = 0;
+                for (const [id, a] of result.activations) {
+                    totalBytes += a.data ? a.data.byteLength : 0;
+                    const stats = a.dtype === 'f32' ? statsOf(a.data) : { min: NaN, max: NaN, mean: NaN };
+                    rows.push({
+                        node_id: id,
+                        name: a.name,
+                        dtype: a.dtype,
+                        shape: a.shape,
+                        shape_str: a.shape.join('×'),
+                        data: a.data ?? new Float32Array(),
+                        n_elements: a.data ? a.data.length : 0,
+                        ...stats,
+                    });
+                }
+
+                els.summary.innerHTML =
+                    `<span class="k">energy</span><span class="v">${result.energy.toFixed(6)} eV</span>` +
+                    `<span class="k">atoms</span><span class="v">${Z.length}</span>` +
+                    `<span class="k">tensors</span><span class="v">${rows.length}</span>` +
+                    `<span class="k">payload</span><span class="v">${(totalBytes / 1024).toFixed(1)} KiB</span>` +
+                    `<span class="k">time</span><span class="v">${elapsed.toFixed(1)} ms</span>`;
+                renderTable();
+                els.preview.innerHTML = '<h3>Click a row to preview values</h3>';
+                setStatus(`Captured ${rows.length} tensors in ${elapsed.toFixed(1)} ms.`, 'ok');
+            } catch (err) {
+                setStatus('Run failed: ' + err.message, 'err');
+                console.error(err);
+            } finally {
+                els.runBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

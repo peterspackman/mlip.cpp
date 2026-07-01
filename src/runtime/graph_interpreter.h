@@ -64,6 +64,21 @@ public:
   // Dump all node outputs after compute (call after backend_graph_compute)
   void dump_all_tensors();
 
+  // Callback invoked once per tensor by capture_all_outputs.
+  // The tensor pointer is owned by the interpreter; data lives on the active
+  // backend buffer and is valid only until the next build()/teardown. Use
+  // ggml_backend_tensor_get to read across backends. The id matches the GIR
+  // node id for nodes; inputs use synthetic ids starting at -1000 (matching
+  // dump_all_tensors), and the final output uses 9999.
+  using CaptureCallback = std::function<void(
+      int id, const std::string &name, ggml_tensor *tensor)>;
+
+  // Walk node outputs, inputs and the final output and invoke `cb` for each.
+  // Must be called after a successful ggml_backend_graph_compute and before
+  // the compute buffer is freed. No I/O; in-memory equivalent of
+  // dump_all_tensors().
+  void capture_all_outputs(const CaptureCallback &cb) const;
+
 private:
   // The IR graph
   GIRGraph graph_;

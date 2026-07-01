@@ -268,6 +268,78 @@ public:
 
     bool isLoaded() const { return predictor_ != nullptr; }
 
+    // Predict energy and capture every intermediate tensor for visualisation.
+    // Returns:
+    //   {
+    //     energy: number,
+    //     activations: Map<nodeId, {
+    //       name: string,
+    //       dtype: 'f32' | 'i32' | 'i8' | 'unsupported',
+    //       shape: number[],
+    //       data: Float32Array | Int32Array | Int8Array | null
+    //     }>
+    //   }
+    val predictWithActivations(const AtomicSystemWrapper& system) {
+        if (!predictor_) {
+            throw std::runtime_error("Model not loaded");
+        }
+
+        auto result = predictor_->predict_with_activations(
+            system.numAtoms(),
+            system.positionsPtr(),
+            system.atomicNumbersPtr(),
+            system.cellPtr(),
+            system.pbcPtr()
+        );
+
+        val output = val::object();
+        output.set("energy", static_cast<double>(result.prediction.energy));
+
+        val activations = val::global("Map").new_();
+        for (const auto& a : result.activations) {
+            val entry = val::object();
+            entry.set("name", a.name);
+            entry.set("dtype", a.dtype);
+
+            val shape = val::array();
+            for (size_t i = 0; i < a.shape.size(); ++i) {
+                shape.set(static_cast<int>(i), static_cast<double>(a.shape[i]));
+            }
+            entry.set("shape", shape);
+
+            // Bulk-copy through Embind's typed_memory_view, which constructs
+            // a TypedArray view over the WASM heap directly. This avoids
+            // depending on Module.HEAPF32 etc. being exposed by the build.
+            val data = val::null();
+            if (!a.data.empty()) {
+                if (a.dtype == "f32") {
+                    const size_t n = a.data.size() / sizeof(float);
+                    data = val::global("Float32Array").new_(n);
+                    val src(typed_memory_view(n,
+                        reinterpret_cast<const float*>(a.data.data())));
+                    data.call<void>("set", src);
+                } else if (a.dtype == "i32") {
+                    const size_t n = a.data.size() / sizeof(int32_t);
+                    data = val::global("Int32Array").new_(n);
+                    val src(typed_memory_view(n,
+                        reinterpret_cast<const int32_t*>(a.data.data())));
+                    data.call<void>("set", src);
+                } else if (a.dtype == "i8") {
+                    const size_t n = a.data.size();
+                    data = val::global("Int8Array").new_(n);
+                    val src(typed_memory_view(n,
+                        reinterpret_cast<const int8_t*>(a.data.data())));
+                    data.call<void>("set", src);
+                }
+            }
+            entry.set("data", data);
+
+            activations.call<void>("set", a.node_id, entry);
+        }
+        output.set("activations", activations);
+        return output;
+    }
+
 private:
     std::shared_ptr<mlipcpp::Predictor> predictor_;
 };
@@ -309,6 +381,7 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .function("predictEnergy", &PredictorWrapper::predictEnergy)
         .function("predict", &PredictorWrapper::predict)
         .function("predictWithOptions", &PredictorWrapper::predictWithOptions)
+        .function("predictWithActivations", &PredictorWrapper::predictWithActivations)
         .function("isLoaded", &PredictorWrapper::isLoaded);
 
     // Utility functions

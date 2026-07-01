@@ -11,6 +11,11 @@
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
 #include "runtime/graph_model.h"
+
+#include <ggml-backend.h>
+#include <ggml.h>
+
+#include <cstring>
 #include <mutex>
 
 namespace mlipcpp {
@@ -381,6 +386,72 @@ Result Predictor::predict(int32_t n_atoms, const float *positions,
   }
 }
 
+namespace {
+
+// Map a ggml dtype to the canonical short name used in NodeActivation.dtype.
+// f16 is reported as "f32" because we widen the data on capture.
+const char *activation_dtype_name(ggml_type t) {
+  switch (t) {
+  case GGML_TYPE_F32: return "f32";
+  case GGML_TYPE_F16: return "f32";  // converted on read
+  case GGML_TYPE_I32: return "i32";
+  case GGML_TYPE_I8:  return "i8";   // bool/byte
+  default:            return "unsupported";
+  }
+}
+
+// Read a tensor's data off the active backend and emit a NodeActivation.
+// Returns std::nullopt only on truly empty tensors. Unsupported dtypes
+// produce a NodeActivation with empty `data` and dtype "unsupported" — the
+// shape and name are still useful for visualisation.
+NodeActivation tensor_to_activation(int id, const std::string &name,
+                                    ggml_tensor *t) {
+  NodeActivation a;
+  a.node_id = id;
+  a.name = name;
+  a.dtype = activation_dtype_name(t->type);
+  for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+    if (t->ne[i] <= 0) break;
+    a.shape.push_back(t->ne[i]);
+  }
+  const size_t n = ggml_nelements(t);
+  if (n == 0) return a;
+
+  switch (t->type) {
+  case GGML_TYPE_F32: {
+    a.data.resize(n * sizeof(float));
+    ggml_backend_tensor_get(t, a.data.data(), 0, n * sizeof(float));
+    break;
+  }
+  case GGML_TYPE_F16: {
+    // Read as f16 then widen to f32 in the output buffer.
+    std::vector<ggml_fp16_t> half(n);
+    ggml_backend_tensor_get(t, half.data(), 0, n * sizeof(ggml_fp16_t));
+    a.data.resize(n * sizeof(float));
+    auto *out = reinterpret_cast<float *>(a.data.data());
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = ggml_fp16_to_fp32(half[i]);
+    }
+    break;
+  }
+  case GGML_TYPE_I32: {
+    a.data.resize(n * sizeof(int32_t));
+    ggml_backend_tensor_get(t, a.data.data(), 0, n * sizeof(int32_t));
+    break;
+  }
+  case GGML_TYPE_I8: {
+    a.data.resize(n * sizeof(int8_t));
+    ggml_backend_tensor_get(t, a.data.data(), 0, n * sizeof(int8_t));
+    break;
+  }
+  default:
+    break;  // leave data empty for unsupported types
+  }
+  return a;
+}
+
+}  // namespace
+
 Result Predictor::predict(int32_t n_atoms, const float *positions,
                           const int32_t *atomic_numbers, const float *cell,
                           const bool *pbc, const PredictOptions &options) {
@@ -412,6 +483,63 @@ Result Predictor::predict(int32_t n_atoms, const float *positions,
     AtomicSystem system(n_atoms, positions, atomic_numbers, nullptr);
     return impl_->predict_impl(system, options);
   }
+}
+
+ActivationResult Predictor::predict_with_activations(
+    int32_t n_atoms, const float *positions, const int32_t *atomic_numbers,
+    const float *cell, const bool *pbc) {
+  if (!positions || !atomic_numbers) {
+    throw std::invalid_argument(
+        "positions and atomic_numbers must not be null");
+  }
+
+  // Only the auto-export graph path exposes intermediate tensors today.
+  auto *graph_model =
+      dynamic_cast<runtime::GraphModel *>(impl_->model.get());
+  if (!graph_model) {
+    throw std::runtime_error(
+        "predict_with_activations is only supported for graph-based models "
+        "(architecture 'pet-graph'); the loaded model is '" +
+        impl_->model_type_str + "'.");
+  }
+
+  std::optional<AtomicSystem> system;
+  if (cell) {
+    float lattice[3][3];
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        lattice[i][j] = cell[i * 3 + j];
+      }
+    }
+    bool pbc_flags[3] = {true, true, true};
+    if (pbc) {
+      pbc_flags[0] = pbc[0];
+      pbc_flags[1] = pbc[1];
+      pbc_flags[2] = pbc[2];
+    }
+    Cell periodic_cell(lattice, pbc_flags[0], pbc_flags[1], pbc_flags[2]);
+    system.emplace(n_atoms, positions, atomic_numbers, &periodic_cell);
+  } else {
+    system.emplace(n_atoms, positions, atomic_numbers, nullptr);
+  }
+
+  ActivationResult out;
+  auto internal_result = graph_model->predict_with_capture(
+      *system, [&out](runtime::GraphInterpreter &interp) {
+        interp.capture_all_outputs(
+            [&out](int id, const std::string &name, ggml_tensor *t) {
+              out.activations.push_back(tensor_to_activation(id, name, t));
+            });
+      });
+
+  out.prediction.energy = internal_result.energy;
+  if (internal_result.has_forces) {
+    out.prediction.forces = std::move(internal_result.forces);
+  }
+  if (internal_result.has_stress) {
+    out.prediction.stress = std::move(internal_result.stress);
+  }
+  return out;
 }
 
 } // namespace mlipcpp

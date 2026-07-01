@@ -1893,4 +1893,35 @@ void GraphInterpreter::dump_all_tensors() {
   }
 }
 
+void GraphInterpreter::capture_all_outputs(const CaptureCallback &cb) const {
+  if (!cb) {
+    return;
+  }
+
+  for (const auto &[node_id, tensor] : node_outputs_) {
+    if (!tensor) {
+      continue;
+    }
+    std::string name = "unknown";
+    for (const auto &node : graph_.nodes) {
+      if (node.id == node_id) {
+        name = node.name.empty() ? node.op : node.name;
+        break;
+      }
+    }
+    cb(node_id, name, tensor);
+  }
+
+  int input_id = -1000;
+  for (const auto &[name, tensor] : inputs_) {
+    if (tensor) {
+      cb(input_id--, "input_" + name, tensor);
+    }
+  }
+
+  if (output_) {
+    cb(9999, "final_output", output_);
+  }
+}
+
 } // namespace mlipcpp::runtime

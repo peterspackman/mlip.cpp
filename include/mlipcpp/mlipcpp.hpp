@@ -9,6 +9,7 @@
 #define MLIPCPP_HPP
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -63,6 +64,38 @@ struct Result {
 struct ModelOptions {
   Backend backend = Backend::Auto;
   float cutoff_override = 0.0f; ///< 0 = use model default
+};
+
+/**
+ * @brief A single intermediate tensor captured during inference.
+ *
+ * Returned by Predictor::predict_with_activations(). Data is held as raw
+ * bytes; the caller interprets them according to `dtype` and `shape`.
+ *
+ * Node id conventions (mirroring the GIR graph):
+ *   - >= 0 : matches the GIR node id
+ *   - -1000, -1001, ... : synthetic ids for model inputs (one per input)
+ *   - 9999 : the final model output
+ *
+ * Supported dtypes (others are emitted with empty data):
+ *   "f32", "f16" (converted to f32 in `data`), "i32", "i8" (bool/byte)
+ */
+struct NodeActivation {
+  int node_id = 0;
+  std::string name;            ///< human-readable node name
+  std::string dtype;           ///< element type (after any f16->f32 conversion)
+  std::vector<int64_t> shape;  ///< up to 4 entries
+  std::vector<uint8_t> data;   ///< raw bytes; size == n_elements * elt_size
+};
+
+/**
+ * @brief Result of Predictor::predict_with_activations.
+ *
+ * Carries the usual energy/forces/stress alongside per-node activations.
+ */
+struct ActivationResult {
+  Result prediction;
+  std::vector<NodeActivation> activations;
 };
 
 /**
@@ -190,6 +223,26 @@ public:
   Result predict(int32_t n_atoms, const float *positions,
                  const int32_t *atomic_numbers, const float *cell,
                  const bool *pbc, const PredictOptions &options);
+
+  /**
+   * @brief Predict energy and capture every intermediate tensor.
+   *
+   * Runs the energy graph and collects each node's output (plus inputs and
+   * the final output) for inspection. Intended for debugging, parity
+   * checks, and live-trace visualisation; not optimised for throughput.
+   *
+   * Only supported for graph-based models (architecture "pet-graph").
+   * Throws std::runtime_error for legacy model paths or non-CPU backends
+   * that haven't been validated for readback.
+   *
+   * Forces are not captured in this v1 — the visualisation contract is
+   * energy-only (see ACTIVATION_CAPTURE.md, open question 1).
+   */
+  ActivationResult predict_with_activations(int32_t n_atoms,
+                                            const float *positions,
+                                            const int32_t *atomic_numbers,
+                                            const float *cell = nullptr,
+                                            const bool *pbc = nullptr);
 
 private:
   struct Impl;

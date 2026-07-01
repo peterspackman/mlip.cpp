@@ -503,8 +503,17 @@ ModelResult GraphModel::predict(const AtomicSystem &system,
   return predict_single(system, compute_forces);
 }
 
-ModelResult GraphModel::predict_single(const AtomicSystem &system,
-                                       bool compute_forces) {
+ModelResult GraphModel::predict_with_capture(
+    const AtomicSystem &system,
+    const std::function<void(GraphInterpreter &)> &cb) {
+  return predict_single(system, /*compute_forces=*/false,
+                        cb ? std::function<void()>([this, &cb]() { cb(interp_); })
+                           : nullptr);
+}
+
+ModelResult GraphModel::predict_single(
+    const AtomicSystem &system, bool compute_forces,
+    const std::function<void()> &post_compute_hook) {
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
         "GraphModel: forces requested but model was exported with "
@@ -1022,6 +1031,13 @@ ModelResult GraphModel::predict_single(const AtomicSystem &system,
         }
       }
     }
+  }
+
+  // Hook for callers that want to inspect intermediate tensors. Runs while
+  // the compute buffer (and therefore every node_outputs_ tensor) is still
+  // alive on the active backend.
+  if (post_compute_hook) {
+    post_compute_hook();
   }
 
   // Cleanup

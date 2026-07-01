@@ -752,3 +752,110 @@ TEST_CASE("Debug tensor dumping", "[runtime][debug]") {
   // Note: We don't verify the files exist here to keep the test simple
   // In practice, you would check /tmp/test_debug_dump/ for the dumped files
 }
+
+TEST_CASE("Activation capture callback", "[runtime][activations]") {
+  // Two-node graph: SCALE(*2) -> SCALE(*3). Verify capture_all_outputs
+  // fires once per node + once per input + once for the final output, with
+  // shapes and data we can read back through the backend.
+
+  std::string json = R"({
+    "version": "1.0.0",
+    "model_type": "test",
+    "inputs": [
+      {"name": "x", "dtype": "f32", "shape": [4]}
+    ],
+    "outputs": [
+      {"name": "y", "node_ref": "node:1"}
+    ],
+    "nodes": [
+      {"id": 0, "op": "SCALE", "name": "double", "inputs": ["input:x"], "output_shape": [4], "output_dtype": "f32", "params": {"scale": 2.0}},
+      {"id": 1, "op": "SCALE", "name": "triple", "inputs": ["node:0"], "output_shape": [4], "output_dtype": "f32", "params": {"scale": 3.0}}
+    ]
+  })";
+
+  GraphInterpreter interp;
+  interp.load_graph(json);
+
+  struct ggml_init_params params = {
+      .mem_size = 16 * 1024 * 1024,
+      .mem_buffer = nullptr,
+      .no_alloc = true,
+  };
+  ggml_context *ctx = ggml_init(params);
+  REQUIRE(ctx != nullptr);
+
+  ggml_tensor *x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+  ggml_set_input(x);
+  interp.set_input("x", x);
+
+  ggml_tensor *output = interp.build(ctx);
+  REQUIRE(output != nullptr);
+  ggml_set_output(output);
+
+  ggml_cgraph *cgraph = ggml_new_graph(ctx);
+  ggml_build_forward_expand(cgraph, output);
+
+  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+  REQUIRE(cpu_backend != nullptr);
+
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+  REQUIRE(buf != nullptr);
+
+  float input_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
+  ggml_backend_tensor_set(x, input_data, 0, 4 * sizeof(float));
+
+  REQUIRE(ggml_backend_graph_compute(cpu_backend, cgraph) ==
+          GGML_STATUS_SUCCESS);
+
+  // Capture: collect (id, name, first-element value) for every callback call.
+  struct Captured {
+    int id;
+    std::string name;
+    int64_t n_elements;
+    float first_value;
+  };
+  std::vector<Captured> captured;
+  interp.capture_all_outputs(
+      [&](int id, const std::string &name, ggml_tensor *t) {
+        Captured c;
+        c.id = id;
+        c.name = name;
+        c.n_elements = ggml_nelements(t);
+        float v = 0.0f;
+        ggml_backend_tensor_get(t, &v, 0, sizeof(float));
+        c.first_value = v;
+        captured.push_back(c);
+      });
+
+  // We expect: node 0 (double), node 1 (triple), one input (id <= -1000),
+  // and the final output (id 9999).
+  bool saw_node0 = false, saw_node1 = false, saw_input = false, saw_output = false;
+  for (const auto &c : captured) {
+    REQUIRE(c.n_elements == 4);
+    if (c.id == 0) {
+      saw_node0 = true;
+      REQUIRE(c.name == "double");
+      REQUIRE(c.first_value == 2.0f);  // 1 * 2
+    } else if (c.id == 1) {
+      saw_node1 = true;
+      REQUIRE(c.name == "triple");
+      REQUIRE(c.first_value == 6.0f);  // 1 * 2 * 3
+    } else if (c.id <= -1000) {
+      saw_input = true;
+      REQUIRE(c.name == "input_x");
+      REQUIRE(c.first_value == 1.0f);
+    } else if (c.id == 9999) {
+      saw_output = true;
+      REQUIRE(c.name == "final_output");
+      REQUIRE(c.first_value == 6.0f);
+    }
+  }
+  REQUIRE(saw_node0);
+  REQUIRE(saw_node1);
+  REQUIRE(saw_input);
+  REQUIRE(saw_output);
+
+  ggml_backend_buffer_free(buf);
+  ggml_backend_free(cpu_backend);
+  ggml_free(ctx);
+}

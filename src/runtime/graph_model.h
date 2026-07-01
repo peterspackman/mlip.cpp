@@ -5,6 +5,7 @@
 #include "mlipcpp/model.h"
 #include "mlipcpp/neighbor_list.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -77,6 +78,17 @@ public:
    */
   const GraphInterpreter &interpreter() const { return interp_; }
 
+  /**
+   * Run inference and invoke `cb` after the graph compute completes, while
+   * the compute buffer is still alive. The callback typically calls
+   * interp_.capture_all_outputs(...) to read intermediate tensors. Forces
+   * are not computed in this path (the proposed visualisation contract is
+   * energy-only; see ACTIVATION_CAPTURE.md).
+   */
+  ModelResult predict_with_capture(
+      const AtomicSystem &system,
+      const std::function<void(GraphInterpreter &)> &cb);
+
 private:
   GraphInterpreter interp_;
 
@@ -105,8 +117,13 @@ private:
   // Neighbor list builder
   NeighborListBuilder neighbor_builder_;
 
-  // Predict a single system (all logic lives here)
-  ModelResult predict_single(const AtomicSystem &system, bool compute_forces);
+  // Predict a single system (all logic lives here).
+  // post_compute_hook (if set) runs after a successful graph compute and
+  // before the compute buffer is freed — this is the window during which
+  // intermediate tensor data is live on the backend buffer.
+  ModelResult predict_single(
+      const AtomicSystem &system, bool compute_forces,
+      const std::function<void()> &post_compute_hook = nullptr);
 };
 
 } // namespace mlipcpp::runtime
