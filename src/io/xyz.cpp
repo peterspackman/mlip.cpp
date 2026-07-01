@@ -8,18 +8,26 @@
 namespace mlipcpp {
 namespace io {
 
-static int element_to_atomic_number(const std::string &symbol) {
-  // Simple periodic table lookup
-  static const std::vector<std::pair<std::string, int>> elements = {
-      {"H", 1},   {"He", 2},  {"Li", 3},  {"Be", 4},  {"B", 5},   {"C", 6},
-      {"N", 7},   {"O", 8},   {"F", 9},   {"Ne", 10}, {"Na", 11}, {"Mg", 12},
-      {"Al", 13}, {"Si", 14}, {"P", 15},  {"S", 16},  {"Cl", 17}, {"Ar", 18},
-      {"K", 19},  {"Ca", 20}, {"Sc", 21}, {"Ti", 22}, {"V", 23},  {"Cr", 24},
-      {"Mn", 25}, {"Fe", 26}, {"Co", 27}, {"Ni", 28}, {"Cu", 29}, {"Zn", 30},
-      {"Ga", 31}, {"Ge", 32}, {"As", 33}, {"Se", 34}, {"Br", 35}, {"Kr", 36}};
+// Element symbols indexed by atomic number (index 0 unused). Covers the full
+// periodic table (Z 1-118) so any element can be read/written.
+static const char *const ELEMENT_SYMBOLS[] = {
+    "",   "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",  "Ne", "Na",
+    "Mg", "Al", "Si", "P",  "S",  "Cl", "Ar", "K",  "Ca", "Sc", "Ti", "V",
+    "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br",
+    "Kr", "Rb", "Sr", "Y",  "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag",
+    "Cd", "In", "Sn", "Sb", "Te", "I",  "Xe", "Cs", "Ba", "La", "Ce", "Pr",
+    "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+    "Hf", "Ta", "W",  "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi",
+    "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U",  "Np", "Pu", "Am",
+    "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh",
+    "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"};
 
-  for (const auto &[sym, Z] : elements) {
-    if (sym == symbol) {
+static constexpr int MAX_ATOMIC_NUMBER =
+    static_cast<int>(sizeof(ELEMENT_SYMBOLS) / sizeof(ELEMENT_SYMBOLS[0])) - 1;
+
+static int element_to_atomic_number(const std::string &symbol) {
+  for (int Z = 1; Z <= MAX_ATOMIC_NUMBER; ++Z) {
+    if (symbol == ELEMENT_SYMBOLS[Z]) {
       return Z;
     }
   }
@@ -141,13 +149,6 @@ AtomicSystem read_xyz(const std::string &filename) {
 
 void write_xyz(std::ostream &stream, const AtomicSystem &system,
                const std::string &comment) {
-  // Simple atomic number to element symbol (expand as needed)
-  static const char *symbols[] = {
-      "",   "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",
-      "Ne", "Na", "Mg", "Al", "Si", "P",  "S",  "Cl", "Ar", "K",
-      "Ca", "Sc", "Ti", "V",  "Cr", "Mn", "Fe", "Co", "Ni", "Cu",
-      "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr"};
-
   int n_atoms = system.num_atoms();
   const int32_t *atomic_nums = system.atomic_numbers();
   const float *pos = system.positions();
@@ -161,13 +162,13 @@ void write_xyz(std::ostream &stream, const AtomicSystem &system,
   // Write atoms
   for (int i = 0; i < n_atoms; ++i) {
     int Z = atomic_nums[i];
-    if (Z <= 0 || Z > 36) {
+    if (Z <= 0 || Z > MAX_ATOMIC_NUMBER) {
       throw std::runtime_error("XYZ: Unsupported atomic number: " +
                                std::to_string(Z));
     }
 
-    stream << symbols[Z] << " " << pos[i * 3 + 0] << " " << pos[i * 3 + 1]
-           << " " << pos[i * 3 + 2] << "\n";
+    stream << ELEMENT_SYMBOLS[Z] << " " << pos[i * 3 + 0] << " "
+           << pos[i * 3 + 1] << " " << pos[i * 3 + 2] << "\n";
   }
 }
 
