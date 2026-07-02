@@ -117,6 +117,11 @@ export class SimulationStore {
 
   // App mode + editor selection
   appMode = $state<'sim' | 'edit'>('sim')
+  /** Active element (atomic number) for drawing / adding atoms. Shared between
+   *  the Edit panel's element picker and the viewer's INSERT-mode drawing. */
+  activeElement = $state(6)
+  /** Shortcuts/help overlay visibility. Opened from the Edit panel or ? / h. */
+  helpOpen = $state(false)
   /** Selected atom indices (against the *displayed* atom list, which may be
    *  a supercell expansion of the canonical atoms). */
   selectedAtoms = $state<Set<number>>(new Set())
@@ -620,30 +625,38 @@ export class SimulationStore {
     return true
   }
 
-  /** Paste the clipboard into the structure. Anchor: current selection's
-   *  centroid + small +X offset, or world origin if nothing is selected.
+  /** Paste the clipboard into the structure so its centroid lands on the
+   *  anchor. Anchor priority:
+   *    1. opts.anchor — an explicit world point (e.g. the cursor position)
+   *    2. current selection's centroid + small +X offset
+   *    3. world origin + offset
    *  Newly-pasted atoms become the selection so the user can immediately
    *  G-drag them to a precise location. */
-  async editPaste(opts: { offset?: [number, number, number] } = {}): Promise<boolean> {
+  async editPaste(opts: { offset?: [number, number, number]; anchor?: [number, number, number] } = {}): Promise<boolean> {
     if (!this.canEdit() || !this.clipboard) return false
     const { atomicNumbers: addZ, relPositions } = this.clipboard
     const oldN = this.atomicNumbers.length
     const addN = addZ.length
 
     let ax = 0, ay = 0, az = 0
-    if (this.selectedAtoms.size > 0 && this.positions) {
-      let n = 0
-      for (const i of this.selectedAtoms) {
-        if (i < 0 || i * 3 + 2 >= this.positions.length) continue
-        ax += this.positions[i * 3]
-        ay += this.positions[i * 3 + 1]
-        az += this.positions[i * 3 + 2]
-        n++
+    if (opts.anchor) {
+      // Drop the clipboard centroid exactly on the anchor (cursor paste).
+      ax = opts.anchor[0]; ay = opts.anchor[1]; az = opts.anchor[2]
+    } else {
+      if (this.selectedAtoms.size > 0 && this.positions) {
+        let n = 0
+        for (const i of this.selectedAtoms) {
+          if (i < 0 || i * 3 + 2 >= this.positions.length) continue
+          ax += this.positions[i * 3]
+          ay += this.positions[i * 3 + 1]
+          az += this.positions[i * 3 + 2]
+          n++
+        }
+        if (n > 0) { ax /= n; ay /= n; az /= n }
       }
-      if (n > 0) { ax /= n; ay /= n; az /= n }
+      const off = opts.offset ?? [1.5, 0, 0]
+      ax += off[0]; ay += off[1]; az += off[2]
     }
-    const off = opts.offset ?? [1.5, 0, 0]
-    ax += off[0]; ay += off[1]; az += off[2]
 
     this.pushUndoIfActive()
     const newPos = new Float64Array((oldN + addN) * 3)

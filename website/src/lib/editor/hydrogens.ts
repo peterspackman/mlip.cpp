@@ -89,6 +89,28 @@ export function fillHydrogens(
   return { added: new Float64Array(newH), count: newH.length / 3 }
 }
 
+/** One sensible direction for a *new* bond off atom `idx`, given its current
+ *  neighbours — the valence-open direction the draw tool snaps to when you add
+ *  a bonded atom without aiming. Falls back to +z for an isolated atom. */
+export function openBondDirection(
+  positions: Float64Array,
+  atomicNumbers: number[],
+  idx: number,
+): [number, number, number] {
+  const adj = buildAdjacency(positions, atomicNumbers)
+  const nbrs = adj.get(idx) ?? []
+  const existing: THREE.Vector3[] = nbrs.map((j) => {
+    const v = new THREE.Vector3(
+      positions[j * 3]     - positions[idx * 3],
+      positions[j * 3 + 1] - positions[idx * 3 + 1],
+      positions[j * 3 + 2] - positions[idx * 3 + 2],
+    )
+    return v.lengthSq() > 1e-12 ? v.normalize() : new THREE.Vector3(0, 0, 1)
+  })
+  const d = missingDirections(existing, 1)[0] ?? new THREE.Vector3(0, 0, 1)
+  return [d.x, d.y, d.z]
+}
+
 function buildAdjacency(positions: Float64Array, atomicNumbers: number[]): Map<number, number[]> {
   const adj = new Map<number, number[]>()
   // detectBonds returns 1-indexed pairs.

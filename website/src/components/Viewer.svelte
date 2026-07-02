@@ -9,9 +9,13 @@
   import { generateSupercell } from '../lib/chem/supercell'
   import { detectBonds } from '../lib/chem/bonds'
   import { TransformController } from '../lib/editor/transform.svelte'
+  import { EditorMachine } from '../lib/editor/editorMachine.svelte'
+  import { openBondDirection } from '../lib/editor/hydrogens'
   import { GhostFlash } from '../lib/editor/ghostFlash'
   import EditOverlay from './EditOverlay.svelte'
+  import EditorHelp from './EditorHelp.svelte'
   import type { SimulationStore } from '../lib/stores/simulation.svelte'
+  import { getElementByNumber, symbolToAtomicNumber } from '../lib/molview/data/elements'
   import * as THREE from 'three'
   import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js'
   import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js'
@@ -61,7 +65,7 @@
   // user click-drags on the canvas to draw a rectangle; on release, atoms
   // whose camera-projected centers fall inside become the selection (modifier
   // keys at start time decide replace / add / toggle). Esc cancels.
-  let boxArmed = $state(false)
+  // `boxArmed` is derived from the machine so 'box' is a first-class mode.
   let boxStart: { x: number; y: number } | null = $state(null)
   let boxEnd: { x: number; y: number } | null = $state(null)
   let boxModifier: 'replace' | 'add' | 'toggle' = 'replace'
@@ -75,22 +79,58 @@
     return { x, y, w, h }
   })
 
-  function exitBoxMode(): void {
-    boxArmed = false
+  function clearBoxScratch(): void {
     boxStart = null
     boxEnd = null
   }
 
+  // INSERT-mode scratch. insertDragging mutes the camera while a bond is being
+  // dragged off an existing atom; insertStartAtom is the atom under pointerdown
+  // (-1 = empty); insertPointerActive tracks an in-progress insert gesture.
+  let insertDragging = $state(false)
+  let insertStartAtom = -1
+  let insertPointerActive = false
+
+  /** Wipe every per-gesture scratch variable back to its idle value. Called on
+   *  every machine transition (via onAnyTransition), so no gesture state can
+   *  survive into a different mode. Does NOT touch pointerOwnedByTransform —
+   *  that is deliberately set during a transition (commit-on-pointerdown) and
+   *  owned by the pointerdown/up pair. */
+  function resetGestureScratch(): void {
+    insertDragging = false
+    insertStartAtom = -1
+    insertPointerActive = false
+    boxStart = null
+    boxEnd = null
+    dragged = false
+  }
+
+  // The editor mode state machine. It is the SINGLE source of truth for the
+  // top-level interaction state; every key/pointer handler routes through it
+  // and reads `machine.mode` (never transform.active / boxArmed directly for
+  // decisions). Side effects (begin a transform, arm the marquee, run a
+  // command) are wired here; onAnyTransition guarantees a clean slate.
+  const machine = new EditorMachine({
+    onEnterTransform: (kind) => transform.begin(kind, lastPointer.x, lastPointer.y),
+    onSwitchTransform: (kind) => transform.switchMode(kind),
+    onCommitTransform: () => transform.commit(),
+    onCancelTransform: () => transform.cancel(),
+    onCommitBox: () => commitBoxSelection(),
+    onRunCommand: (buf) => runCommand(buf),
+    onAnyTransition: () => resetGestureScratch(),
+  })
+  let boxArmed = $derived(machine.mode === 'box')
+
   function commitBoxSelection(): void {
-    if (!stage || !canvasEl || !boxStart || !boxEnd) { exitBoxMode(); return }
+    if (!stage || !canvasEl || !boxStart || !boxEnd) { clearBoxScratch(); return }
     const display = prepareDisplay()
-    if (!display) { exitBoxMode(); return }
+    if (!display) { clearBoxScratch(); return }
     const minX = Math.min(boxStart.x, boxEnd.x)
     const maxX = Math.max(boxStart.x, boxEnd.x)
     const minY = Math.min(boxStart.y, boxEnd.y)
     const maxY = Math.max(boxStart.y, boxEnd.y)
     // Click without drag → ignore (user just tapped, treat as cancel).
-    if (maxX - minX < 2 && maxY - minY < 2) { exitBoxMode(); return }
+    if (maxX - minX < 2 && maxY - minY < 2) { clearBoxScratch(); return }
 
     const cam = stage.camera
     const w = canvasEl.clientWidth
@@ -128,7 +168,168 @@
     }
     store.selectedAtoms = next
     store.selectedBond = null
-    exitBoxMode()
+    clearBoxScratch()
+  }
+
+  // --- INSERT-mode building ------------------------------------------------
+
+  /** Canonical index of the atom under the cursor, or -1 for empty space. */
+  function pickAtomAt(ev: MouseEvent): number {
+    if (!stage || !structureObj || !canvasEl) return -1
+    const hit = picker.pick(ev, stage.camera, canvasEl, structureObj)
+    return hit && hit.type === 'atom' ? canonicalize(hit.atomIndex) : -1
+  }
+
+  function atomVec(i: number): THREE.Vector3 {
+    const p = store.positions!
+    return new THREE.Vector3(p[i * 3], p[i * 3 + 1], p[i * 3 + 2])
+  }
+
+  /** Centroid of the current structure, used as the depth reference for
+   *  placing free atoms so they land near the molecule and stay visible. */
+  function structureCentroid(): THREE.Vector3 {
+    const p = store.positions
+    const c = new THREE.Vector3()
+    if (!p || p.length < 3) return c
+    const n = p.length / 3
+    for (let i = 0; i < n; i++) { c.x += p[i * 3]; c.y += p[i * 3 + 1]; c.z += p[i * 3 + 2] }
+    return c.divideScalar(n)
+  }
+
+  /** Project canvas-relative (px) coords onto the screen-parallel plane through
+   *  `ref` — the Avogadro trick that turns a 2D point into a 3D one at a
+   *  sensible depth. */
+  function canvasToWorldPlane(cx: number, cy: number, ref: THREE.Vector3): THREE.Vector3 | null {
+    if (!stage || !canvasEl) return null
+    const rect = canvasEl.getBoundingClientRect()
+    const ndc = new THREE.Vector2(
+      (cx / rect.width) * 2 - 1,
+      -(cy / rect.height) * 2 + 1,
+    )
+    const ray = new THREE.Raycaster()
+    ray.setFromCamera(ndc, stage.camera)
+    const normal = new THREE.Vector3()
+    stage.camera.getWorldDirection(normal)
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, ref)
+    const hit = new THREE.Vector3()
+    return ray.ray.intersectPlane(plane, hit) ? hit : null
+  }
+
+  /** As above, from a mouse/pointer event's client coordinates. */
+  function screenToWorldPlane(clientX: number, clientY: number, ref: THREE.Vector3): THREE.Vector3 | null {
+    if (!canvasEl) return null
+    const rect = canvasEl.getBoundingClientRect()
+    return canvasToWorldPlane(clientX - rect.left, clientY - rect.top, ref)
+  }
+
+  /** Paste the clipboard so its centroid lands at the cursor (⌘V). Falls back
+   *  to the store's default anchor if the ray can't hit the plane. */
+  function pasteAtCursor(): void {
+    const p = canvasToWorldPlane(lastPointer.x, lastPointer.y, structureCentroid())
+    store.editPaste(p ? { anchor: [p.x, p.y, p.z] } : {})
+  }
+
+  /** Where a new atom bonded to `srcIdx` should sit: aim at `target` but clamp
+   *  the bond length to the sum of covalent radii; if the drag was tiny, snap
+   *  to a valence-open direction instead. */
+  function bondedPlacement(srcIdx: number, target: THREE.Vector3): THREE.Vector3 {
+    const src = atomVec(srcIdx)
+    const bondLen = getElementByNumber(store.atomicNumbers[srcIdx]).covalentRadius
+      + getElementByNumber(store.activeElement).covalentRadius
+    let dir = target.clone().sub(src)
+    if (dir.lengthSq() < 1e-6) {
+      const d = openBondDirection(store.positions!, store.atomicNumbers, srcIdx)
+      dir = new THREE.Vector3(d[0], d[1], d[2])
+    } else {
+      dir.normalize()
+    }
+    return src.add(dir.multiplyScalar(bondLen))
+  }
+
+  /** Resolve an INSERT-mode pointer release into an edit. */
+  function handleInsertRelease(startAtom: number, wasDrag: boolean, ev: PointerEvent): void {
+    if (!wasDrag) {
+      if (startAtom >= 0) {
+        // Click an atom → recolour it to the active element.
+        store.editSetElement(new Set([startAtom]), store.activeElement)
+      } else {
+        // Click empty → drop a new atom at the cursor.
+        const p = screenToWorldPlane(ev.clientX, ev.clientY, structureCentroid())
+        if (p) store.editAddAtom(store.activeElement, [p.x, p.y, p.z])
+      }
+      return
+    }
+    if (startAtom < 0) return // empty-space drag = camera orbit; nothing to build
+    const endAtom = pickAtomAt(ev)
+    if (endAtom >= 0 && endAtom !== startAtom) {
+      store.toggleBond(startAtom, endAtom) // drag atom → atom: (un)bond
+      return
+    }
+    if (endAtom < 0) {
+      // Drag atom → empty: new bonded atom at the release point.
+      const raw = screenToWorldPlane(ev.clientX, ev.clientY, atomVec(startAtom))
+      if (!raw) return
+      const placed = bondedPlacement(startAtom, raw)
+      store.editAddAtom(store.activeElement, [placed.x, placed.y, placed.z])
+    }
+  }
+
+  /** Vim-style command line. Small, extensible verb set. */
+  function runCommand(raw: string): void {
+    const s = raw.trim()
+    if (!s) return
+    const parts = s.split(/\s+/)
+    const cmd = parts[0].toLowerCase()
+    const arg = parts.slice(1).join(' ')
+    switch (cmd) {
+      case 'e':
+      case 'element': {
+        const z = symbolToAtomicNumber(arg)
+        if (z > 0) store.activeElement = z
+        break
+      }
+      case 'add': {
+        const z = arg ? symbolToAtomicNumber(arg) : store.activeElement
+        if (z > 0) {
+          const c = structureCentroid()
+          store.editAddAtom(z, [c.x, c.y, c.z + 1.5])
+        }
+        break
+      }
+      case 'fill':
+        if (/^h/i.test(arg)) {
+          store.editFillHydrogens(store.selectedAtoms.size > 0 ? store.selectedAtoms : null)
+        }
+        break
+      case 'del':
+      case 'delete':
+        if (store.selectedAtoms.size > 0) store.editDeleteAtoms(store.selectedAtoms)
+        break
+      case 'relax':
+      case 'opt':
+        if (store.modelStatus === 'ready' && store.atomicNumbers.length > 0) {
+          store.runOptimize({ onlySelected: store.selectedAtoms.size > 0 })
+        }
+        break
+    }
+  }
+
+  function onCommandKey(ev: KeyboardEvent): void {
+    ev.stopPropagation()
+    if (ev.key === 'Enter') { ev.preventDefault(); machine.commit() }
+    else if (ev.key === 'Escape') { ev.preventDefault(); machine.escape() }
+  }
+
+  function focusOnMount(node: HTMLInputElement) { node.focus() }
+
+  // Visible tool toggle (discoverability — you shouldn't need to know `i`).
+  function selectMode() {
+    if (machine.mode !== 'normal') machine.escape()
+  }
+  function drawMode() {
+    if (machine.mode === 'insert') return
+    if (machine.mode !== 'normal') machine.escape()
+    machine.enterInsert()
   }
 
   // Inputs that force a full rebuild (atom count/types, lattice, wrap, supercell, view style).
@@ -250,7 +451,9 @@
     // bond-topology reasons mid-motion, and the axis-constraint line in the
     // scene would blow up the bounding box.
     const fitKey = `${store.atomicNumbers.length}|${JSON.stringify(store.lattice)}`
-    if (fitKey !== lastFitKey && !transform.active && !store.isRunning) {
+    // Don't refit while drawing — each placed atom changes the count and would
+    // otherwise jump the camera out from under the user mid-build.
+    if (fitKey !== lastFitKey && machine.mode !== 'transform' && !store.isRunning && machine.mode !== 'insert') {
       stage.fitToContent()
       lastFitKey = fitKey
     }
@@ -267,6 +470,29 @@
     if (!canvasEl) return { x: 0, y: 0 }
     const r = canvasEl.getBoundingClientRect()
     return { x: ev.clientX - r.left, y: ev.clientY - r.top }
+  }
+
+  /** Capture-phase pointerdown (registered on window). Only claims INSERT-mode
+   *  presses that land on an atom — those become build-drags, so we stop the
+   *  event before TrackballControls (bound to the canvas) can start orbiting.
+   *  Empty-space presses fall through untouched so the camera still orbits. */
+  function onPointerDownCapture(ev: PointerEvent) {
+    if (store.appMode !== 'edit' || machine.mode !== 'insert') return
+    if (ev.button !== 0 || ev.target !== canvasEl) return
+    const atom = pickAtomAt(ev)
+    if (atom < 0) return // empty space → let the normal flow orbit
+    ev.stopImmediatePropagation()
+    ev.preventDefault()
+    // Capture the pointer so pointerup fires even if released off-canvas —
+    // otherwise a stray release would strand insertDragging (camera stuck muted).
+    try { canvasEl?.setPointerCapture(ev.pointerId) } catch { /* invalid id */ }
+    if (stage) stage.controls.enabled = false
+    insertStartAtom = atom
+    insertPointerActive = true
+    insertDragging = true
+    downX = ev.clientX
+    downY = ev.clientY
+    dragged = false
   }
 
   function onPointerDown(ev: PointerEvent) {
@@ -287,11 +513,31 @@
 
     // While a transform is active, pointer events drive commit/cancel; don't
     // engage the pick-on-release path.
-    if (transform.active) {
+    if (machine.mode === 'transform') {
       ev.preventDefault()
       pointerOwnedByTransform = true
-      if (ev.button === 0) transform.commit()
-      else if (ev.button === 2) transform.cancel()
+      if (ev.button === 0) machine.commit()
+      else if (ev.button === 2) machine.escape()
+      return
+    }
+
+    // INSERT mode: left-press starts a build gesture. A press on an atom is a
+    // build-drag (bond) so we own the pointer + mute the camera; a press on
+    // empty space lets the camera orbit and only *places* on a no-move release.
+    if (machine.mode === 'insert') {
+      if (ev.button !== 0) return // right-click delete is handled in onContextMenu
+      insertStartAtom = pickAtomAt(ev)
+      insertPointerActive = true
+      downX = ev.clientX
+      downY = ev.clientY
+      dragged = false
+      if (insertStartAtom >= 0) {
+        insertDragging = true
+        // Disable orbit synchronously — the reactive mute effect runs a tick
+        // later, too late to stop TrackballControls grabbing this drag.
+        if (stage) stage.controls.enabled = false
+        ev.preventDefault()
+      }
       return
     }
 
@@ -306,7 +552,7 @@
     }
     if (boxArmed && ev.button === 2) {
       ev.preventDefault()
-      exitBoxMode()
+      machine.escape()
       return
     }
 
@@ -320,7 +566,7 @@
   function onPointerMove(ev: PointerEvent) {
     const c = canvasCoords(ev)
     lastPointer = c
-    if (transform.active) {
+    if (machine.mode === 'transform') {
       transform.update(c.x, c.y)
       return
     }
@@ -342,10 +588,24 @@
   }
 
   function onPointerUp(ev: PointerEvent) {
+    // INSERT mode owns its own release path (place / set-element / bond).
+    if (machine.mode === 'insert') {
+      if (!insertPointerActive || ev.button !== 0) return
+      insertPointerActive = false
+      const startAtom = insertStartAtom
+      const wasDrag = dragged
+      insertStartAtom = -1
+      insertDragging = false
+      // Re-enable orbit now the build gesture is over (mirrors the sync disable
+      // on pointerdown; the mute effect will keep it consistent afterward).
+      if (stage) stage.controls.enabled = true
+      handleInsertRelease(startAtom, wasDrag, ev)
+      return
+    }
     if (boxArmed && boxStart && ev.button === 0) {
       ev.preventDefault()
       pointerOwnedByTransform = false
-      commitBoxSelection()
+      machine.commit()
       return
     }
     if (pointerOwnedByTransform) {
@@ -353,7 +613,7 @@
       pointerOwnedByTransform = false
       return
     }
-    if (transform.active) return  // a fresh transform was begun via keyboard between down and up
+    if (machine.mode === 'transform') return  // a fresh transform was begun via keyboard between down and up
     if (ev.button !== 0) return
     if (dragged) return
     if (!stage || !structureObj || !canvasEl) return
@@ -394,9 +654,18 @@
   }
 
   function onContextMenu(ev: MouseEvent) {
-    if (!transform.active) return
-    ev.preventDefault()
-    transform.cancel()
+    if (machine.mode === 'transform') {
+      ev.preventDefault()
+      machine.escape()
+      return
+    }
+    // INSERT mode: right-click deletes the atom under the cursor.
+    if (machine.mode === 'insert') {
+      ev.preventDefault()
+      const a = pickAtomAt(ev)
+      if (a >= 0) store.editDeleteAtoms(new Set([a]))
+      return
+    }
   }
 
   function isTypingTarget(t: EventTarget | null): boolean {
@@ -409,9 +678,19 @@
     if (store.appMode !== 'edit') return
     if (isTypingTarget(ev.target)) return
 
+    // While the help overlay is open it captures keys: ? / h / Esc close it,
+    // everything else is swallowed so nothing acts behind the modal.
+    if (store.helpOpen) {
+      if (ev.key === '?' || ev.key === 'h' || ev.key === 'Escape') {
+        ev.preventDefault()
+        store.helpOpen = false
+      }
+      return
+    }
+
     // ⌘/Ctrl combos (undo, redo, copy, paste, duplicate). Inert during a
     // modal transform — the user has Esc / Enter for that.
-    if ((ev.metaKey || ev.ctrlKey) && !transform.active) {
+    if ((ev.metaKey || ev.ctrlKey) && machine.mode !== 'transform') {
       const k = ev.key.toLowerCase()
       if (k === 'z') {
         ev.preventDefault()
@@ -434,7 +713,7 @@
       if (k === 'v' && !ev.shiftKey) {
         if (store.clipboard) {
           ev.preventDefault()
-          store.editPaste()
+          pasteAtCursor()
         }
         return
       }
@@ -448,13 +727,13 @@
     }
 
     // Modal keys take over while a transform is in flight.
-    if (transform.active) {
-      if (ev.key === 'Escape') { ev.preventDefault(); transform.cancel(); return }
-      if (ev.key === 'Enter')  { ev.preventDefault(); transform.commit(); return }
+    if (machine.mode === 'transform') {
+      if (ev.key === 'Escape') { ev.preventDefault(); machine.escape(); return }
+      if (ev.key === 'Enter')  { ev.preventDefault(); machine.commit(); return }
       const k = ev.key.toLowerCase()
       // G / R inside an active transform = switch mode (preserves the in-progress effect).
-      if (k === 'g') { ev.preventDefault(); transform.switchMode('grab'); return }
-      if (k === 'r') { ev.preventDefault(); transform.switchMode('rotate'); return }
+      if (k === 'g') { ev.preventDefault(); machine.switchTransform('grab'); return }
+      if (k === 'r') { ev.preventDefault(); machine.switchTransform('rotate'); return }
       if (k === 'x' || k === 'y' || k === 'z') {
         ev.preventDefault(); transform.setAxis(k); return
       }
@@ -470,6 +749,25 @@
       if (/^[\d.\-]$/.test(ev.key)) { ev.preventDefault(); transform.type(ev.key); return }
       return
     }
+
+    // Help overlay — reachable from Select and Draw.
+    if ((ev.key === '?' || ev.key === 'h') && (machine.mode === 'normal' || machine.mode === 'insert')) {
+      ev.preventDefault()
+      store.helpOpen = true
+      return
+    }
+
+    // --- editor mode switches (state machine) ----------------------------
+    // From NORMAL, `i` enters INSERT and `:` opens the COMMAND line. In any
+    // other modal state (insert / command / box) Esc returns to NORMAL and the
+    // NORMAL keymap below is suppressed — INSERT is mouse-driven and COMMAND
+    // typing is routed to its own input.
+    if (machine.mode !== 'normal') {
+      if (ev.key === 'Escape') { ev.preventDefault(); machine.escape(); return }
+      return
+    }
+    if (ev.key === 'i') { ev.preventDefault(); machine.enterInsert(); return }
+    if (ev.key === ':') { ev.preventDefault(); machine.enterCommand(); return }
 
     // Saved selection slots: digit 1-9 recalls, shift+digit saves. Use ev.code
     // so it works regardless of keyboard layout (shift+1 → '!' on US layouts).
@@ -498,13 +796,6 @@
       }
     }
 
-    // Box-select cancellation.
-    if (boxArmed && ev.key === 'Escape') {
-      ev.preventDefault()
-      exitBoxMode()
-      return
-    }
-
     // Esc while idle stops a running run, so the user doesn't have to chase
     // the Stop button in the panel.
     if (ev.key === 'Escape' && store.isRunning) {
@@ -528,10 +819,10 @@
     // Idle keys.
     if (ev.key === 'g' || ev.key === 'G') {
       ev.preventDefault()
-      transform.begin('grab', lastPointer.x, lastPointer.y)
+      machine.beginTransform('grab')
     } else if (ev.key === 'r' || ev.key === 'R') {
       ev.preventDefault()
-      transform.begin('rotate', lastPointer.x, lastPointer.y)
+      machine.beginTransform('rotate')
     } else if (ev.key === 'f' || ev.key === 'F') {
       // Bond / unbond between the two selected atoms (or the selected bond).
       let pair: [number, number] | null = null
@@ -556,9 +847,26 @@
       // at pointerdown decide replace / add / toggle.
       if (store.atomicNumbers.length > 0) {
         ev.preventDefault()
-        boxArmed = true
-        boxStart = null
-        boxEnd = null
+        machine.armBox()
+      }
+    } else if (ev.key === 'u') {
+      // Vim-style undo / redo (alongside ⌘Z / ⌘⇧Z).
+      ev.preventDefault()
+      store.undo()
+    } else if (ev.key === 'U') {
+      ev.preventDefault()
+      store.redo()
+    } else if (ev.key === 'y') {
+      // Vim yank — copy the selection.
+      if (store.selectedAtoms.size > 0) {
+        ev.preventDefault()
+        store.editCopy()
+      }
+    } else if (ev.key === 'p') {
+      // Vim paste — drop the clipboard at the cursor.
+      if (store.clipboard) {
+        ev.preventDefault()
+        pasteAtCursor()
       }
     } else if (ev.key === 'Delete' || ev.key === 'Backspace') {
       if (store.selectedAtoms.size > 0) {
@@ -611,6 +919,10 @@
     stage = new ViewerStage(canvas)
     stage.setOutlineColor(0xff9900)
     ghostFlash = new GhostFlash(stage.scene, () => stage?.requestRender())
+    // Capture-phase interceptor (on window, an ancestor) runs before
+    // TrackballControls' own pointerdown on the canvas, so an INSERT-mode atom
+    // press can claim the gesture before the camera starts orbiting.
+    window.addEventListener('pointerdown', onPointerDownCapture, true)
     canvas.addEventListener('pointerdown', onPointerDown)
     canvas.addEventListener('pointermove', onPointerMove)
     canvas.addEventListener('pointerup', onPointerUp)
@@ -619,6 +931,8 @@
   })
 
   onDestroy(() => {
+    machine.reset()
+    window.removeEventListener('pointerdown', onPointerDownCapture, true)
     canvasEl?.removeEventListener('pointerdown', onPointerDown)
     canvasEl?.removeEventListener('pointermove', onPointerMove)
     canvasEl?.removeEventListener('pointerup', onPointerUp)
@@ -639,13 +953,22 @@
     syncOutline()
   })
 
-  // Mute camera controls while the user is in a modal interaction (grab /
-  // rotate transform OR box-select). TrackballControls keeps its own
-  // pointer/keydown listeners on the canvas, so without this they'd also
-  // rotate the camera while the user is drawing the marquee.
+  // Mute camera controls while the user is in a modal interaction. In INSERT
+  // mode the camera stays live for orbiting empty space, but is muted while a
+  // bond is being dragged off an atom (insertDragging). COMMAND mode mutes so
+  // stray keys/drags don't move the view. TrackballControls keeps its own
+  // pointer/keydown listeners on the canvas, so this gating is essential.
   $effect(() => {
     if (!stage) return
-    stage.controls.enabled = !transform.active && !boxArmed
+    const m = machine.mode
+    const muted = m === 'transform' || m === 'box' || m === 'command' || insertDragging
+    stage.controls.enabled = !muted
+  })
+
+  // Leaving edit mode (or any appMode change away from edit) resets the editor
+  // machine so we never resume in a stale modal state.
+  $effect(() => {
+    if (store.appMode !== 'edit' && machine.mode !== 'normal') machine.reset()
   })
 
   // Apply the user's viewer background color whenever it changes. Hex string
@@ -680,7 +1003,7 @@
 
   function syncAxisLine() {
     if (!stage) return
-    const info = transform.active ? transform.constraintInfo : null
+    const info = machine.mode === 'transform' ? transform.constraintInfo : null
     if (!info) {
       if (axisLine) {
         stage.remove(axisLine)
@@ -768,17 +1091,40 @@
 </script>
 
 <div class="viewer" bind:this={container}>
-  <EditOverlay controller={transform} {store} />
-  {#if boxArmed}
-    <div class="box-hint" role="status" aria-live="polite">
-      BOX SELECT — drag · shift = add · ⌘/ctrl = toggle · esc cancels
+  <!-- Single top-left HUD: tool toggle + mode-aware status / hints. -->
+  <EditOverlay
+    controller={transform}
+    {store}
+    mode={machine.mode}
+    onselect={selectMode}
+    ondraw={drawMode}
+    onhelp={() => (store.helpOpen = true)}
+  />
+
+  {#if boxArmed && boxRect}
+    <div
+      class="box-rect"
+      style="left: {boxRect.x}px; top: {boxRect.y}px; width: {boxRect.w}px; height: {boxRect.h}px;"
+    ></div>
+  {/if}
+
+  <EditorHelp open={store.helpOpen} onclose={() => (store.helpOpen = false)} />
+
+  {#if machine.mode === 'command'}
+    <div class="cmdline">
+      <span class="cmd-prompt">:</span>
+      <input
+        class="cmd-input"
+        type="text"
+        bind:value={machine.commandBuffer}
+        onkeydown={onCommandKey}
+        placeholder="e Fe · add O · fill h · del · relax"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Command line"
+        use:focusOnMount
+      />
     </div>
-    {#if boxRect}
-      <div
-        class="box-rect"
-        style="left: {boxRect.x}px; top: {boxRect.y}px; width: {boxRect.w}px; height: {boxRect.h}px;"
-      ></div>
-    {/if}
   {/if}
 </div>
 
@@ -791,26 +1137,41 @@
     position: relative;
     overflow: hidden;
   }
-  .box-hint {
-    position: absolute;
-    top: 0.6rem;
-    right: 0.6rem;
-    padding: 0.3rem 0.55rem;
-    background: rgba(15, 17, 24, 0.92);
-    color: #ff9900;
-    border-radius: 6px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    pointer-events: none;
-    z-index: 6;
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 153, 0, 0.4);
-  }
+  /* Box-select marquee rectangle (the tool toggle + hints live in EditOverlay). */
   .box-rect {
     position: absolute;
-    border: 1px solid #ff9900;
-    background: rgba(255, 153, 0, 0.12);
+    border: 1px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
     pointer-events: none;
     z-index: 5;
   }
+
+  .cmdline {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    z-index: 8;
+  }
+  .cmd-prompt {
+    color: var(--accent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 700;
+  }
+  .cmd-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+  }
+  .cmd-input::placeholder { color: var(--text-secondary); opacity: 0.7; }
 </style>

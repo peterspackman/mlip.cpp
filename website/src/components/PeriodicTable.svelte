@@ -43,26 +43,96 @@
     value = z
     onpick?.(z)
   }
+
+  // --- Search: filter by symbol prefix or name substring. ------------------
+  let query = $state('')
+
+  function matchesQuery(z: number): boolean {
+    const q = query.trim().toLowerCase()
+    if (!q) return true
+    const el = getElementByNumber(z)
+    return el.symbol.toLowerCase().startsWith(q) || el.name.toLowerCase().includes(q)
+  }
+
+  /** Best match for the current query: exact symbol, then symbol prefix, then
+   *  name substring — each scanned in ascending-Z order (layout is Z-sorted). */
+  function resolveQuery(): number | null {
+    const q = query.trim().toLowerCase()
+    if (!q) return null
+    for (const c of layout) if (getElementByNumber(c.z).symbol.toLowerCase() === q) return c.z
+    for (const c of layout) if (getElementByNumber(c.z).symbol.toLowerCase().startsWith(q)) return c.z
+    for (const c of layout) if (getElementByNumber(c.z).name.toLowerCase().includes(q)) return c.z
+    return null
+  }
+
+  let resolved = $derived(resolveQuery())
+
+  function onSearchKey(e: KeyboardEvent) {
+    if (e.key === 'Enter' && resolved != null) {
+      e.preventDefault()
+      pick(resolved)
+    }
+  }
+
+  function autofocus(node: HTMLInputElement) {
+    node.focus()
+  }
 </script>
 
-<div class="ptable" role="grid" aria-label="Periodic table">
-  {#each layout as cell (cell.z)}
-    {@const el = getElementByNumber(cell.z)}
-    <button
-      class="cell"
-      class:active={value === cell.z}
-      style="grid-row: {cell.row}; grid-column: {cell.col};
-             --cpk: {rgbStr(el.color)}; --ink: {pickContrastInk(el.color)};"
-      title={`${el.name} (Z=${cell.z})`}
-      onclick={() => pick(cell.z)}
-    >
-      <span class="z">{cell.z}</span>
-      <span class="sym">{el.symbol}</span>
-    </button>
-  {/each}
+<div class="ptable-wrap">
+  <input
+    class="ptable-search"
+    type="text"
+    placeholder="Search element — symbol or name (e.g. Fe, iron)"
+    bind:value={query}
+    onkeydown={onSearchKey}
+    spellcheck="false"
+    autocomplete="off"
+    aria-label="Search elements"
+    use:autofocus
+  />
+  <div class="ptable" role="grid" aria-label="Periodic table">
+    {#each layout as cell (cell.z)}
+      {@const el = getElementByNumber(cell.z)}
+      <button
+        class="cell"
+        class:active={value === cell.z}
+        class:dim={!matchesQuery(cell.z)}
+        class:hit={query.trim() !== '' && resolved === cell.z}
+        style="grid-row: {cell.row}; grid-column: {cell.col};
+               --cpk: {rgbStr(el.color)}; --ink: {pickContrastInk(el.color)};"
+        title={`${el.name} (Z=${cell.z})`}
+        onclick={() => pick(cell.z)}
+      >
+        <span class="z">{cell.z}</span>
+        <span class="sym">{el.symbol}</span>
+      </button>
+    {/each}
+  </div>
 </div>
 
 <style>
+  .ptable-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    width: clamp(420px, 60vw, 720px);
+  }
+  .ptable-search {
+    padding: 0.5rem 0.7rem;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    background: rgba(15, 17, 24, 0.96);
+    color: #fff;
+    font-size: 0.85rem;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    outline: none;
+  }
+  .ptable-search:focus {
+    border-color: #ff9900;
+    box-shadow: 0 0 0 2px rgba(255, 153, 0, 0.35);
+  }
+  .ptable-search::placeholder { color: rgba(255, 255, 255, 0.4); }
   .ptable {
     display: grid;
     grid-template-columns: repeat(18, 1fr);
@@ -74,7 +144,7 @@
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
     /* Force square cells via aspect-ratio, so the table doesn't squish. */
     aspect-ratio: 18 / 9.5;
-    width: clamp(420px, 60vw, 720px);
+    width: 100%;
   }
   .cell {
     background: var(--cpk);
@@ -101,6 +171,16 @@
     border-color: #ff9900;
     box-shadow: 0 0 0 2px rgba(255, 153, 0, 0.7);
     z-index: 2;
+  }
+  /* Search: fade non-matches, ring the element Enter would select. */
+  .cell.dim {
+    opacity: 0.18;
+    filter: saturate(0.4);
+  }
+  .cell.hit {
+    border-color: #4ade80;
+    box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.8);
+    z-index: 3;
   }
   .z {
     font-size: 0.55rem;

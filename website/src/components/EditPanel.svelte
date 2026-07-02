@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getContext } from 'svelte'
   import type { SimulationStore } from '../lib/stores/simulation.svelte'
-  import { getElementByNumber } from '../lib/molview/data/elements'
+  import { getElementByNumber, symbolToAtomicNumber } from '../lib/molview/data/elements'
   import { FRAGMENTS, FRAGMENT_ORDER } from '../lib/editor/fragments'
   import PeriodicTable from './PeriodicTable.svelte'
 
@@ -9,8 +9,15 @@
 
   // Quick palette for the most-used elements. Anything else opens the popover.
   const COMMON: number[] = [1, 6, 7, 8, 9, 15, 16, 17]
-  let currentZ = $state(6)
   let ptableOpen = $state(false)
+
+  // Type-to-pick: resolve a typed symbol (e.g. "Fe") to the active element.
+  let elemQuery = $state('')
+  let elemQueryBad = $derived(elemQuery.trim() !== '' && symbolToAtomicNumber(elemQuery.trim()) === 0)
+  function applyElemQuery() {
+    const z = symbolToAtomicNumber(elemQuery.trim())
+    if (z > 0) store.activeElement = z
+  }
 
   function rgbStr(c: [number, number, number]): string {
     return `rgb(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)})`
@@ -62,7 +69,7 @@
 
   async function setElementOnSelection() {
     if (store.selectedAtoms.size === 0) return
-    await store.editSetElement(store.selectedAtoms, currentZ)
+    await store.editSetElement(store.selectedAtoms, store.activeElement)
   }
   async function deleteSelection() {
     if (store.selectedAtoms.size === 0) return
@@ -70,7 +77,7 @@
   }
   async function addAtomNearSelection() {
     const c = selectionCentroid()
-    await store.editAddAtom(currentZ, [c[0], c[1], c[2] + 1.5])
+    await store.editAddAtom(store.activeElement, [c[0], c[1], c[2] + 1.5])
   }
   async function fillHydrogens() {
     await store.editFillHydrogens(store.selectedAtoms.size > 0 ? store.selectedAtoms : null)
@@ -259,10 +266,10 @@
 <div class="panel-section">
   <div class="section-header">
     <span class="section-title">Edit</span>
-    <span class="active-elem" title={`Active element — ${getElementByNumber(currentZ).name}`}
-      style="--cpk: {rgbStr(getElementByNumber(currentZ).color)}; --ink: {inkFor(getElementByNumber(currentZ).color)};">
+    <span class="active-elem" title={`Active element — ${getElementByNumber(store.activeElement).name}`}
+      style="--cpk: {rgbStr(getElementByNumber(store.activeElement).color)}; --ink: {inkFor(getElementByNumber(store.activeElement).color)};">
       <span class="dot"></span>
-      <span class="sym">{getElementByNumber(currentZ).symbol}</span>
+      <span class="sym">{getElementByNumber(store.activeElement).symbol}</span>
     </span>
   </div>
 
@@ -270,8 +277,8 @@
     {#each COMMON as z}
       {@const el = getElementByNumber(z)}
       <button class="elem-pill"
-        class:active={currentZ === z}
-        onclick={() => (currentZ = z)}
+        class:active={store.activeElement === z}
+        onclick={() => (store.activeElement = z)}
         style="--cpk: {rgbStr(el.color)}; --ink: {inkFor(el.color)};"
         title={el.name}
       >{el.symbol}</button>
@@ -281,12 +288,24 @@
       title="Browse all elements">⋯</button>
   </div>
 
+  <input
+    class="elem-input"
+    class:bad={elemQueryBad}
+    type="text"
+    placeholder="type symbol (e.g. Fe)"
+    bind:value={elemQuery}
+    oninput={applyElemQuery}
+    spellcheck="false"
+    autocomplete="off"
+    aria-label="Set active element by symbol"
+  />
+
   <div class="btn-row">
     <button onclick={setElementOnSelection} disabled={runningGuard || !hasSelection}>
-      Set to {getElementByNumber(currentZ).symbol}
+      Set to {getElementByNumber(store.activeElement).symbol}
     </button>
     <button onclick={addAtomNearSelection} disabled={runningGuard}>
-      Add {getElementByNumber(currentZ).symbol}
+      Add {getElementByNumber(store.activeElement).symbol}
     </button>
     <button
       onclick={fillHydrogens}
@@ -414,26 +433,11 @@
   <p class="hint">key 1–9 recalls · shift+digit saves current selection</p>
 </details>
 
-<details class="panel-section panel-collapse">
-  <summary>Shortcuts</summary>
-  <dl class="shortcuts">
-    <dt>G</dt><dd>grab — translate selection</dd>
-    <dt>R</dt><dd>rotate around centroid (or bond endpoint w/ B)</dd>
-    <dt>X / Y / Z / B</dt><dd>during G/R, lock to axis</dd>
-    <dt>Tab</dt><dd>cycle bond axis (after B)</dd>
-    <dt>0–9 . −</dt><dd>during G/R, type a precise value</dd>
-    <dt>Enter</dt><dd>commit · esc / right-click cancel</dd>
-    <dt>A</dt><dd>select all</dd>
-    <dt>S</dt><dd>box-select — drag a rectangle (shift add, ⌘/ctrl toggle)</dd>
-    <dt>F</dt><dd>toggle bond between two selected atoms (or selected bond)</dd>
-    <dt>1–9</dt><dd>recall saved selection · shift saves it</dd>
-    <dt>Delete</dt><dd>remove selected atoms</dd>
-    <dt>Space</dt><dd>start/stop relax (selection if any, else all)</dd>
-    <dt>⌘/Ctrl+C/V/D</dt><dd>copy · paste · duplicate</dd>
-    <dt>⌘/Ctrl+Z</dt><dd>undo · shift to redo</dd>
-    <dt>Esc</dt><dd>cancel transform · stop a run</dd>
-  </dl>
-</details>
+<div class="panel-section">
+  <button class="shortcuts-link" onclick={() => (store.helpOpen = true)}>
+    Keyboard &amp; mouse shortcuts <kbd>?</kbd>
+  </button>
+</div>
 
 {#if ptableOpen}
   <div class="ptable-overlay" role="dialog" aria-modal="true"
@@ -441,7 +445,7 @@
     onkeydown={(e) => e.key === 'Escape' && (ptableOpen = false)}
     tabindex="-1">
     <div class="ptable-dialog" onclick={(e) => e.stopPropagation()} role="presentation">
-      <PeriodicTable bind:value={currentZ} onpick={() => (ptableOpen = false)} />
+      <PeriodicTable bind:value={store.activeElement} onpick={() => (ptableOpen = false)} />
     </div>
   </div>
 {/if}
@@ -592,6 +596,25 @@
     border-color: #ff9900;
     box-shadow: 0 0 0 2px rgba(255, 153, 0, 0.55);
   }
+  .elem-input {
+    width: 100%;
+    margin-bottom: 0.45rem;
+    padding: 0.28rem 0.4rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 0.76rem;
+    font-family: inherit;
+  }
+  .elem-input:focus {
+    outline: none;
+    border-color: #ff9900;
+  }
+  .elem-input.bad {
+    border-color: #ff6b6b;
+  }
+  .elem-input::placeholder { color: var(--text-secondary); }
 
   .btn-row {
     display: flex;
@@ -612,23 +635,27 @@
   .btn-row button:disabled { opacity: 0.4; cursor: default; }
   .btn-row button:not(:disabled):hover { background: var(--bg-primary); }
 
-  .shortcuts {
-    margin: 0;
-    display: grid;
-    grid-template-columns: auto 1fr;
-    column-gap: 0.6rem;
-    row-gap: 0.18rem;
-    font-size: 0.72rem;
-  }
-  .shortcuts dt {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-weight: 600;
-    color: var(--text-primary);
-    white-space: nowrap;
-  }
-  .shortcuts dd {
-    margin: 0;
+  .shortcuts-link {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    padding: 0;
+    background: transparent;
+    border: none;
     color: var(--text-secondary);
+    font-size: 0.74rem;
+    cursor: pointer;
+  }
+  .shortcuts-link:hover { color: var(--text-primary); }
+  .shortcuts-link kbd {
+    margin-left: auto;
+    padding: 0.05rem 0.35rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.7rem;
   }
 
   .slots {
