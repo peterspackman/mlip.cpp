@@ -12,6 +12,7 @@ struct ModelResult {
   float energy = 0.0f;
   std::vector<float> forces; // [n_atoms * 3], flattened
   std::vector<float> stress; // [6] in Voigt notation (xx, yy, zz, yz, xz, xy)
+  std::vector<float> atomic_energies; // [n_atoms], when the model has them
 
   bool has_forces = false;
   bool has_stress = false;

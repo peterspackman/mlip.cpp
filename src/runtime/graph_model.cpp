@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -467,7 +468,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   ggml_backend_buffer_set_usage(weight_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
   // Copy weight data and register with interpreter
+  num_gnn_layers_ = 0;
   for (const auto &name : loader.get_tensor_names()) {
+    if (name.rfind("gnn_layers_", 0) == 0) {
+      num_gnn_layers_ = std::max(num_gnn_layers_, std::atoi(name.c_str() + 11) + 1);
+    }
     ggml_tensor *temp = loader.get_tensor(name);
     ggml_tensor *weight = ggml_get_tensor(ctx_weights_, name.c_str());
     if (temp && weight) {
@@ -504,6 +509,33 @@ ModelResult GraphModel::predict(const AtomicSystem &system,
   return predict_single(system, compute_forces);
 }
 
+ModelResult GraphModel::predict(const AtomicSystem &system,
+                                const NeighborList &neighbors,
+                                bool compute_forces,
+                                const std::vector<int32_t> *selected) {
+  return predict_single(system, compute_forces, nullptr, &neighbors, selected);
+}
+
+std::vector<int32_t> GraphModel::atomic_types() const {
+  std::vector<int32_t> types;
+  for (const auto &kv : species_to_index_) {
+    types.push_back(kv.first);
+  }
+  return types;
+}
+
+float GraphModel::interaction_range() const {
+  const int hops =
+      std::max(num_gnn_layers_, 1) + (num_neighbors_adaptive_ > 0.0f ? 1 : 0);
+  return cutoff_ * static_cast<float>(hops);
+}
+
+void GraphModel::set_cpu_threads(int n) {
+  if (backend_provider_ && n > 0) {
+    ggml_backend_cpu_set_n_threads(backend_provider_->cpu(), n);
+  }
+}
+
 ModelResult GraphModel::predict_with_capture(
     const AtomicSystem &system,
     const std::function<void(GraphInterpreter &)> &cb) {
@@ -514,7 +546,9 @@ ModelResult GraphModel::predict_with_capture(
 
 ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
-    const std::function<void()> &post_compute_hook) {
+    const std::function<void()> &post_compute_hook,
+    const NeighborList *neighbors,
+    const std::vector<int32_t> *selected) {
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
         "GraphModel: forces requested but model was exported with "
@@ -524,8 +558,38 @@ ModelResult GraphModel::predict_single(
   const int n_atoms = static_cast<int>(system.num_atoms());
   const int32_t *atomic_numbers = system.atomic_numbers();
 
-  // Build neighbor list at the global model cutoff (the search radius).
-  NeighborList nlist = neighbor_builder_.build(system);
+  // Build neighbor list at the global model cutoff (the search radius),
+  // unless the caller brought one.
+  NeighborList nlist = neighbors ? *neighbors : neighbor_builder_.build(system);
+  if (neighbors) {
+    const size_t n_pairs = nlist.centers.size();
+    if (nlist.neighbors.size() != n_pairs ||
+        nlist.edge_vectors.size() != n_pairs ||
+        nlist.distances.size() != n_pairs ||
+        (!nlist.cell_shifts.empty() && nlist.cell_shifts.size() != n_pairs)) {
+      throw std::runtime_error("GraphModel: inconsistent neighbor list");
+    }
+    for (size_t e = 0; e < n_pairs; e++) {
+      if (nlist.centers[e] < 0 || nlist.centers[e] >= n_atoms ||
+          nlist.neighbors[e] < 0 || nlist.neighbors[e] >= n_atoms) {
+        throw std::runtime_error(
+            "GraphModel: neighbor list refers to an atom that does not exist");
+      }
+    }
+  }
+
+  // Which atoms' energies count: all of them, or the selection.
+  std::vector<float> weights(n_atoms, selected ? 0.0f : 1.0f);
+  if (selected) {
+    for (int32_t a : *selected) {
+      if (a < 0 || a >= n_atoms) {
+        throw std::runtime_error(
+            "GraphModel: selected atom " + std::to_string(a) +
+            " does not exist");
+      }
+      weights[a] = 1.0f;
+    }
+  }
 
   // Per-pair cutoffs: default to global cutoff. When the graph itself does
   // adaptive cutoff (adaptive_cutoff_in_graph_), C++ leaves pair_cutoffs at
@@ -812,9 +876,27 @@ ModelResult GraphModel::predict_single(
 
   ggml_cgraph *cgraph = nullptr;
 
+  if (ggml_nelements(output) != n_atoms) {
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+    throw std::runtime_error("GraphModel: expected one energy per atom");
+  }
+
+  // With a selection, the loss is the selected atoms' energy only.
+  ggml_tensor *weights_t = nullptr;
+
   if (compute_forces) {
     // Build forward + backward graph
-    ggml_tensor *total_energy = ggml_sum(compute_ctx, output);
+    ggml_tensor *energies = output;
+    if (selected) {
+      weights_t = ggml_new_tensor(compute_ctx, GGML_TYPE_F32, GGML_MAX_DIMS,
+                                  output->ne);
+      ggml_set_name(weights_t, "atom_weights");
+      ggml_set_input(weights_t);
+      energies = ggml_mul(compute_ctx, output, weights_t);
+    }
+    ggml_tensor *total_energy = ggml_sum(compute_ctx, energies);
     ggml_set_loss(total_energy);
     ggml_set_output(total_energy);
 
@@ -848,6 +930,10 @@ ModelResult GraphModel::predict_single(
   if (compute_forces) {
     ggml_graph_reset(cgraph);
   }
+  if (weights_t) {
+    ggml_backend_tensor_set(weights_t, weights.data(), 0,
+                            weights.size() * sizeof(float));
+  }
 
   ggml_status status = ggml_backend_graph_compute(compute_backend_, cgraph);
   if (status != GGML_STATUS_SUCCESS) {
@@ -866,20 +952,24 @@ ModelResult GraphModel::predict_single(
   ggml_backend_tensor_get(output, atomic_energies.data(), 0,
                           n_atoms * sizeof(float));
 
-  // Sum and scale
+  // Sum and scale (the selected atoms, when there is a selection)
   float model_energy = 0.0f;
   for (int i = 0; i < n_atoms; i++) {
-    model_energy += atomic_energies[i];
+    model_energy += weights[i] * atomic_energies[i];
   }
   float scaled_energy = model_energy * energy_scale_;
 
   // Add composition energies
   float composition_energy = 0.0f;
+  result.atomic_energies.resize(n_atoms);
   for (int i = 0; i < n_atoms; i++) {
+    float composition = 0.0f;
     auto it = composition_energies_.find(atomic_numbers[i]);
     if (it != composition_energies_.end()) {
-      composition_energy += it->second;
+      composition = it->second;
     }
+    composition_energy += weights[i] * composition;
+    result.atomic_energies[i] = atomic_energies[i] * energy_scale_ + composition;
   }
 
   result.energy = scaled_energy + composition_energy;

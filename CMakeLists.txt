@@ -37,6 +37,7 @@ option(MLIPCPP_USE_CANN "Enable CANN backend via ggml (Huawei Ascend)" OFF)
 option(MLIPCPP_USE_BLAS "Enable BLAS acceleration via ggml" OFF)
 option(MLIPCPP_USE_SYSTEM_FMT "Use system-installed fmtlib instead of bundled" OFF)
 option(MLIPCPP_WASM_ASYNCIFY "Use ASYNCIFY instead of JSPI for async WebGPU calls in WASM builds" OFF)
+option(MLIPCPP_BUILD_METATOMIC "Build the metatomic plugin (needs metatomic and metatensor)" OFF)
 
 # WASM-specific settings
 if(EMSCRIPTEN)
@@ -70,6 +71,11 @@ endif()
 # Enable Python bindings via scikit-build
 if(SKBUILD)
     set(MLIPCPP_BUILD_PYTHON ON)
+endif()
+
+# The metatomic plugin is a shared module with mlipcpp and ggml inside.
+if(MLIPCPP_BUILD_METATOMIC)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
 if(MLIPCPP_BUILD_PYTHON)
@@ -256,6 +262,13 @@ if(MLIPCPP_BUILD_TESTS)
     )
 
     add_subdirectory(tests)
+endif()
+
+# =============================================================================
+# metatomic plugin
+# =============================================================================
+if(MLIPCPP_BUILD_METATOMIC)
+    add_subdirectory(plugins/metatomic)
 endif()
 
 # =============================================================================

@@ -47,6 +47,27 @@ public:
   float cutoff() const override { return cutoff_; }
 
   /**
+   * Run inference over a neighbor list built by the caller (e.g. a simulation
+   * engine): a full list of the pairs within cutoff(), with edge vectors and
+   * distances. With `selected`, only those atoms' energies count; the forces
+   * and stress are still with respect to every atom (ghost atoms in a domain
+   * decomposition, say).
+   */
+  ModelResult predict(const AtomicSystem &system, const NeighborList &neighbors,
+                      bool compute_forces,
+                      const std::vector<int32_t> *selected = nullptr);
+
+  /// Atomic numbers the model knows.
+  std::vector<int32_t> atomic_types() const;
+
+  /// How far an atom's energy reaches: one cutoff per message-passing layer,
+  /// and one more for the adaptive cutoff.
+  float interaction_range() const;
+
+  /// Threads for the CPU backend (after loading).
+  void set_cpu_threads(int n);
+
+  /**
    * Load model from GGUF file.
    *
    * The GGUF file must contain:
@@ -99,6 +120,7 @@ private:
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
   float num_neighbors_adaptive_ = 0.0f;
+  int num_gnn_layers_ = 0;
 
   BackendPreference backend_preference_ = BackendPreference::Auto;
 
@@ -121,9 +143,13 @@ private:
   // post_compute_hook (if set) runs after a successful graph compute and
   // before the compute buffer is freed — this is the window during which
   // intermediate tensor data is live on the backend buffer.
+  // `neighbors` (if set) is used instead of building a list; `selected` (if
+  // set) restricts the energy to those atoms.
   ModelResult predict_single(
       const AtomicSystem &system, bool compute_forces,
-      const std::function<void()> &post_compute_hook = nullptr);
+      const std::function<void()> &post_compute_hook = nullptr,
+      const NeighborList *neighbors = nullptr,
+      const std::vector<int32_t> *selected = nullptr);
 };
 
 } // namespace mlipcpp::runtime

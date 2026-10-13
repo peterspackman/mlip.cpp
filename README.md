@@ -109,6 +109,12 @@ cmake --build . -j
 
 C, C++, Fortran, and Python APIs are provided. See `examples/` for usage.
 
+## metatomic plugin
+
+mlip.cpp can also be loaded as a [metatomic](https://github.com/metatensor/metatomic)
+plugin, so engines that load metatomic models run GGUF models through it. See
+[`plugins/metatomic`](plugins/metatomic/README.md).
+
 ## License
 
 BSD 3-Clause
