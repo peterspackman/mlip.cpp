@@ -8,6 +8,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -891,10 +892,72 @@ ModelResult GraphModel::predict_single(
       ggml_backend_tensor_get(grad_tensor, grad_data.data(), 0,
                               ggml_nbytes(grad_tensor));
 
-      // Scatter edge gradients to per-atom forces
-      result.forces.resize(n_atoms * 3, 0.0f);
       const int stride_slot = 3;
       const int stride_atom = 3 * max_neighbors;
+
+      // Chain-rule correction: the model's autograd doesn't see the
+      // implicit dependence of pair_cutoffs on edge_distances (the C++
+      // adaptive cutoff math). When cutoff_values_t was marked as a
+      // ggml param, its gradient C[e] = ∂E/∂cutoff_values[e] is also
+      // available; combined with the analytic Jacobian J[e'] =
+      // ∂atomic_cutoffs[i_{e'}]/∂d_{e'} we recover the missing gradient
+      // with respect to each edge of the full (pre-filter) list:
+      //   ∂E/∂r_e = 0.5 * J[e] * S[k] * r_e / d_e,  k = centre of e,
+      // which both the forces and the virial need. Skipped when adaptive
+      // cutoff isn't active.
+      std::vector<std::array<double, 3>> adaptive_grad;
+      if (have_adaptive && cutoff_values_t) {
+        ggml_tensor *cv_grad = ggml_graph_get_grad(cgraph, cutoff_values_t);
+        if (cv_grad && cv_grad->data) {
+          std::vector<float> cv_grad_data(ggml_nelements(cv_grad));
+          ggml_backend_tensor_get(cv_grad, cv_grad_data.data(), 0,
+                                  ggml_nbytes(cv_grad));
+
+          // S[k] = Σ_e (in filtered list, edge e touches atom k) C_e
+          std::vector<double> S(n_atoms, 0.0);
+          for (int ca = 0; ca < n_atoms; ca++) {
+            for (int slot = 0; slot < max_neighbors; slot++) {
+              int flat_idx = ca * max_neighbors + slot;
+              if (pm_data[flat_idx] > 0.5f) continue;
+              int na = neighbor_atoms_vec[flat_idx];
+              if (na < 0) continue;
+              double c = static_cast<double>(cv_grad_data[flat_idx]);
+              S[ca] += c;
+              S[na] += c;
+            }
+          }
+          // S[k] is symmetric in i↔j averaging since cv[e] = 0.5*(a[i]+a[j])
+          // and we summed C over both endpoints for each edge.
+
+          const int n_probes = adapt_cache.n_probes;
+          const auto &probes = adapt_cache.probes;
+          const auto &X = adapt_cache.diff_jacobian;
+          const float ew = adapt_cache.effective_width;
+
+          adaptive_grad.assign(full_nlist.num_pairs(), {0.0, 0.0, 0.0});
+          for (int e = 0; e < full_nlist.num_pairs(); e++) {
+            int k = full_nlist.centers[e];
+            double d = static_cast<double>(full_nlist.distances[e]);
+            if (d <= 0.0) continue;
+            // J[e] = Σ_p X[k, p] * bump_derivative(d, probes[p], ew)
+            double J = 0.0;
+            const double *Xk = &X[static_cast<size_t>(k) * n_probes];
+            for (int p = 0; p < n_probes; p++) {
+              J += Xk[p] * bump_derivative(static_cast<float>(d),
+                                           probes[p], ew);
+            }
+            if (J == 0.0) continue;
+            double coef = 0.5 * J * S[k] / d;
+            const auto &r = full_nlist.edge_vectors[e];
+            for (int c = 0; c < 3; c++) {
+              adaptive_grad[e][c] = coef * r[c];
+            }
+          }
+        }
+      }
+
+      // Scatter edge gradients to per-atom forces
+      result.forces.resize(n_atoms * 3, 0.0f);
 
       for (int ca = 0; ca < n_atoms; ca++) {
         for (int slot = 0; slot < max_neighbors; slot++) {
@@ -916,6 +979,15 @@ ModelResult GraphModel::predict_single(
           result.forces[na * 3 + 0] -= gx;
           result.forces[na * 3 + 1] -= gy;
           result.forces[na * 3 + 2] -= gz;
+        }
+      }
+
+      for (size_t e = 0; e < adaptive_grad.size(); e++) {
+        const int i = full_nlist.centers[e];
+        const int j = full_nlist.neighbors[e];
+        for (int c = 0; c < 3; c++) {
+          result.forces[i * 3 + c] += static_cast<float>(adaptive_grad[e][c]);
+          result.forces[j * 3 + c] -= static_cast<float>(adaptive_grad[e][c]);
         }
       }
 
@@ -960,68 +1032,20 @@ ModelResult GraphModel::predict_single(
               result.stress[5] += 0.5f * (ex * gy + ey * gx); // xy
             }
           }
-          // Chain-rule correction: the model's autograd doesn't see the
-          // implicit dependence of pair_cutoffs on edge_distances (the C++
-          // adaptive cutoff math). When cutoff_values_t was marked as a
-          // ggml param, its gradient C[e] = ∂E/∂cutoff_values[e] is also
-          // available; combined with the analytic Jacobian J[e'] =
-          // ∂atomic_cutoffs[i_{e'}]/∂d_{e'} we recover the missing virial
-          // term. Skipped when adaptive cutoff isn't active.
-          if (have_adaptive && cutoff_values_t) {
-            ggml_tensor *cv_grad = ggml_graph_get_grad(cgraph, cutoff_values_t);
-            if (cv_grad && cv_grad->data) {
-              std::vector<float> cv_grad_data(ggml_nelements(cv_grad));
-              ggml_backend_tensor_get(cv_grad, cv_grad_data.data(), 0,
-                                      ggml_nbytes(cv_grad));
-
-              // S[k] = Σ_e (in filtered list, edge e touches atom k) C_e
-              std::vector<double> S(n_atoms, 0.0);
-              for (int ca = 0; ca < n_atoms; ca++) {
-                for (int slot = 0; slot < max_neighbors; slot++) {
-                  int flat_idx = ca * max_neighbors + slot;
-                  if (pm_data[flat_idx] > 0.5f) continue;
-                  int na = neighbor_atoms_vec[flat_idx];
-                  if (na < 0) continue;
-                  double c = static_cast<double>(cv_grad_data[flat_idx]);
-                  S[ca] += c;
-                  S[na] += c;
-              }
-              }
-              // S[k] is symmetric in i↔j averaging since cv[e] = 0.5*(a[i]+a[j])
-              // and we summed C over both endpoints for each edge.
-
-              const int n_probes = adapt_cache.n_probes;
-              const auto &probes = adapt_cache.probes;
-              const auto &X = adapt_cache.diff_jacobian;
-              const float ew = adapt_cache.effective_width;
-
-              double corr[6] = {0, 0, 0, 0, 0, 0};
-              for (int e = 0; e < full_nlist.num_pairs(); e++) {
-                int k = full_nlist.centers[e];
-                double d = static_cast<double>(full_nlist.distances[e]);
-                if (d <= 0.0) continue;
-                // J[e] = Σ_p X[k, p] * bump_derivative(d, probes[p], ew)
-                double J = 0.0;
-                const double *Xk = &X[static_cast<size_t>(k) * n_probes];
-                for (int p = 0; p < n_probes; p++) {
-                  J += Xk[p] * bump_derivative(static_cast<float>(d),
-                                               probes[p], ew);
-                }
-                if (J == 0.0) continue;
-                double coef = 0.5 * J * S[k] / d;
-                const auto &r = full_nlist.edge_vectors[e];
-                double ex = r[0], ey = r[1], ez = r[2];
-                corr[0] += coef * ex * ex;
-                corr[1] += coef * ey * ey;
-                corr[2] += coef * ez * ez;
-                corr[3] += 0.5 * coef * (ey * ez + ez * ey);
-                corr[4] += 0.5 * coef * (ex * ez + ez * ex);
-                corr[5] += 0.5 * coef * (ex * ey + ey * ex);
-              }
-              for (int i = 0; i < 6; i++) {
-                result.stress[i] += static_cast<float>(corr[i]);
-              }
-            }
+          // The adaptive cutoff's share (see adaptive_grad above).
+          double corr[6] = {0, 0, 0, 0, 0, 0};
+          for (size_t e = 0; e < adaptive_grad.size(); e++) {
+            const auto &r = full_nlist.edge_vectors[e];
+            const auto &g = adaptive_grad[e];
+            corr[0] += r[0] * g[0];
+            corr[1] += r[1] * g[1];
+            corr[2] += r[2] * g[2];
+            corr[3] += 0.5 * (r[1] * g[2] + r[2] * g[1]);
+            corr[4] += 0.5 * (r[0] * g[2] + r[2] * g[0]);
+            corr[5] += 0.5 * (r[0] * g[1] + r[1] * g[0]);
+          }
+          for (int i = 0; i < 6; i++) {
+            result.stress[i] += static_cast<float>(corr[i]);
           }
 
           for (int i = 0; i < 6; i++) {
