@@ -6,7 +6,7 @@ Needs metatomic (core, with its Python package), metatensor, numpy, ase and
 pytest; mlip.cpp's own Python package (mlipcpp), which is the reference; and a
 graph-format pet-mad-xs, at gguf/pet-mad-xs.gguf or MLIPCPP_MODEL (CI fetches it
 from huggingface.co/peterspackman/mlip-gguf). A missing model fails, it is not
-skipped.
+skipped. MLIPCPP_BACKEND picks the plugin's ggml backend (default cpu).
 
 The plugin and mlipcpp run the same model on the same neighbors, so they agree
 to float32 round-off: the pairs come in a different order.
@@ -28,7 +28,8 @@ import metatomic as mta
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 MODEL = os.environ.get("MLIPCPP_MODEL", str(ROOT / "gguf" / "pet-mad-xs.gguf"))
-OPTIONS = {"backend": "cpu"}
+# The backend the plugin runs on; the reference always runs on the CPU.
+OPTIONS = {"backend": os.environ.get("MLIPCPP_BACKEND", "cpu")}
 
 ENERGY = mta.Quantity(
     name="energy", unit="eV", sample_kind="system", gradients=["positions", "strain"]
